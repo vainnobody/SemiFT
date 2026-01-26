@@ -14,11 +14,14 @@ import random
 
 
 class SemiDataset(Dataset):
-    def __init__(self, name, root, mode, size=None, id_path=None, nsample=None):
+    def __init__(
+        self, name, root, mode, size=None, id_path=None, nsample=None, ignore_index=255
+    ):
         self.name = name
         self.root = root
         self.mode = mode
         self.size = size
+        self.ignore_index = ignore_index
 
         if mode == "train_l" or mode == "train_u":
             with open(id_path, "r") as f:
@@ -46,7 +49,7 @@ class SemiDataset(Dataset):
             return img, mask, id
 
         img, mask = resize(img, mask, (0.5, 2.0))
-        ignore_value = 254 if self.mode == "train_u" else 255
+        ignore_value = 254 if self.mode == "train_u" else self.ignore_index
         img, mask = crop(img, mask, self.size, ignore_value)
         img, mask = hflip(img, mask, p=0.5)
 
@@ -73,7 +76,8 @@ class SemiDataset(Dataset):
         img_s2 = normalize(img_s2)
 
         mask = torch.from_numpy(np.array(mask)).long()
-        ignore_mask[mask == 254] = 255
+        # Use 255 as a special internal ignore flag for the unsupervised mask filter
+        ignore_mask[mask == self.ignore_index] = 255
 
         return normalize(img_w), img_s1, img_s2, ignore_mask, cutmix_box1, cutmix_box2
 

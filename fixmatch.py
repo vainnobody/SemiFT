@@ -153,6 +153,7 @@ def main():
         "train_u",
         cfg["crop_size"],
         args.unlabeled_id_path,
+        ignore_index=cfg["ignore_index"],
     )
     trainset_l = SemiDataset(
         cfg["dataset"],
@@ -161,8 +162,11 @@ def main():
         cfg["crop_size"],
         args.labeled_id_path,
         nsample=len(trainset_u.ids),
+        ignore_index=cfg["ignore_index"],
     )
-    valset = ValDataset(cfg["dataset"], cfg["data_root"], "val")
+    valset = ValDataset(
+        cfg["dataset"], cfg["data_root"], "val", ignore_index=cfg["ignore_index"]
+    )
 
     trainsampler_l = torch.utils.data.distributed.DistributedSampler(trainset_l)
     trainloader_l = DataLoader(
@@ -270,11 +274,10 @@ def main():
             loss_x = criterion_l(pred_x, mask_x)
 
             loss_u_s = criterion_u(pred_u_s, mask_u_w_cutmixed)
-            loss_u_s = loss_u_s * (
-                (conf_u_w_cutmixed >= cfg["conf_thresh"])
-                & (ignore_mask_cutmixed != 255)
+            loss_mask = (conf_u_w_cutmixed >= cfg["conf_thresh"]) & (
+                ignore_mask_cutmixed != 255
             )
-            loss_u_s = loss_u_s.sum() / (ignore_mask_cutmixed != 255).sum().item()
+            loss_u_s = (loss_u_s * loss_mask).sum() / loss_mask.sum().clamp(min=1.0)
 
             loss = (loss_x + loss_u_s) / 2.0
 

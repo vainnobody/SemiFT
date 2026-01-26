@@ -400,6 +400,8 @@ def DINOv3(model_name):
     # - n_storage_tokens=4: Official uses 4 storage tokens
     # - mask_k_bias=True: Official uses masked K bias
     # - layerscale_init=1e-5: Official uses LayerScale
+    # - pos_embed_rope_rescale_coords=2: Official training augmentation
+    # - norm_layer="layernormbf16": Official uses LayerNorm with eps=1e-5
     return model_zoo[model_name](
         img_size=518,
         patch_size=16,
@@ -407,4 +409,6 @@ def DINOv3(model_name):
         n_storage_tokens=4,
         mask_k_bias=True,
         layerscale_init=1e-5,
+        pos_embed_rope_rescale_coords=2,
+        norm_layer="layernormbf16",
     )
