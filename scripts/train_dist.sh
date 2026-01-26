@@ -6,7 +6,7 @@
 # exp: just for specifying the 'save_path'
 # split: ['92', '1_16', ...]. Please check directory './splits/$dataset' for concrete splits
 dataset='vaihingen'
-method='unimatch_v2'
+method='fixmatch'
 exp='dinov3_small'
 split='4'
 
