@@ -95,7 +95,7 @@ def evaluate(model, loader, mode, cfg, multiplier=None):
             pred = pred.argmax(dim=1)
 
             intersection, union, target = intersectionAndUnion(
-                pred.cpu().numpy(), mask.numpy(), cfg["nclass"], cfg["ignore_index"]
+                pred.cpu().numpy(), mask.numpy(), cfg["nclass"], 255
             )
 
             reduced_intersection = torch.from_numpy(intersection).cuda()

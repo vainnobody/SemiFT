@@ -34,7 +34,8 @@ class SemiDataset(Dataset):
                 self.ids = f.read().splitlines()
 
     def __getitem__(self, item):
-        id = self.ids[item % len(self.ids)]
+        # id = self.ids[item]
+        id = random.choice(self.ids)
         img = Image.open(os.path.join(self.root, id.split(" ")[0])).convert("RGB")
         if self.mode == "train_u":
             mask = Image.fromarray(np.zeros((img.size[1], img.size[0]), dtype=np.uint8))
@@ -76,11 +77,7 @@ class SemiDataset(Dataset):
 
         mask = torch.from_numpy(np.array(mask)).long()
         # Use 255 as a special internal ignore flag for the unsupervised mask filter
-        # Ignore both dataset-specific ignore_index and padding pixels (254)
         ignore_mask[mask == self.ignore_index] = 255
-        ignore_mask[mask == 254] = 255
-
-        return normalize(img_w), img_s1, img_s2, ignore_mask, cutmix_box1, cutmix_box2
 
         return normalize(img_w), img_s1, img_s2, ignore_mask, cutmix_box1, cutmix_box2
 

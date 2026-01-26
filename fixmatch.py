@@ -104,7 +104,7 @@ def main():
                     for name, param in model.named_parameters()
                     if "backbone" not in name
                 ],
-                "lr": cfg["lr"] * 10.0,
+                "lr": cfg["lr"] * cfg["lr_multi"],
             },
         ],
         lr=cfg["lr"],
@@ -129,8 +129,7 @@ def main():
         find_unused_parameters=True,
     )
 
-    model_ema = deepcopy(model.module)
-    model_ema.cuda()
+    model_ema = deepcopy(model)
     model_ema.eval()
     for param in model_ema.parameters():
         param.requires_grad = False
@@ -303,13 +302,11 @@ def main():
 
             ema_ratio = min(1 - 1 / (iters + 1), 0.996)
 
-            for param, param_ema in zip(
-                model.module.parameters(), model_ema.parameters()
-            ):
+            for param, param_ema in zip(model.parameters(), model_ema.parameters()):
                 param_ema.copy_(
                     param_ema * ema_ratio + param.detach() * (1 - ema_ratio)
                 )
-            for buffer, buffer_ema in zip(model.module.buffers(), model_ema.buffers()):
+            for buffer, buffer_ema in zip(model.buffers(), model_ema.buffers()):
                 buffer_ema.copy_(
                     buffer_ema * ema_ratio + buffer.detach() * (1 - ema_ratio)
                 )
