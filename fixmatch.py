@@ -165,7 +165,7 @@ def main():
         ignore_index=cfg["ignore_index"],
     )
     valset = ValDataset(
-        cfg["dataset"], cfg["data_root"], "val", ignore_index=cfg["ignore_index"]
+        cfg["dataset"], cfg["data_root"], "val", ignore_value=cfg["ignore_index"]
     )
 
     trainsampler_l = torch.utils.data.distributed.DistributedSampler(trainset_l)
