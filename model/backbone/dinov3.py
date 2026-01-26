@@ -103,6 +103,7 @@ class DinoVisionTransformer(nn.Module):
         ffn_bias: bool = True,
         proj_bias: bool = True,
         n_storage_tokens: int = 0,
+        mask_k_bias: bool = False,
         device: Any = None,
         **ignored_kwargs,
     ):
@@ -159,6 +160,7 @@ class DinoVisionTransformer(nn.Module):
                 act_layer=nn.GELU,
                 ffn_layer=ffn_layer_cls,
                 init_values=layerscale_init,
+                mask_k_bias=mask_k_bias,
                 device=device,
             )
             for i in range(depth)
@@ -393,9 +395,16 @@ def DINOv3(model_name):
             f"Unknown model name: {model_name}. Available: {list(model_zoo.keys())}"
         )
 
+    # Parameters matching official DINOv3 pretrained weights:
+    # - patch_size=16: Official uses 16
+    # - n_storage_tokens=4: Official uses 4 storage tokens
+    # - mask_k_bias=True: Official uses masked K bias
+    # - layerscale_init=1e-5: Official uses LayerScale
     return model_zoo[model_name](
         img_size=518,
-        patch_size=14,
+        patch_size=16,
         ffn_layer="mlp" if model_name not in ["giant", "huge", "so400m"] else "swiglu",
-        n_storage_tokens=0,
+        n_storage_tokens=4,
+        mask_k_bias=True,
+        layerscale_init=1e-5,
     )

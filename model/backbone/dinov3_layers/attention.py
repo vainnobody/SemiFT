@@ -2,6 +2,7 @@
 #
 # This source code is licensed under the DINOv3 License Agreement.
 
+import math
 from typing import List, Tuple
 
 import torch
@@ -18,6 +19,27 @@ def rope_rotate_half(x: Tensor) -> Tensor:
 def rope_apply(x: Tensor, sin: Tensor, cos: Tensor) -> Tensor:
     """Apply rotary position embedding."""
     return (x * cos) + (rope_rotate_half(x) * sin)
+
+
+class LinearKMaskedBias(nn.Linear):
+    """Linear layer with masked bias for K in QKV."""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        o = self.out_features
+        assert o % 3 == 0
+        if self.bias is not None:
+            self.register_buffer(
+                "bias_mask", torch.full_like(self.bias, fill_value=math.nan)
+            )
+
+    def forward(self, input: Tensor) -> Tensor:
+        masked_bias = (
+            self.bias * self.bias_mask.to(self.bias.dtype)
+            if self.bias is not None
+            else None
+        )
+        return F.linear(input, self.weight, masked_bias)
 
 
 class SelfAttention(nn.Module):
@@ -37,7 +59,9 @@ class SelfAttention(nn.Module):
         head_dim = dim // num_heads
         self.scale = head_dim**-0.5
 
-        self.qkv = nn.Linear(dim, dim * 3, bias=qkv_bias, device=device)
+        # Use LinearKMaskedBias if mask_k_bias is True (for official pretrained weights)
+        linear_class = LinearKMaskedBias if mask_k_bias else nn.Linear
+        self.qkv = linear_class(dim, dim * 3, bias=qkv_bias, device=device)
         self.attn_drop = nn.Dropout(attn_drop)
         self.proj = nn.Linear(dim, dim, bias=proj_bias, device=device)
         self.proj_drop = nn.Dropout(proj_drop)
