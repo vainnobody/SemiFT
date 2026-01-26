@@ -174,7 +174,8 @@ class DPT(nn.Module):
             p.requires_grad = False
 
     def forward(self, x, comp_drop=False):
-        patch_h, patch_w = x.shape[-2] // 14, x.shape[-1] // 14
+        patch_size = self.backbone.patch_size
+        patch_h, patch_w = x.shape[-2] // patch_size, x.shape[-1] // patch_size
 
         features = self.backbone.get_intermediate_layers(
             x, self.intermediate_layer_idx[self.encoder_size]
@@ -198,14 +199,20 @@ class DPT(nn.Module):
             out = self.head(features, patch_h, patch_w)
 
             out = F.interpolate(
-                out, (patch_h * 14, patch_w * 14), mode="bilinear", align_corners=True
+                out,
+                (patch_h * patch_size, patch_w * patch_size),
+                mode="bilinear",
+                align_corners=True,
             )
 
             return out
 
         out = self.head(features, patch_h, patch_w)
         out = F.interpolate(
-            out, (patch_h * 14, patch_w * 14), mode="bilinear", align_corners=True
+            out,
+            (patch_h * patch_size, patch_w * patch_size),
+            mode="bilinear",
+            align_corners=True,
         )
 
         return out

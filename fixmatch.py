@@ -78,6 +78,8 @@ def main():
 
     backbone_size = cfg["backbone"].split("_")[-1]
     backbone_version = cfg["backbone"].split("_")[0]
+    # DINOv2 uses patch_size=14, DINOv3 uses patch_size=16
+    patch_size = 14 if backbone_version == "dinov2" else 16
     model = DPT(
         **{**model_configs[backbone_size], "nclass": cfg["nclass"]},
         backbone_version=backbone_version,
@@ -325,9 +327,11 @@ def main():
                 )
 
         eval_mode = "sliding_window" if cfg["dataset"] == "cityscapes" else "original"
-        mIoU, iou_class = evaluate(model, valloader, eval_mode, cfg, multiplier=14)
+        mIoU, iou_class = evaluate(
+            model, valloader, eval_mode, cfg, multiplier=patch_size
+        )
         mIoU_ema, iou_class_ema = evaluate(
-            model_ema, valloader, eval_mode, cfg, multiplier=14
+            model_ema, valloader, eval_mode, cfg, multiplier=patch_size
         )
 
         if rank == 0:
