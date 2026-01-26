@@ -10,6 +10,7 @@ from PIL import Image
 import torch
 from torch.utils.data import Dataset
 from torchvision import transforms
+import random
 
 
 class SemiDataset(Dataset):
@@ -18,37 +19,40 @@ class SemiDataset(Dataset):
         self.root = root
         self.mode = mode
         self.size = size
-        
-        if mode == 'train_l' or mode == 'train_u':
-            with open(id_path, 'r') as f:
+
+        if mode == "train_l" or mode == "train_u":
+            with open(id_path, "r") as f:
                 self.ids = f.read().splitlines()
-            if mode == 'train_l' and nsample is not None and nsample > len(self.ids):
+            if mode == "train_l" and nsample is not None and nsample > len(self.ids):
                 self.ids *= math.ceil(nsample / len(self.ids))
                 self.ids = self.ids[:nsample]
         else:
-            with open('splits/%s/val.txt' % name, 'r') as f:
+            with open("splits/%s/val.txt" % name, "r") as f:
                 self.ids = f.read().splitlines()
 
     def __getitem__(self, item):
-        id = self.ids[item]
-        img = Image.open(os.path.join(self.root, id.split(' ')[0])).convert('RGB')
-        if self.mode == 'train_u':
+        # id = self.ids[item]
+        id = random.choice(self.ids)
+        img = Image.open(os.path.join(self.root, id.split(" ")[0])).convert("RGB")
+        if self.mode == "train_u":
             mask = Image.fromarray(np.zeros((img.size[1], img.size[0]), dtype=np.uint8))
         else:
-            mask = Image.fromarray(np.array(Image.open(os.path.join(self.root, id.split(' ')[1])))) 
-        
-        if self.mode == 'val':
+            mask = Image.fromarray(
+                np.array(Image.open(os.path.join(self.root, id.split(" ")[1])))
+            )
+
+        if self.mode == "val":
             img, mask = normalize(img, mask)
             return img, mask, id
 
         img, mask = resize(img, mask, (0.5, 2.0))
-        ignore_value = 254 if self.mode == 'train_u' else 255
+        ignore_value = 254 if self.mode == "train_u" else 255
         img, mask = crop(img, mask, self.size, ignore_value)
         img, mask = hflip(img, mask, p=0.5)
 
-        if self.mode == 'train_l':
+        if self.mode == "train_l":
             return normalize(img, mask)
-        
+
         img_w, img_s1, img_s2 = deepcopy(img), deepcopy(img), deepcopy(img)
 
         if random.random() < 0.8:
@@ -74,4 +78,4 @@ class SemiDataset(Dataset):
         return normalize(img_w), img_s1, img_s2, ignore_mask, cutmix_box1, cutmix_box2
 
     def __len__(self):
-        return len(self.ids)
+        return len(self.ids) * 50
