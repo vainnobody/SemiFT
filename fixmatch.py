@@ -13,6 +13,7 @@ from torch.utils.tensorboard import SummaryWriter
 import yaml
 
 from dataset.semi import SemiDataset
+from dataset.val import ValDataset
 from model.semseg.dpt import DPT
 from supervised import evaluate
 from util.classes import CLASSES
@@ -161,7 +162,7 @@ def main():
         args.labeled_id_path,
         nsample=len(trainset_u.ids),
     )
-    valset = SemiDataset(cfg["dataset"], cfg["data_root"], "val")
+    valset = ValDataset(cfg["dataset"], cfg["data_root"], "val")
 
     trainsampler_l = torch.utils.data.distributed.DistributedSampler(trainset_l)
     trainloader_l = DataLoader(
