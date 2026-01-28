@@ -292,6 +292,7 @@ def main():
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
+
             if i < 10:
                 viz.push(
                     {
@@ -304,7 +305,7 @@ def main():
                             Visualizer.SEGMENTATION,
                         ),
                         "pred_u_s": (
-                            pred_u_s[0].argmax(dim=1),
+                            pred_u_s.argmax(dim=1)[0],
                             Visualizer.SEGMENTATION,
                         ),
                     }
