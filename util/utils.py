@@ -79,10 +79,11 @@ def init_log(name, level=logging.INFO):
     return logger
 
 
-def color_map(dataset='pascal'):
-    cmap = np.zeros((256, 3), dtype='uint8')
+def color_map(dataset="pascal"):
+    cmap = np.zeros((256, 3), dtype="uint8")
 
-    if dataset == 'pascal' or dataset == 'coco':
+    if dataset == "pascal" or dataset == "coco":
+
         def bitget(byteval, idx):
             return (byteval & (1 << idx)) != 0
 
@@ -90,14 +91,35 @@ def color_map(dataset='pascal'):
             r = g = b = 0
             c = i
             for j in range(8):
-                r = r | (bitget(c, 0) << 7-j)
-                g = g | (bitget(c, 1) << 7-j)
-                b = b | (bitget(c, 2) << 7-j)
+                r = r | (bitget(c, 0) << 7 - j)
+                g = g | (bitget(c, 1) << 7 - j)
+                b = b | (bitget(c, 2) << 7 - j)
                 c = c >> 3
 
             cmap[i] = np.array([r, g, b])
 
-    elif dataset == 'cityscapes':
+    elif dataset == "vaihingen" or dataset == "potsdam":
+        # 按照 ISPRS 标准定义的颜色映射 (R, G, B)
+        # 0: 不透水表面 (Impervious surfaces) -> 白色
+        # 1: 建筑物 (Building) -> 蓝色
+        # 2: 低矮植被 (Low vegetation) -> 青色/浅蓝
+        # 3: 树木 (Tree) -> 绿色
+        # 4: 车辆 (Car) -> 黄色
+        # 5: 背景/杂项 (Clutter/background) -> 红色
+
+        mapping = {
+            0: [255, 255, 255],  # Impervious surfaces
+            1: [0, 0, 255],  # Building
+            2: [0, 255, 255],  # Low vegetation
+            3: [0, 255, 0],  # Tree
+            4: [255, 255, 0],  # Car
+            5: [255, 0, 0],  # Clutter
+        }
+
+        for idx, color in mapping.items():
+            cmap[idx] = color
+
+    elif dataset == "cityscapes":
         cmap[0] = np.array([128, 64, 128])
         cmap[1] = np.array([244, 35, 232])
         cmap[2] = np.array([70, 70, 70])
@@ -118,7 +140,7 @@ def color_map(dataset='pascal'):
         cmap[17] = np.array([0, 0, 230])
         cmap[18] = np.array([119, 11, 32])
 
-    elif dataset == 'ade20k':
+    elif dataset == "ade20k":
         cmap[0] = np.array([120, 120, 120])
         cmap[1] = np.array([180, 120, 120])
         cmap[2] = np.array([6, 230, 230])
