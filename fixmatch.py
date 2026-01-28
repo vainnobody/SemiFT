@@ -12,12 +12,15 @@ from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
 import yaml
 
-from dataset.semi import SemiDataset
+from dataset.semi_rs import SemiDataset
 from dataset.val import ValDataset
 from model.semseg.dpt import DPT
+from model.semseg.upernet import UperNet
+
 from supervised import evaluate
 from util.classes import CLASSES
 from util.ohem import ProbOhemCrossEntropy2d
+from util.focal import FocalLoss
 from util.utils import count_params, init_log, AverageMeter
 from util.dist_helper import setup_distributed
 
@@ -82,10 +85,17 @@ def main():
     backbone_version = cfg["backbone"].split("_")[0]
     # DINOv2 uses patch_size=14, DINOv3 uses patch_size=16
     patch_size = 14 if backbone_version == "dinov2" else 16
-    model = DPT(
-        **{**model_configs[backbone_size], "nclass": cfg["nclass"]},
-        backbone_version=backbone_version,
-    )
+
+    if cfg["model"] == "dpt":
+        model = DPT(
+            **{**model_configs[backbone_size], "nclass": cfg["nclass"]},
+            backbone_version=backbone_version,
+        )
+    elif cfg["model"] == "upernet":
+        model = UperNet(
+            **{**model_configs[backbone_size], "nclass": cfg["nclass"]},
+            backbone_version=backbone_version,
+        )
 
     state_dict = torch.load(f'./pretrained/{cfg["backbone"]}.pth')
     model.backbone.load_state_dict(state_dict)
@@ -141,6 +151,8 @@ def main():
         criterion_l = ProbOhemCrossEntropy2d(**cfg["criterion"]["kwargs"]).cuda(
             local_rank
         )
+    elif cfg["criterion"]["name"] == "FocalLoss":
+        criterion_l = FocalLoss(**cfg["criterion"]["kwargs"]).cuda(local_rank)
     else:
         raise NotImplementedError(
             "%s criterion is not implemented" % cfg["criterion"]["name"]
@@ -292,6 +304,7 @@ def main():
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
+
             if i < 10:
                 viz.push(
                     {
@@ -304,7 +317,7 @@ def main():
                             Visualizer.SEGMENTATION,
                         ),
                         "pred_u_s": (
-                            pred_u_s[0].argmax(dim=1),
+                            pred_u_s.argmax(dim=1)[0],
                             Visualizer.SEGMENTATION,
                         ),
                     }
