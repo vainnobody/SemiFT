@@ -42,7 +42,6 @@ def validation_cpu(cfg, model, valid_loader):
     intersection_meter = AverageMeter()
     union_meter = AverageMeter()
     target_meter = AverageMeter()
-    predict_meter = AverageMeter()
 
     model.eval()
 
@@ -96,30 +95,20 @@ def validation_cpu(cfg, model, valid_loader):
             o = o.max(1)[1]
         gray = np.uint8(o.cpu().numpy())
         target = np.array(y, dtype=np.int32)
-        intersection, union, target, predict = intersectionAndUnion(
+        intersection, union, target_area = intersectionAndUnion(
             gray, target, cfg["nclass"], cfg["ignore_index"]
         )
         intersection_meter.update(intersection)
         union_meter.update(union)
-        target_meter.update(target)
-        predict_meter.update(predict)
+        target_meter.update(target_area)
     iou_class = intersection_meter.sum / (union_meter.sum + 1e-10)
-    accuracy_class = intersection_meter.sum / (target_meter.sum + 1e-10)
-    precise_class = intersection_meter.sum / (predict_meter.sum + 1e-10)
-    F1_class = 2 * (precise_class * accuracy_class) / (precise_class + accuracy_class)
 
     if cfg["dataset"] == "iSAID":
         mIoU = np.mean(iou_class[1:]) * 100.0
-        mAcc = np.mean(accuracy_class[1:]) * 100.0
-        mF1 = np.mean(F1_class[1:]) * 100.0
-        allAcc = sum(intersection_meter.sum[1:]) / (sum(target_meter.sum[1:]) + 1e-10)
     else:
         mIoU = np.nanmean(iou_class) * 100.0
-        mAcc = np.nanmean(accuracy_class) * 100.0
-        mF1 = np.nanmean(F1_class) * 100.0
-        allAcc = sum(intersection_meter.sum) / (sum(target_meter.sum) + 1e-10)
 
-    return mIoU, mAcc, mF1, allAcc, iou_class, F1_class
+    return mIoU, iou_class
 
 
 def evaluate(model, loader, mode, cfg, multiplier=None):
