@@ -17,7 +17,7 @@ from dataset.val import ValDataset
 from model.semseg.dpt import DPT
 from model.semseg.my_upernet import MyUperNet
 from model.semseg.upernet import UperNet
-from supervised import evaluate
+from supervised import evaluate, validation_cpu
 from util.classes import CLASSES
 from util.ohem import ProbOhemCrossEntropy2d
 from util.focal import FocalLoss
@@ -368,12 +368,15 @@ def main(args, cfg):
                 )
 
         eval_mode = "sliding_window" if cfg["dataset"] == "cityscapes" else "original"
-        mIoU, iou_class = evaluate(
-            model, valloader, eval_mode, cfg, multiplier=patch_size
-        )
-        mIoU_ema, iou_class_ema = evaluate(
-            model_ema, valloader, eval_mode, cfg, multiplier=patch_size
-        )
+        # mIoU, iou_class = evaluate(
+        #     model, valloader, eval_mode, cfg, multiplier=patch_size
+        # )
+        # mIoU_ema, iou_class_ema = evaluate(
+        #     model_ema, valloader, eval_mode, cfg, multiplier=patch_size
+        # )
+
+        mIoU, iou_class = validation_cpu(cfg, model, valloader)
+        mIoU_ema, iou_class_ema = validation_cpu(cfg, model_ema, valloader)
 
         if rank == 0:
             for cls_idx, iou in enumerate(iou_class):
