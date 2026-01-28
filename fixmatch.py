@@ -21,6 +21,7 @@ from util.ohem import ProbOhemCrossEntropy2d
 from util.utils import count_params, init_log, AverageMeter
 from util.dist_helper import setup_distributed
 
+from util.viz import Visualizer
 
 parser = argparse.ArgumentParser(
     description="Reproduced FixMatch with an EMA Teacher for Semi-Supervised Semantic Segmentation"
@@ -217,6 +218,11 @@ def main():
         if rank == 0:
             logger.info("************ Load from checkpoint at epoch %i\n" % epoch)
 
+    from datetime import datetime
+
+    filename = datetime.now().strftime("%Y%m%d_%H%M%S")
+    viz = Visualizer(save_dir=f"./viz/{filename}", dataset=args.dataset)
+
     for epoch in range(epoch + 1, cfg["epochs"]):
         if rank == 0:
             logger.info(
@@ -286,6 +292,22 @@ def main():
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
+            if i < 10:
+                viz.push(
+                    {
+                        "img_x": (img_x, Visualizer.TENSOR),
+                        "mask_x": (mask_x, Visualizer.SEGMENTATION),
+                        "pred_x": (pred_x.argmax(dim=1), Visualizer.SEGMENTATION),
+                        "img_u_s": (img_u_s, Visualizer.TENSOR),
+                        "mask_u_w_cutmixed": (
+                            mask_u_w_cutmixed,
+                            Visualizer.SEGMENTATION,
+                        ),
+                        "pred_u_s": (pred_u_s.argmax(dim=1), Visualizer.SEGMENTATION),
+                    }
+                )
+                viz.render(f"epoch_{epoch}_iter_{i}")
+                viz.reset()
 
             total_loss.update(loss.item())
             total_loss_x.update(loss_x.item())
