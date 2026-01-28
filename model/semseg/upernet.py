@@ -211,6 +211,7 @@ class UperNet(nn.Module):
         fpn_channels=512,
         use_bn=True,  # kept for API compatibility with DPT
         backbone_version="dinov2",
+        **kwargs,  # Ignore DPT-specific params (features, out_channels)
     ):
         super(UperNet, self).__init__()
 
