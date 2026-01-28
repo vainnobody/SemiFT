@@ -14,3 +14,9 @@ configs/
 # splits
 
 splits/
+
+# viz
+viz/
+
+# scripts
+scripts/
