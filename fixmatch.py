@@ -221,7 +221,7 @@ def main():
     from datetime import datetime
 
     filename = datetime.now().strftime("%Y%m%d_%H%M%S")
-    viz = Visualizer(save_dir=f"./viz/{filename}", dataset=args.dataset)
+    viz = Visualizer(save_dir=f"./viz/{filename}", dataset=cfg["dataset"])
 
     for epoch in range(epoch + 1, cfg["epochs"]):
         if rank == 0:
