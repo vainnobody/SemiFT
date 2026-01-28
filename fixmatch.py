@@ -15,8 +15,8 @@ import yaml
 from dataset.semi_rs import SemiDataset
 from dataset.val import ValDataset
 from model.semseg.dpt import DPT
-from model.semseg.my_upernet import MyUperNet as UperNet
-
+from model.semseg.my_upernet import MyUperNet
+from model.semseg.upernet import UperNet
 from supervised import evaluate
 from util.classes import CLASSES
 from util.ohem import ProbOhemCrossEntropy2d
