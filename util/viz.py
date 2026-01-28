@@ -65,15 +65,21 @@ class Visualizer:
             img = self._process(data, dtype)
             self.data_list.append((name, img, dtype))
 
-    def render(self, filename):
+    def render(self, filename=None):
         """渲染并保存图像
 
         Args:
-            filename: 保存文件名
+            filename: 保存文件名，默认为当前时间
         """
         n = len(self.data_list)
         if n == 0:
             return
+
+        # 如果没有指定文件名，使用当前时间
+        if filename is None:
+            from datetime import datetime
+
+            filename = datetime.now().strftime("%Y%m%d_%H%M%S") + ".png"
 
         # 自动计算网格布局（接近正方形）
         ncol = int(np.ceil(np.sqrt(n)))
