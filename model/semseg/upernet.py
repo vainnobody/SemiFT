@@ -208,7 +208,7 @@ class UperNet(nn.Module):
         self,
         encoder_size="base",
         nclass=21,
-        fpn_channels=512,
+        fpn_channels=256,
         use_bn=True,  # kept for API compatibility with DPT
         backbone_version="dinov2",
         **kwargs,  # Ignore DPT-specific params (features, out_channels)
