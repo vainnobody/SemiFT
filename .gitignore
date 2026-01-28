@@ -20,3 +20,6 @@ viz/
 
 # scripts
 scripts/
+
+# logs
+logs/
