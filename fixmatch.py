@@ -26,22 +26,21 @@ from util.dist_helper import setup_distributed
 
 from util.viz import Visualizer
 
-parser = argparse.ArgumentParser(
-    description="Reproduced FixMatch with an EMA Teacher for Semi-Supervised Semantic Segmentation"
-)
-parser.add_argument("--config", type=str, required=True)
-parser.add_argument("--labeled-id-path", type=str, required=True)
-parser.add_argument("--unlabeled-id-path", type=str, required=True)
-parser.add_argument("--save-path", type=str, required=True)
-parser.add_argument("--local_rank", "--local-rank", default=0, type=int)
-parser.add_argument("--port", default=None, type=int)
+
+def get_parser():
+    parser = argparse.ArgumentParser(
+        description="Reproduced FixMatch with an EMA Teacher for Semi-Supervised Semantic Segmentation"
+    )
+    parser.add_argument("--config", type=str, required=True)
+    parser.add_argument("--labeled-id-path", type=str, required=True)
+    parser.add_argument("--unlabeled-id-path", type=str, required=True)
+    parser.add_argument("--save-path", type=str, required=True)
+    parser.add_argument("--local_rank", "--local-rank", default=0, type=int)
+    parser.add_argument("--port", default=None, type=int)
+    return parser.parse_args()
 
 
-def main():
-    args = parser.parse_args()
-
-    cfg = yaml.load(open(args.config, "r"), Loader=yaml.Loader)
-
+def main(args, cfg):
     logger = init_log("global", logging.INFO)
     logger.propagate = 0
 
@@ -431,4 +430,6 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    args = get_parser()
+    cfg = yaml.load(open(args.config, "r"), Loader=yaml.Loader)
+    main(args, cfg)
