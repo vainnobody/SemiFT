@@ -263,6 +263,11 @@ class UperNet(nn.Module):
         # For comp_drop support (same as DPT)
         self.binomial = torch.distributions.binomial.Binomial(probs=0.5)
 
+    @property
+    def head(self):
+        """Return decoder components for compatibility with DPT interface."""
+        return nn.ModuleList([self.neck, self.decoder])
+
     def lock_backbone(self):
         """Lock backbone parameters (same interface as DPT)."""
         for p in self.backbone.parameters():
