@@ -313,84 +313,81 @@ def main(args, cfg):
             # CutMix images
             cutmix_img_(img_u_s1, img_u_s1_mix, cutmix_box1)
 
-            with torch.cuda.amp.autocast(enabled=amp):
-                # Generate pseudo-labels (teacher mode - no gradients)
-                model.eval()
-                with torch.no_grad():
-                    pred_u_w_mix = model(img_u_w_mix, scale_factor=None)
-                    if isinstance(pred_u_w_mix, dict):
-                        pred_u_w_mix = pred_u_w_mix["pred_ori"]
-                    conf_u_w_mix, mask_u_w_mix = pred_u_w_mix.softmax(dim=1).max(dim=1)
+            # Generate pseudo-labels (teacher mode - no gradients)
+            model.eval()
+            with torch.no_grad():
+                pred_u_w_mix = model(img_u_w_mix, scale_factor=None)
+                if isinstance(pred_u_w_mix, dict):
+                    pred_u_w_mix = pred_u_w_mix["pred_ori"]
+                conf_u_w_mix, mask_u_w_mix = pred_u_w_mix.softmax(dim=1).max(dim=1)
 
-                model.train()
+            model.train()
 
-                num_lb, num_ulb = img_x.shape[0], img_u_w.shape[0]
+            num_lb, num_ulb = img_x.shape[0], img_u_w.shape[0]
 
-                # Multi-scale forward
-                pred = model(
-                    torch.cat((img_x, img_u_w)),
-                    scale_factor=random_scale,
-                    feature_scale=feature_scale,
-                )
-                pred_u_s = model(img_u_s1, scale_factor=None)
-                if isinstance(pred_u_s, dict):
-                    pred_u_s = pred_u_s["pred_ori"]
+            # Multi-scale forward
+            pred = model(
+                torch.cat((img_x, img_u_w)),
+                scale_factor=random_scale,
+                feature_scale=feature_scale,
+            )
+            pred_u_s = model(img_u_s1, scale_factor=None)
+            if isinstance(pred_u_s, dict):
+                pred_u_s = pred_u_s["pred_ori"]
 
-                # Select prediction based on warmup
-                if epoch < warm_up:
-                    pred_u_w = pred["pred_ori"][num_lb:]
-                else:
-                    pred_u_w = pred["pred_joint"][num_lb:]
+            # Select prediction based on warmup
+            if epoch < warm_up:
+                pred_u_w = pred["pred_ori"][num_lb:]
+            else:
+                pred_u_w = pred["pred_joint"][num_lb:]
 
-                pred_u_w = pred_u_w.detach()
-                conf_u_w, mask_u_w = pred_u_w.softmax(dim=1).max(dim=1)
+            pred_u_w = pred_u_w.detach()
+            conf_u_w, mask_u_w = pred_u_w.softmax(dim=1).max(dim=1)
 
-                # CutMix labels
-                mask_u_w_cutmixed1 = cutmix_mask(mask_u_w, mask_u_w_mix, cutmix_box1)
-                conf_u_w_cutmixed1 = cutmix_mask(conf_u_w, conf_u_w_mix, cutmix_box1)
-                ignore_mask_cutmixed1 = cutmix_mask(
-                    ignore_mask, ignore_mask_mix, cutmix_box1
-                )
+            # CutMix labels
+            mask_u_w_cutmixed1 = cutmix_mask(mask_u_w, mask_u_w_mix, cutmix_box1)
+            conf_u_w_cutmixed1 = cutmix_mask(conf_u_w, conf_u_w_mix, cutmix_box1)
+            ignore_mask_cutmixed1 = cutmix_mask(
+                ignore_mask, ignore_mask_mix, cutmix_box1
+            )
 
-                # Supervised loss
-                pred_x_joint = pred["pred_joint"][:num_lb]
-                loss_x = criterion_l(pred_x_joint, mask_x)
+            # Supervised loss
+            pred_x_joint = pred["pred_joint"][:num_lb]
+            loss_x = criterion_l(pred_x_joint, mask_x)
 
-                # Unsupervised losses
-                pred_u_w_scale = pred["pred_size"][num_lb:]
-                pred_u_w_fp = pred["pred_fp"][num_lb:]
+            # Unsupervised losses
+            pred_u_w_scale = pred["pred_size"][num_lb:]
+            pred_u_w_fp = pred["pred_fp"][num_lb:]
 
-                # Strong augmentation loss
-                loss_u_s1 = criterion_u(pred_u_s, mask_u_w_cutmixed1)
-                loss_u_s1 = confidence_weighted_loss(
-                    loss_u_s1,
-                    conf_u_w_cutmixed1,
-                    ignore_mask_cutmixed1,
-                    conf_thresh=conf_thresh,
-                )
+            # Strong augmentation loss
+            loss_u_s1 = criterion_u(pred_u_s, mask_u_w_cutmixed1)
+            loss_u_s1 = confidence_weighted_loss(
+                loss_u_s1,
+                conf_u_w_cutmixed1,
+                ignore_mask_cutmixed1,
+                conf_thresh=conf_thresh,
+            )
 
-                # Scale loss
-                loss_u_size = criterion_u(pred_u_w_scale, mask_u_w)
-                loss_u_size = confidence_weighted_loss(
-                    loss_u_size, conf_u_w, ignore_mask, conf_thresh=conf_thresh
-                )
+            # Scale loss
+            loss_u_size = criterion_u(pred_u_w_scale, mask_u_w)
+            loss_u_size = confidence_weighted_loss(
+                loss_u_size, conf_u_w, ignore_mask, conf_thresh=conf_thresh
+            )
 
-                # Feature perturbation loss
-                loss_u_w_fp = criterion_u(pred_u_w_fp, mask_u_w)
-                loss_u_w_fp = confidence_weighted_loss(
-                    loss_u_w_fp, conf_u_w, ignore_mask, conf_thresh=conf_thresh
-                )
+            # Feature perturbation loss
+            loss_u_w_fp = criterion_u(pred_u_w_fp, mask_u_w)
+            loss_u_w_fp = confidence_weighted_loss(
+                loss_u_w_fp, conf_u_w, ignore_mask, conf_thresh=conf_thresh
+            )
 
-                mask_ratio = (
-                    (conf_u_w >= conf_thresh) & (ignore_mask != 255)
-                ).sum().item() / (ignore_mask != 255).sum().clamp(min=1.0)
+            mask_ratio = (
+                (conf_u_w >= conf_thresh) & (ignore_mask != 255)
+            ).sum().item() / (ignore_mask != 255).sum().clamp(min=1.0)
 
-                # Combined unsupervised loss (ScaleMatch weighting)
-                loss_standard = (
-                    loss_u_s1 * 0.25 + loss_u_size * 0.25 + loss_u_w_fp * 0.5
-                )
+            # Combined unsupervised loss (ScaleMatch weighting)
+            loss_standard = loss_u_s1 * 0.25 + loss_u_size * 0.25 + loss_u_w_fp * 0.5
 
-                total_loss = (loss_x + loss_standard) / 2.0
+            total_loss = (loss_x + loss_standard) / 2.0
 
             torch.distributed.barrier()
 
