@@ -325,24 +325,56 @@ def main(args, cfg):
 
             num_lb, num_ulb = img_x.shape[0], img_u_w.shape[0]
 
-            # Multi-scale forward
-            pred = model(
-                torch.cat((img_x, img_u_w)),
-                scale_factor=random_scale,
-                feature_scale=feature_scale,
-            )
+            optimizer.zero_grad()
+
+            # Part 1: Labeled + Weak Unlabeled (No Sync)
+            # Use no_sync to accumulate gradients without communication for the first forward pass
+            with model.no_sync():
+                # Multi-scale forward
+                pred = model(
+                    torch.cat((img_x, img_u_w)),
+                    scale_factor=random_scale,
+                    feature_scale=feature_scale,
+                )
+
+                # Select prediction based on warmup
+                if epoch < warm_up:
+                    pred_u_w = pred["pred_ori"][num_lb:]
+                else:
+                    pred_u_w = pred["pred_joint"][num_lb:]
+
+                pred_u_w = pred_u_w.detach()
+                conf_u_w, mask_u_w = pred_u_w.softmax(dim=1).max(dim=1)
+
+                # Supervised loss
+                pred_x_joint = pred["pred_joint"][:num_lb]
+                loss_x = criterion_l(pred_x_joint, mask_x)
+
+                # Unsupervised losses parts (feature perturbation coverage)
+                pred_u_w_scale = pred["pred_size"][num_lb:]
+                pred_u_w_fp = pred["pred_fp"][num_lb:]
+
+                # Scale loss
+                loss_u_size = criterion_u(pred_u_w_scale, mask_u_w)
+                loss_u_size = confidence_weighted_loss(
+                    loss_u_size, conf_u_w, ignore_mask, conf_thresh=conf_thresh
+                )
+
+                # Feature perturbation loss
+                loss_u_w_fp = criterion_u(pred_u_w_fp, mask_u_w)
+                loss_u_w_fp = confidence_weighted_loss(
+                    loss_u_w_fp, conf_u_w, ignore_mask, conf_thresh=conf_thresh
+                )
+
+                # Part 1 Loss: (loss_x + 0.25*loss_u_size + 0.5*loss_u_w_fp) / 2.0
+                loss_part1 = (loss_x + 0.25 * loss_u_size + 0.5 * loss_u_w_fp) / 2.0
+                loss_part1.backward()
+
+            # Part 2: Strong Unlabeled (Sync)
+            # Second forward pass triggers gradient synchronization in its backward
             pred_u_s = model(img_u_s1, scale_factor=None)
             if isinstance(pred_u_s, dict):
                 pred_u_s = pred_u_s["pred_ori"]
-
-            # Select prediction based on warmup
-            if epoch < warm_up:
-                pred_u_w = pred["pred_ori"][num_lb:]
-            else:
-                pred_u_w = pred["pred_joint"][num_lb:]
-
-            pred_u_w = pred_u_w.detach()
-            conf_u_w, mask_u_w = pred_u_w.softmax(dim=1).max(dim=1)
 
             # CutMix labels
             mask_u_w_cutmixed1 = cutmix_mask(mask_u_w, mask_u_w_mix, cutmix_box1)
@@ -350,14 +382,6 @@ def main(args, cfg):
             ignore_mask_cutmixed1 = cutmix_mask(
                 ignore_mask, ignore_mask_mix, cutmix_box1
             )
-
-            # Supervised loss
-            pred_x_joint = pred["pred_joint"][:num_lb]
-            loss_x = criterion_l(pred_x_joint, mask_x)
-
-            # Unsupervised losses
-            pred_u_w_scale = pred["pred_size"][num_lb:]
-            pred_u_w_fp = pred["pred_fp"][num_lb:]
 
             # Strong augmentation loss
             loss_u_s1 = criterion_u(pred_u_s, mask_u_w_cutmixed1)
@@ -368,32 +392,20 @@ def main(args, cfg):
                 conf_thresh=conf_thresh,
             )
 
-            # Scale loss
-            loss_u_size = criterion_u(pred_u_w_scale, mask_u_w)
-            loss_u_size = confidence_weighted_loss(
-                loss_u_size, conf_u_w, ignore_mask, conf_thresh=conf_thresh
-            )
+            # Part 2 Loss: (0.25 * loss_u_s1) / 2.0
+            # Note: total_loss calculation for logging is reconstructed below
+            loss_part2 = (0.25 * loss_u_s1) / 2.0
+            loss_part2.backward()
 
-            # Feature perturbation loss
-            loss_u_w_fp = criterion_u(pred_u_w_fp, mask_u_w)
-            loss_u_w_fp = confidence_weighted_loss(
-                loss_u_w_fp, conf_u_w, ignore_mask, conf_thresh=conf_thresh
-            )
+            optimizer.step()
+
+            # Reconstruct total loss for logging
+            loss_standard = loss_u_s1 * 0.25 + loss_u_size * 0.25 + loss_u_w_fp * 0.5
+            total_loss = (loss_x + loss_standard) / 2.0
 
             mask_ratio = (
                 (conf_u_w >= conf_thresh) & (ignore_mask != 255)
             ).sum().item() / (ignore_mask != 255).sum().clamp(min=1.0)
-
-            # Combined unsupervised loss (ScaleMatch weighting)
-            loss_standard = loss_u_s1 * 0.25 + loss_u_size * 0.25 + loss_u_w_fp * 0.5
-
-            total_loss = (loss_x + loss_standard) / 2.0
-
-            torch.distributed.barrier()
-
-            optimizer.zero_grad()
-            total_loss.backward()
-            optimizer.step()
 
             # Logging
             log_avg.update(
