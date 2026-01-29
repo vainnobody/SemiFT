@@ -327,7 +327,7 @@ def main(args, cfg):
         pin_memory=True,
         num_workers=4,
         drop_last=True,
-        sampler=trainsampler_l,
+        sampler=trainsampler,
     )
 
     valsampler = torch.utils.data.distributed.DistributedSampler(valset)
