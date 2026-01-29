@@ -25,6 +25,8 @@ from util.dist_helper import setup_distributed
 
 from util.viz import Visualizer
 
+import numpy as np
+
 
 def evaluate(model, loader, mode, cfg, multiplier=None):
     model.eval()
