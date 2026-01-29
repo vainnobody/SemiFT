@@ -310,12 +310,20 @@ def main(args, cfg):
             "%s criterion is not implemented" % cfg["criterion"]["name"]
         )
 
+    if cfg["dataset"] == "Vainhingen":
+        cfg["nsample"] = 15 * 50
+    elif cfg["dataset"] == "potsdam":
+        cfg["nsample"] = 23 * 50
+    else:
+        cfg["nsample"] = 750
+
     trainset_l = SemiDataset(
         cfg["dataset"],
         cfg["data_root"],
         "train_l",
         cfg["crop_size"],
         args.labeled_id_path,
+        nsample=cfg["nsample"],
         ignore_index=cfg["ignore_index"],
     )
     valset = ValDataset(
