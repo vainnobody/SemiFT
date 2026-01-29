@@ -461,7 +461,7 @@ class DPT_ScaleMatch(nn.Module):
             x_lo = resize_x(x_1x, scale_factor)
             x_hi = x_1x
 
-            p_lo, feats_lo = self._base_forward(x_lo, scale_factor=scale_factor)
+            p_lo, feats_lo = self._base_forward(x_lo)
             p_hi, feats_hi, out_fp = self._base_forward(
                 x_hi, need_fp=True, feature_scale=feature_scale
             )
