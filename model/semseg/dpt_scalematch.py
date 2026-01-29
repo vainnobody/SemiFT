@@ -319,20 +319,21 @@ class DPT_ScaleMatch(nn.Module):
 
         # ScaleMatch specific components
         scale_in_ch = 2 * features  # Concatenated features from two scales
+        rwkv_channels = scale_in_ch // 16
 
         # Scale attention module
         self.scale_attn = nn.Sequential(
             nn.Conv2d(
-                scale_in_ch + 32,
-                scale_in_ch + 32,
+                scale_in_ch + rwkv_channels,
+                scale_in_ch + rwkv_channels,
                 kernel_size=3,
                 padding=1,
-                groups=scale_in_ch + 32,
+                groups=scale_in_ch + rwkv_channels,
                 bias=False,
             ),
-            nn.BatchNorm2d(scale_in_ch + 32),
+            nn.BatchNorm2d(scale_in_ch + rwkv_channels),
             nn.ReLU(inplace=True),
-            nn.Conv2d(scale_in_ch + 32, 128, kernel_size=1, bias=False),
+            nn.Conv2d(scale_in_ch + rwkv_channels, 128, kernel_size=1, bias=False),
             nn.BatchNorm2d(128),
             nn.ReLU(inplace=True),
             nn.Conv2d(128, 128, kernel_size=3, padding=1, groups=128, bias=False),
@@ -343,11 +344,11 @@ class DPT_ScaleMatch(nn.Module):
         )
 
         # Squeeze-and-Excitation block
-        self.se_block = SqueezeExcitation(scale_in_ch + 32)
+        self.se_block = SqueezeExcitation(scale_in_ch + rwkv_channels)
 
         # Global interaction via RWKV-style layers
         self.rwkv_layers = RWKVLayers(
-            1, scale_in_ch // 16, mlp_ratio=4.0, drop_path=0.0, total_layers=2
+            1, rwkv_channels, mlp_ratio=4.0, drop_path=0.0, total_layers=2
         )
 
         # Dropout for feature perturbation
