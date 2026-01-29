@@ -311,11 +311,11 @@ def main(args, cfg):
         )
 
     if cfg["dataset"] == "Vainhingen":
-        cfg["nsample"] = 15 * 50
+        cfg["nsample"] = 15
     elif cfg["dataset"] == "potsdam":
-        cfg["nsample"] = 23 * 50
+        cfg["nsample"] = 23
     else:
-        cfg["nsample"] = 750
+        cfg["nsample"] = 20
 
     trainset_l = SemiDataset(
         cfg["dataset"],
