@@ -190,14 +190,14 @@ def main(args, cfg):
     )
 
     # Data loaders
-    if ddp:
-        trainsampler_l = torch.utils.data.distributed.DistributedSampler(trainset_l)
-        trainsampler_u = torch.utils.data.distributed.DistributedSampler(trainset_u)
-        valsampler = torch.utils.data.distributed.DistributedSampler(valset)
-    else:
-        trainsampler_l = None
-        trainsampler_u = None
-        valsampler = None
+    # if ddp:
+    #     trainsampler_l = torch.utils.data.distributed.DistributedSampler(trainset_l)
+    #     trainsampler_u = torch.utils.data.distributed.DistributedSampler(trainset_u)
+    #     valsampler = torch.utils.data.distributed.DistributedSampler(valset)
+    # else:
+    #     trainsampler_l = None
+    #     trainsampler_u = None
+    #     valsampler = None
 
     trainsampler_l = torch.utils.data.distributed.DistributedSampler(trainset_l)
     trainloader_l = DataLoader(
