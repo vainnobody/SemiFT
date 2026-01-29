@@ -343,6 +343,7 @@ def main(args, cfg):
     iters = 0
     total_iters = len(trainloader) * cfg["epochs"]
     previous_best = 0.0
+    best_epoch = -1
     epoch = -1
 
     if os.path.exists(os.path.join(args.save_path, "latest.pth")):
