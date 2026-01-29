@@ -35,12 +35,25 @@ def scale_as(x, target):
     return F.interpolate(x, size=target.shape[-2:], mode="bilinear", align_corners=True)
 
 
-def resize_x(x, scale_factor):
-    """Resize x by a scale factor."""
+def resize_x(x, scale_factor, patch_size=14):
+    """Resize x by a scale factor, ensuring patch alignment."""
     if scale_factor == 1.0:
         return x
+
+    H, W = x.shape[-2:]
+    target_H = int(H * scale_factor)
+    target_W = int(W * scale_factor)
+
+    # Snap to nearest multiple of patch_size
+    target_H = round(target_H / patch_size) * patch_size
+    target_W = round(target_W / patch_size) * patch_size
+
+    # Ensure at least one patch
+    target_H = max(target_H, patch_size)
+    target_W = max(target_W, patch_size)
+
     return F.interpolate(
-        x, scale_factor=scale_factor, mode="bilinear", align_corners=True
+        x, size=(target_H, target_W), mode="bilinear", align_corners=True
     )
 
 
@@ -415,7 +428,7 @@ class DPT_ScaleMatch(nn.Module):
         if scale_factor > 1.0:
             # High resolution path
             x_lo = x_1x
-            x_hi = resize_x(x_1x, scale_factor)
+            x_hi = resize_x(x_1x, scale_factor, patch_size=self.backbone.patch_size)
 
             p_lo_ori, feats_lo, out_fp = self._base_forward(
                 x_lo, need_fp=True, feature_scale=feature_scale
@@ -458,7 +471,7 @@ class DPT_ScaleMatch(nn.Module):
 
         else:
             # Low resolution path
-            x_lo = resize_x(x_1x, scale_factor)
+            x_lo = resize_x(x_1x, scale_factor, patch_size=self.backbone.patch_size)
             x_hi = x_1x
 
             p_lo, feats_lo = self._base_forward(x_lo)
