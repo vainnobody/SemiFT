@@ -12,31 +12,35 @@ from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
 import yaml
 
-from dataset.semi import SemiDataset
+from dataset.semi_rs import SemiDataset
+from dataset.val import ValDataset
 from model.semseg.dpt import DPT
-from supervised import evaluate
+from model.semseg.my_upernet import MyUperNet
+from model.semseg.upernet import UperNet
+from supervised import evaluate, validation_cpu
 from util.classes import CLASSES
 from util.ohem import ProbOhemCrossEntropy2d
+from util.focal import FocalLoss
 from util.utils import count_params, init_log, AverageMeter
 from util.dist_helper import setup_distributed
 
-
-parser = argparse.ArgumentParser(
-    description="UniMatch V2: Pushing the Limit of Semi-Supervised Semantic Segmentation"
-)
-parser.add_argument("--config", type=str, required=True)
-parser.add_argument("--labeled-id-path", type=str, required=True)
-parser.add_argument("--unlabeled-id-path", type=str, required=True)
-parser.add_argument("--save-path", type=str, required=True)
-parser.add_argument("--local_rank", "--local-rank", default=0, type=int)
-parser.add_argument("--port", default=None, type=int)
+from util.viz import Visualizer
 
 
-def main():
-    args = parser.parse_args()
+def get_parser():
+    parser = argparse.ArgumentParser(
+        description="Reproduced FixMatch with an EMA Teacher for Semi-Supervised Semantic Segmentation"
+    )
+    parser.add_argument("--config", type=str, required=True)
+    parser.add_argument("--labeled-id-path", type=str, required=True)
+    parser.add_argument("--unlabeled-id-path", type=str, required=True)
+    parser.add_argument("--save-path", type=str, required=True)
+    parser.add_argument("--local_rank", "--local-rank", default=0, type=int)
+    parser.add_argument("--port", default=None, type=int)
+    return parser.parse_args()
 
-    cfg = yaml.load(open(args.config, "r"), Loader=yaml.Loader)
 
+def main(args, cfg):
     logger = init_log("global", logging.INFO)
     logger.propagate = 0
 
@@ -75,9 +79,23 @@ def main():
             "out_channels": [1536, 1536, 1536, 1536],
         },
     }
-    model = DPT(
-        **{**model_configs[cfg["backbone"].split("_")[-1]], "nclass": cfg["nclass"]}
-    )
+
+    backbone_size = cfg["backbone"].split("_")[-1]
+    backbone_version = cfg["backbone"].split("_")[0]
+    # DINOv2 uses patch_size=14, DINOv3 uses patch_size=16
+    patch_size = 14 if backbone_version == "dinov2" else 16
+
+    if cfg["model"] == "dpt":
+        model = DPT(
+            **{**model_configs[backbone_size], "nclass": cfg["nclass"]},
+            backbone_version=backbone_version,
+        )
+    elif cfg["model"] == "upernet":
+        model = UperNet(
+            **{**model_configs[backbone_size], "nclass": cfg["nclass"]},
+            backbone_version=backbone_version,
+        )
+
     state_dict = torch.load(f'./pretrained/{cfg["backbone"]}.pth')
     model.backbone.load_state_dict(state_dict)
 
@@ -132,6 +150,8 @@ def main():
         criterion_l = ProbOhemCrossEntropy2d(**cfg["criterion"]["kwargs"]).cuda(
             local_rank
         )
+    elif cfg["criterion"]["name"] == "FocalLoss":
+        criterion_l = FocalLoss(**cfg["criterion"]["kwargs"]).cuda(local_rank)
     else:
         raise NotImplementedError(
             "%s criterion is not implemented" % cfg["criterion"]["name"]
@@ -145,6 +165,7 @@ def main():
         "train_u",
         cfg["crop_size"],
         args.unlabeled_id_path,
+        ignore_index=cfg["ignore_index"],
     )
     trainset_l = SemiDataset(
         cfg["dataset"],
@@ -153,8 +174,11 @@ def main():
         cfg["crop_size"],
         args.labeled_id_path,
         nsample=len(trainset_u.ids),
+        ignore_index=cfg["ignore_index"],
     )
-    valset = SemiDataset(cfg["dataset"], cfg["data_root"], "val")
+    valset = ValDataset(
+        cfg["dataset"], cfg["data_root"], "val", ignore_value=cfg["ignore_index"]
+    )
 
     trainsampler_l = torch.utils.data.distributed.DistributedSampler(trainset_l)
     trainloader_l = DataLoader(
@@ -192,9 +216,7 @@ def main():
     epoch = -1
 
     if os.path.exists(os.path.join(args.save_path, "latest.pth")):
-        checkpoint = torch.load(
-            os.path.join(args.save_path, "latest.pth"), map_location="cpu"
-        )
+        checkpoint = torch.load(os.path.join(args.save_path, "latest.pth"))
         model.load_state_dict(checkpoint["model"])
         model_ema.load_state_dict(checkpoint["model_ema"])
         optimizer.load_state_dict(checkpoint["optimizer"])
@@ -206,6 +228,11 @@ def main():
 
         if rank == 0:
             logger.info("************ Load from checkpoint at epoch %i\n" % epoch)
+
+    from datetime import datetime
+
+    filename = datetime.now().strftime("%Y%m%d_%H%M%S")
+    viz = Visualizer(save_dir=f"./viz/{filename}", dataset=cfg["dataset"])
 
     for epoch in range(epoch + 1, cfg["epochs"]):
         if rank == 0:
@@ -230,7 +257,7 @@ def main():
 
         for i, (
             (img_x, mask_x),
-            (img_u_w, img_u_s1, img_u_s2, ignore_mask, cutmix_box1, cutmix_box2),
+            (img_u_w, img_u_s, img_u_s2, ignore_mask, cutmix_box1, cutmix_box2),
         ) in enumerate(loader):
 
             img_x, mask_x = img_x.cuda(), mask_x.cuda()
@@ -305,9 +332,40 @@ def main():
 
             loss = (loss_x + loss_u_s) / 2.0
 
+            torch.distributed.barrier()
+
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
+
+            if i < 10:
+                viz.push(
+                    {
+                        "img_x": (img_x[0], Visualizer.TENSOR),
+                        "mask_x": (mask_x[0], Visualizer.SEGMENTATION),
+                        "pred_x": (pred_x.argmax(dim=1)[0], Visualizer.SEGMENTATION),
+                        "img_u_s1": (img_u_s1[0], Visualizer.TENSOR),
+                        "img_u_s2": (img_u_s2[0], Visualizer.TENSOR),
+                        "mask_u_w_cutmixed1": (
+                            mask_u_w_cutmixed1[0],
+                            Visualizer.SEGMENTATION,
+                        ),
+                        "mask_u_w_cutmixed2": (
+                            mask_u_w_cutmixed2[0],
+                            Visualizer.SEGMENTATION,
+                        ),
+                        "pred_u_s1": (
+                            pred_u_s1.argmax(dim=1)[0],
+                            Visualizer.SEGMENTATION,
+                        ),
+                        "pred_u_s2": (
+                            pred_u_s2.argmax(dim=1)[0],
+                            Visualizer.SEGMENTATION,
+                        ),
+                    }
+                )
+                viz.render(f"epoch_{epoch}_iter_{i}")
+                viz.reset()
 
             total_loss.update(loss.item())
             total_loss_x.update(loss_x.item())
@@ -353,10 +411,15 @@ def main():
                 )
 
         eval_mode = "sliding_window" if cfg["dataset"] == "cityscapes" else "original"
-        mIoU, iou_class = evaluate(model, valloader, eval_mode, cfg, multiplier=14)
-        mIoU_ema, iou_class_ema = evaluate(
-            model_ema, valloader, eval_mode, cfg, multiplier=14
-        )
+        # mIoU, iou_class = evaluate(
+        #     model, valloader, eval_mode, cfg, multiplier=patch_size
+        # )
+        # mIoU_ema, iou_class_ema = evaluate(
+        #     model_ema, valloader, eval_mode, cfg, multiplier=patch_size
+        # )
+
+        mIoU, iou_class = validation_cpu(cfg, model, valloader)
+        mIoU_ema, iou_class_ema = validation_cpu(cfg, model_ema, valloader)
 
         if rank == 0:
             for cls_idx, iou in enumerate(iou_class):
@@ -413,4 +476,6 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    args = get_parser()
+    cfg = yaml.load(open(args.config, "r"), Loader=yaml.Loader)
+    main(args, cfg)
