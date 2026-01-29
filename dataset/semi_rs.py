@@ -77,7 +77,7 @@ class SemiDataset(Dataset):
 
         mask = torch.from_numpy(np.array(mask)).long()
         # Use 255 as a special internal ignore flag for the unsupervised mask filter
-        ignore_mask[mask == self.ignore_index] = 255
+        ignore_mask[mask == 254] = 255
 
         return normalize(img_w), img_s1, img_s2, ignore_mask, cutmix_box1, cutmix_box2
 
