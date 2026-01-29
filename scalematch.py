@@ -23,7 +23,7 @@ import yaml
 from dataset.semi_rs import SemiDataset
 from dataset.val import ValDataset
 from model.semseg.dpt_scalematch import DPT_ScaleMatch
-from supervised import evaluate
+from supervised import evaluate, validation_cpu
 from util.classes import CLASSES
 from util.ohem import ProbOhemCrossEntropy2d
 from util.focal import FocalLoss
@@ -56,8 +56,8 @@ def main(args, cfg):
     logger.propagate = 0
 
     rank, world_size = setup_distributed(port=args.port)
-    ddp = True if world_size > 1 else False
-    amp = cfg.get("amp", False)
+    # ddp = True if world_size > 1 else False
+    # amp = cfg.get("amp", False)
 
     if rank == 0:
         all_args = {**cfg, **vars(args), "ngpus": world_size}
@@ -106,7 +106,7 @@ def main(args, cfg):
     state_dict = torch.load(f'./pretrained/{cfg["backbone"]}.pth')
     model.backbone.load_state_dict(state_dict)
 
-    if cfg.get("lock_backbone", False):
+    if cfg["lock_backbone"]:
         model.lock_backbone()
 
     # Optimizer - use SGD like original ScaleMatch
@@ -137,18 +137,16 @@ def main(args, cfg):
 
     local_rank = int(os.environ["LOCAL_RANK"])
 
-    if ddp:
-        model = torch.nn.SyncBatchNorm.convert_sync_batchnorm(model)
+    model = torch.nn.SyncBatchNorm.convert_sync_batchnorm(model)
     model.cuda()
 
-    if ddp:
-        model = torch.nn.parallel.DistributedDataParallel(
-            model,
-            device_ids=[local_rank],
-            broadcast_buffers=False,
-            output_device=local_rank,
-            find_unused_parameters=True,
-        )
+    model = torch.nn.parallel.DistributedDataParallel(
+        model,
+        device_ids=[local_rank],
+        broadcast_buffers=False,
+        output_device=local_rank,
+        find_unused_parameters=True,
+    )
 
     # Loss functions
     if cfg["criterion"]["name"] == "CELoss":
@@ -201,6 +199,7 @@ def main(args, cfg):
         trainsampler_u = None
         valsampler = None
 
+    trainsampler_l = torch.utils.data.distributed.DistributedSampler(trainset_l)
     trainloader_l = DataLoader(
         trainset_l,
         batch_size=cfg["batch_size"],
@@ -208,8 +207,9 @@ def main(args, cfg):
         num_workers=4,
         drop_last=True,
         sampler=trainsampler_l,
-        shuffle=(trainsampler_l is None),
     )
+
+    trainsampler_u = torch.utils.data.distributed.DistributedSampler(trainset_u)
     trainloader_u = DataLoader(
         trainset_u,
         batch_size=cfg["batch_size"],
@@ -217,8 +217,9 @@ def main(args, cfg):
         num_workers=4,
         drop_last=True,
         sampler=trainsampler_u,
-        shuffle=(trainsampler_u is None),
     )
+
+    valsampler = torch.utils.data.distributed.DistributedSampler(valset)
     valloader = DataLoader(
         valset,
         batch_size=1,
@@ -242,7 +243,7 @@ def main(args, cfg):
     epoch = -1
     ETA = 0.0
 
-    scaler = torch.cuda.amp.GradScaler() if amp else None
+    # scaler = torch.cuda.amp.GradScaler() if amp else None
 
     # Resume from checkpoint
     if os.path.exists(os.path.join(args.save_path, "latest.pth")):
@@ -275,9 +276,8 @@ def main(args, cfg):
 
         log_avg = DictAverageMeter()
 
-        if ddp:
-            trainloader_l.sampler.set_epoch(epoch)
-            trainloader_u.sampler.set_epoch(epoch)
+        trainloader_l.sampler.set_epoch(epoch)
+        trainloader_u.sampler.set_epoch(epoch)
 
         # ScaleMatch uses double trainloader_u for mix samples
         loader = zip(trainloader_l, trainloader_u, trainloader_u)
@@ -392,17 +392,11 @@ def main(args, cfg):
 
                 total_loss = (loss_x + loss_standard) / 2.0
 
-            if ddp:
-                torch.distributed.barrier()
+            torch.distributed.barrier()
 
             optimizer.zero_grad()
-            if amp and scaler is not None:
-                scaler.scale(total_loss).backward()
-                scaler.step(optimizer)
-                scaler.update()
-            else:
-                total_loss.backward()
-                optimizer.step()
+            total_loss.backward()
+            optimizer.step()
 
             # Logging
             log_avg.update(
@@ -434,9 +428,7 @@ def main(args, cfg):
 
         # Evaluation
         eval_mode = "sliding_window" if cfg["dataset"] == "cityscapes" else "original"
-        mIoU, iou_class = evaluate(
-            model, valloader, eval_mode, cfg, multiplier=patch_size
-        )
+        mIoU, iou_class = validation_cpu(cfg, model, valloader)
 
         if rank == 0:
             for cls_idx, iou in enumerate(iou_class):
