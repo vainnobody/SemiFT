@@ -20,7 +20,7 @@ from model.semseg.upernet import UperNet
 from util.classes import CLASSES
 from util.ohem import ProbOhemCrossEntropy2d
 from util.focal import FocalLoss
-from util.utils import count_params, init_log, AverageMeter
+from util.utils import count_params, init_log, AverageMeter, intersectionAndUnion
 from util.dist_helper import setup_distributed
 
 from util.viz import Visualizer
