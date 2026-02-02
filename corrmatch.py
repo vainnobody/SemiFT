@@ -25,77 +25,81 @@ import numpy as np
 from util.classes import CLASSES
 from util.ohem import ProbOhemCrossEntropy2d
 from util.focal import FocalLoss
-from supervised import evaluate, validation_cpu
 
-# @torch.no_grad()
-# def validation_cpu(cfg, model, valid_loader):
-#     intersection_meter = AverageMeter()
-#     union_meter = AverageMeter()
-#     target_meter = AverageMeter()
 
-#     model.eval()
+@torch.no_grad()
+def validation_cpu(cfg, model, valid_loader):
 
-#     for x, y, _ in valid_loader:
-#         x = x.cuda()
-#         if cfg["eval_mode"] == "slide_window":
-#             b, _, h, w = x.shape
-#             final = torch.zeros(b, cfg["nclass"], h, w).cuda()
-#             size = cfg["crop_size"]
-#             step = 510
-#             b_idx = 0
-#             a_idx = 0
-#             while a_idx <= int(h / step):
-#                 while b_idx <= int(w / step):
-#                     sub_input = x[
-#                         :,
-#                         :,
-#                         min(a_idx * step, h - size) : min(a_idx * step + size, h),
-#                         min(b_idx * step, w - size) : min(b_idx * step + size, w),
-#                     ]
-#                     mask = model(sub_input)
-#                     final[
-#                         :,
-#                         :,
-#                         min(a_idx * step, h - size) : min(a_idx * step + size, h),
-#                         min(b_idx * step, w - size) : min(b_idx * step + size, w),
-#                     ] += mask
-#                     b_idx += 1
-#                 b_idx = 0
-#                 a_idx += 1
-#             o = final.argmax(dim=1)
+    intersection_meter = AverageMeter()
+    union_meter = AverageMeter()
+    target_meter = AverageMeter()
 
-#         elif cfg["eval_mode"] == "resize":
-#             original_shape = x.shape[-2:]
-#             resized_x = F.interpolate(
-#                 x, size=cfg["crop_size"], mode="bilinear", align_corners=True
-#             )
-#             resized_o = model(resized_x)
-#             o = F.interpolate(
-#                 resized_o, size=original_shape, mode="bilinear", align_corners=True
-#             )
-#             o = o.argmax(dim=1)
+    model.eval()
 
-#         else:
-#             o = model(x)
-#             o = o.max(1)[1]
+    for x, y, _ in valid_loader:
+        x = x.cuda()
+        if cfg["eval_mode"] == "slide_window":
+            b, _, h, w = x.shape  # 获取输入图像的尺寸 (batch, channels, height, width)
+            final = torch.zeros(b, cfg["nclass"], h, w).cuda()  # 用于存储最终预测结果
+            size = cfg["crop_size"]
+            step = 510
+            b = 0
+            a = 0
+            while a <= int(h / step):
+                while b <= int(w / step):
+                    sub_input = x[
+                        :,
+                        :,
+                        min(a * step, h - size) : min(a * step + size, h),
+                        min(b * step, w - size) : min(b * step + size, w),
+                    ]
+                    # print("sub_input.shape", sub_input.shape)
+                    mask = model(sub_input)["out"]
+                    final[
+                        :,
+                        :,
+                        min(a * step, h - size) : min(a * step + size, h),
+                        min(b * step, w - size) : min(b * step + size, w),
+                    ] += mask
+                    b += 1
+                b = 0
+                a += 1
+            o = final.argmax(dim=1)
 
-#         gray = np.uint8(o.cpu().numpy())
-#         target = np.array(y, dtype=np.int32)
-#         intersection, union, target_area = intersectionAndUnion(
-#             gray, target, cfg["nclass"], cfg["ignore_index"]
-#         )
-#         intersection_meter.update(intersection)
-#         union_meter.update(union)
-#         target_meter.update(target_area)
+        elif cfg["eval_mode"] == "resize":
+            # 使用缩放方式进行预测
+            original_shape = x.shape[-2:]  # 保存原始图像的尺寸 (h, w)
+            resized_x = F.interpolate(
+                x, size=cfg["crop_size"], mode="bilinear", align_corners=True
+            )
+            resized_o = model(resized_x)["out"]
+            # 将预测结果复原到原始尺寸
+            o = F.interpolate(
+                resized_o, size=original_shape, mode="bilinear", align_corners=True
+            )
+            o = o.argmax(dim=1)
 
-#     iou_class = intersection_meter.sum / (union_meter.sum + 1e-10)
+        else:
+            # 直接进行预测（非滑动窗口模式）
 
-#     if cfg["dataset"] == "iSAID":
-#         mIoU = np.mean(iou_class[1:]) * 100.0
-#     else:
-#         mIoU = np.nanmean(iou_class) * 100.0
+            o = model(x)["out"]
+            o = o.max(1)[1]
+        gray = np.uint8(o.cpu().numpy())
+        target = np.array(y, dtype=np.int32)
+        intersection, union, target_area = intersectionAndUnion(
+            gray, target, cfg["nclass"], cfg["ignore_index"]
+        )
+        intersection_meter.update(intersection)
+        union_meter.update(union)
+        target_meter.update(target_area)
+    iou_class = intersection_meter.sum / (union_meter.sum + 1e-10)
 
-#     return mIoU, iou_class
+    if cfg["dataset"] == "iSAID":
+        mIoU = np.mean(iou_class[1:]) * 100.0
+    else:
+        mIoU = np.nanmean(iou_class) * 100.0
+
+    return mIoU, iou_class
 
 
 def get_parser():
@@ -281,6 +285,13 @@ def main(args, cfg):
             logger.info(f"===========> Epoch: {epoch}, Best IoU: {best_iou:.2f}")
 
         total_loss_meter = AverageMeter()
+        loss_x_meter = AverageMeter()
+        loss_x_corr_meter = AverageMeter()
+        loss_u_s1_meter = AverageMeter()
+        loss_u_kl_meter = AverageMeter()
+        loss_u_w_fp_meter = AverageMeter()
+        loss_u_corr_meter = AverageMeter()
+        mask_ratio_meter = AverageMeter()
 
         trainloader_l.sampler.set_epoch(epoch)
         trainloader_u.sampler.set_epoch(epoch)
@@ -461,15 +472,39 @@ def main(args, cfg):
             optimizer.step()
 
             total_loss_meter.update(loss.item())
+            loss_x_meter.update(loss_x.item())
+            loss_x_corr_meter.update(loss_x_corr.item())
+            loss_u_s1_meter.update(loss_u_s1.item())
+            loss_u_kl_meter.update(loss_u_kl.item())
+            loss_u_w_fp_meter.update(loss_u_w_fp.item())
+            loss_u_corr_meter.update(loss_u_corr.item())
+
+            mask_ratio = (
+                (conf_u_w >= thresh_global) & (ignore_mask != 255)
+            ).sum().item() / (ignore_mask != 255).sum().clamp(min=1.0)
+            mask_ratio_meter.update(mask_ratio.item())
 
             iters = epoch * len(trainloader_u) + i
             lr = cfg["lr"] * (1 - iters / total_iters) ** 0.9
             optimizer.param_groups[0]["lr"] = lr
             optimizer.param_groups[1]["lr"] = lr * cfg["lr_multi"]
 
-            if i % 100 == 0 and rank == 0:
+            if (i % (len(trainloader_u) // 8) == 0) and (rank == 0):
                 logger.info(
-                    f"Iter {i}, Loss: {loss.item():.4f}, Thresh: {thresh_global:.3f}"
+                    "Iter {:}, LR: {:.7f}, Total loss: {:.3f}, Loss x: {:.3f}, Loss x_corr: {:.3f}, Loss u_s: {:.3f}, "
+                    "Loss u_kl: {:.3f}, Loss u_fp: {:.3f}, Loss u_corr: {:.3f}, Mask ratio: {:.3f}, Thresh: {:.3f}".format(
+                        i,
+                        optimizer.param_groups[0]["lr"],
+                        total_loss_meter.avg,
+                        loss_x_meter.avg,
+                        loss_x_corr_meter.avg,
+                        loss_u_s1_meter.avg,
+                        loss_u_kl_meter.avg,
+                        loss_u_w_fp_meter.avg,
+                        loss_u_corr_meter.avg,
+                        mask_ratio_meter.avg,
+                        thresh_global,
+                    )
                 )
                 if i < 5:
                     viz.push(
