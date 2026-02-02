@@ -14,7 +14,7 @@ import yaml
 
 from dataset.semi_rs import SemiDataset
 from dataset.val import ValDataset
-from model.semseg.dpt import DPT
+from model.semseg.dpt_unimatch import DPT_UniMatch
 from model.semseg.upernet import UperNet
 from supervised import evaluate, validation_cpu
 from util.classes import CLASSES
@@ -83,7 +83,7 @@ def main(args, cfg):
     patch_size = 14 if backbone_version == "dinov2" else 16
 
     if cfg["model"] == "dpt":
-        model = DPT(
+        model = DPT_UniMatch(
             **{**model_configs[backbone_size], "nclass": cfg["nclass"]},
             backbone_version=backbone_version,
         )
