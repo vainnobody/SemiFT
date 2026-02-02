@@ -80,7 +80,12 @@ class DPT_CorrMatch(DPT):
             dict_return["out"] = out
 
         if use_corr:
-            proj_feats = self.proj(feat_deepest)
+            # feat_deepest is in ViT token format: (B, N, C) where N = patch_h * patch_w
+            # Reshape to CNN format: (B, C, H, W) for Conv2d
+            feat_deepest_reshaped = feat_deepest.permute(0, 2, 1).reshape(
+                feat_deepest.shape[0], feat_deepest.shape[-1], patch_h, patch_w
+            )
+            proj_feats = self.proj(feat_deepest_reshaped)
             corr_out_dict = self.corr(proj_feats, dict_return["out"])
 
             dict_return["corr_map"] = corr_out_dict["corr_map"]
