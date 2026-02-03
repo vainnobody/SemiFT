@@ -375,9 +375,34 @@ def main(args, cfg):
 
             # Combine all images for student prediction
             img_all_s = torch.cat((img_x, img_u_s), dim=0)
+            img_all_w = torch.cat((img_x, img_u_w), dim=0)
 
-            # Student model forward
-            s_pred_all = model(img_all_s)  # [2n, C, H, W]
+            # Determine if we need reconstruction mode
+            need_recon = (
+                SEGMIND_CONFIG["lambda_r"] > 0 or SEGMIND_CONFIG["lambda_rsc"] > 0
+            ) and epoch <= SEGMIND_CONFIG["epoch_pre"]
+            need_contrastive = SEGMIND_CONFIG["lambda_c"] > 0
+
+            # Generate mask for reconstruction if needed
+            if need_recon or need_contrastive:
+                nchw = img_all_s.size()
+                mask_tensor = get_batch_mask_tensor(
+                    nchw=nchw, mask_rate=SEGMIND_CONFIG["mask_rate"]
+                ).cuda()
+
+                # Single forward with reconstruction mode to get all outputs
+                # Apply mask only for reconstruction input, but we use strong augmented images
+                masked_img = img_all_s * mask_tensor if need_recon else img_all_s
+                s_pred_all, s_feat_all, r_img_all = model(
+                    masked_img, mode="r", mask=mask_tensor
+                )
+            else:
+                # Standard forward without reconstruction
+                s_pred_all = model(img_all_s)
+                s_feat_all = None
+                r_img_all = None
+                mask_tensor = None
+
             s_pred_all = F.interpolate(
                 s_pred_all, size=hw, mode="bilinear", align_corners=True
             )
@@ -427,20 +452,7 @@ def main(args, cfg):
             # 4. Reconstruction loss (loss_r, loss_rsc) - only for first epoch_pre epochs
             loss_r = torch.tensor(0.0).cuda()
             loss_rsc = torch.tensor(0.0).cuda()
-            if (
-                SEGMIND_CONFIG["lambda_r"] > 0 or SEGMIND_CONFIG["lambda_rsc"] > 0
-            ) and epoch <= SEGMIND_CONFIG["epoch_pre"]:
-                # Generate mask
-                img_all_w = torch.cat((img_x, img_u_w), dim=0)
-                nchw = img_all_w.size()
-                mask_tensor = get_batch_mask_tensor(
-                    nchw=nchw, mask_rate=SEGMIND_CONFIG["mask_rate"]
-                ).cuda()
-
-                # Reconstruction forward
-                r_pred_all, _, r_img_all = model.module(
-                    img_all_w * mask_tensor, mode="r", mask=mask_tensor
-                )
+            if need_recon and r_img_all is not None:
                 r_img_all = F.interpolate(
                     r_img_all, size=hw, mode="bilinear", align_corners=True
                 )
@@ -452,7 +464,7 @@ def main(args, cfg):
                             r_img_all.permute(0, 2, 3, 1)[
                                 ~mask_tensor.bool().squeeze(1)
                             ],
-                            img_all_w[:, :3, :, :].permute(0, 2, 3, 1)[
+                            img_all_s[:, :3, :, :].permute(0, 2, 3, 1)[
                                 ~mask_tensor.bool().squeeze(1)
                             ],
                         )
@@ -461,9 +473,12 @@ def main(args, cfg):
 
                 if SEGMIND_CONFIG["lambda_rsc"] > 0:
                     # Reconstruction segmentation loss
+                    r_pred_interp = F.interpolate(
+                        s_pred_all, size=hw, mode="bilinear", align_corners=True
+                    )
                     loss_rsc = (
                         criterion_rsc(
-                            r_pred_all.permute(0, 2, 3, 1)[
+                            r_pred_interp.permute(0, 2, 3, 1)[
                                 ~mask_tensor.bool().squeeze(1)
                             ],
                             lab_all[~mask_tensor.bool().squeeze(1)],
@@ -471,22 +486,24 @@ def main(args, cfg):
                         * SEGMIND_CONFIG["lambda_rsc"]
                     )
 
-            # 5. Contrastive loss (loss_c)
+            # 5. Contrastive loss (loss_c) - uses detached features
             loss_c = torch.tensor(0.0).cuda()
-            if SEGMIND_CONFIG["lambda_c"] > 0:
-                # Get features for contrastive learning
+            if need_contrastive and s_feat_all is not None:
                 with torch.no_grad():
-                    _, s_feat_all, _ = model.module(
-                        img_all_s, mode="r", mask=torch.ones_like(img_all_s[:, :1])
-                    )
                     s_feat_small = F.interpolate(
-                        s_feat_all, size=h_w_, mode="bilinear", align_corners=True
+                        s_feat_all.detach(),
+                        size=h_w_,
+                        mode="bilinear",
+                        align_corners=True,
                     )
                     lab_all_small = F.interpolate(
                         lab_all.float().unsqueeze(1), size=h_w_, mode="nearest"
                     ).squeeze(1)
                     s_prob_small = F.interpolate(
-                        s_prob_all, size=h_w_, mode="bilinear", align_corners=True
+                        s_prob_all.detach(),
+                        size=h_w_,
+                        mode="bilinear",
+                        align_corners=True,
                     )
 
                 loss_c = (
