@@ -155,6 +155,9 @@ class AdaptModel(torch.nn.Module):
                         new_module = SemiFt(
                             target.fc1.in_features, target.fc1.out_features, **kwargs
                         )
+                elif self.peft_config.method == "lora":
+                    new_module = Lora
+
                 new_module = WarpBlock(target, new_module)
                 self._insert_module(parent, target_name, new_module, target)
 
@@ -380,3 +383,24 @@ class Linear(nn.Linear, LoraLayer):
         blcls = torch.zeros(1)[0].to(result)
 
         return result, blcls
+
+
+class Lora(nn.Module):
+    def __init__(self, in_features, out_features, r=32, lora_alpha=64, p=0.1):
+        super().__init__()
+        self.r = r
+        self.lora_alpha = lora_alpha
+        self.lora_A = nn.Linear(in_features, r, bias=False)
+        self.lora_B = nn.Linear(r, out_features, bias=False)
+
+        self.lora_dropout = nn.Dropout(p)
+        self.scaling = self.lora_alpha / self.r
+        self.reset_parameters()
+
+    def reset_parameters(self):
+        nn.init.kaiming_uniform_(self.lora_A.weight, a=math.sqrt(5))
+        nn.init.zeros_(self.lora_B.weight)
+
+    def forward(self, x):
+        out = self.lora_B(self.lora_A(self.lora_dropout(x))) * self.scaling
+        return out
