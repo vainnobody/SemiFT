@@ -27,19 +27,25 @@ def get_mask_tensor(h=512, w=512, mask_gap=16, mask_rate=0.75):
     Returns:
         mask_tensor: [1, h, w] tensor where 0=masked, 1=visible
     """
-    if h % mask_gap != 0 or w % mask_gap != 0:
-        raise Exception("h and w should be integral multiple of mask_gap")
+    # Use ceiling division to handle non-divisible dimensions
+    h_gap_num = (h + mask_gap - 1) // mask_gap
+    w_gap_num = (w + mask_gap - 1) // mask_gap
 
-    h_gap_num, w_gap_num = int(h / mask_gap), int(w / mask_gap)
     mask_tensor_small = (
         torch.randperm(h_gap_num * w_gap_num).float().reshape((h_gap_num, w_gap_num))
     )
     divide_threshold = h_gap_num * w_gap_num * mask_rate
     mask_tensor_small[mask_tensor_small < divide_threshold] = 0.0
     mask_tensor_small[mask_tensor_small >= divide_threshold] = 1.0
+
+    # Interpolate to full size and crop to exact dimensions
     mask_tensor = F.interpolate(
-        mask_tensor_small.unsqueeze(0).unsqueeze(0), size=(h, w), mode="nearest"
-    ).squeeze(0)
+        mask_tensor_small.unsqueeze(0).unsqueeze(0),
+        size=(h_gap_num * mask_gap, w_gap_num * mask_gap),
+        mode="nearest",
+    )
+    # Crop to exact h, w
+    mask_tensor = mask_tensor[:, :, :h, :w].squeeze(0)
 
     return mask_tensor
 
