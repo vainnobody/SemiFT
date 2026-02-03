@@ -154,7 +154,7 @@ class AdaptModel(torch.nn.Module):
                         )
                     elif target_name == "mlp":
                         new_module = SemiFt(
-                            target.fc1.in_features, target.fc1.out_features, **kwargs
+                            target.fc1.in_features, target.fc2.out_features, **kwargs
                         )
                 elif self.peft_config.method == "lora":
                     new_module = Lora(

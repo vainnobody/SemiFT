@@ -486,16 +486,13 @@ def main(args, cfg):
                         * SEGMIND_CONFIG["lambda_rsc"]
                     )
 
-            # 5. Contrastive loss (loss_c) - uses detached features
+            # 5. Contrastive loss (loss_c)
             loss_c = torch.tensor(0.0).cuda()
             if need_contrastive and s_feat_all is not None:
+                s_feat_small = F.interpolate(
+                    s_feat_all, size=h_w_, mode="bilinear", align_corners=True
+                )
                 with torch.no_grad():
-                    s_feat_small = F.interpolate(
-                        s_feat_all.detach(),
-                        size=h_w_,
-                        mode="bilinear",
-                        align_corners=True,
-                    )
                     lab_all_small = F.interpolate(
                         lab_all.float().unsqueeze(1), size=h_w_, mode="nearest"
                     ).squeeze(1)
