@@ -106,28 +106,45 @@ class AuxHead_r(nn.Module):
         )
 
     def forward(self, x, res1, res2, res3, res4, h, w, mask):
-        mask_small = F.interpolate(mask, size=res4.shape[-2:])
+        # res4 processing
+        mask_small = F.interpolate(mask, size=res4.shape[-2:], mode="nearest")
         res4 = self.conv4(torch.cat((res4, mask_small), dim=1))
-        res4 = F.interpolate(res4, scale_factor=2)
 
-        mask_small = F.interpolate(mask, size=res3.shape[-2:])
+        # Upsample res4 to match res3's size explicitly
+        res4 = F.interpolate(
+            res4, size=res3.shape[-2:], mode="bilinear", align_corners=True
+        )
+        mask_small = F.interpolate(mask, size=res3.shape[-2:], mode="nearest")
         res3 = self.conv3(torch.cat((res3, mask_small, res4), dim=1))
-        res3 = F.interpolate(res3, scale_factor=2)
 
-        mask_small = F.interpolate(mask, size=res2.shape[-2:])
+        # Upsample res3 to match res2's size explicitly
+        res3 = F.interpolate(
+            res3, size=res2.shape[-2:], mode="bilinear", align_corners=True
+        )
+        mask_small = F.interpolate(mask, size=res2.shape[-2:], mode="nearest")
         res2 = self.conv2(torch.cat((res2, mask_small, res3), dim=1))
-        res2 = F.interpolate(res2, scale_factor=2)
 
-        mask_small = F.interpolate(mask, size=res1.shape[-2:])
+        # Upsample res2 to match res1's size explicitly
+        res2 = F.interpolate(
+            res2, size=res1.shape[-2:], mode="bilinear", align_corners=True
+        )
+        mask_small = F.interpolate(mask, size=res1.shape[-2:], mode="nearest")
         res1 = self.conv1(torch.cat((res1, mask_small, res2), dim=1))
-        res1 = F.interpolate(res1, scale_factor=2)
 
-        mask_small = F.interpolate(mask, size=res1.shape[-2:])
-        x_small = F.interpolate(x, size=res1.shape[-2:])
+        # Upsample res1 by 2x for conv0
+        target_size = (res1.shape[-2] * 2, res1.shape[-1] * 2)
+        res1 = F.interpolate(
+            res1, size=target_size, mode="bilinear", align_corners=True
+        )
+        mask_small = F.interpolate(mask, size=target_size, mode="nearest")
+        x_small = F.interpolate(
+            x, size=target_size, mode="bilinear", align_corners=True
+        )
         out = self.conv0(torch.cat((res1, mask_small, x_small), dim=1))
-        out = F.interpolate(out, scale_factor=2)
 
-        mask_small = F.interpolate(mask, size=x.shape[-2:])
+        # Final upsample to match input x size
+        out = F.interpolate(out, size=x.shape[-2:], mode="bilinear", align_corners=True)
+        mask_small = F.interpolate(mask, size=x.shape[-2:], mode="nearest")
         out = self.conv00(torch.cat((out, mask_small, x), dim=1))
 
         return out
