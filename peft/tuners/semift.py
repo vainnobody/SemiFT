@@ -26,6 +26,7 @@ import torch.nn.functional as F
 from transformers.pytorch_utils import Conv1D
 
 from ..utils import PeftConfig, PeftType, transpose
+from moe import SemiFt
 
 
 @dataclass
@@ -406,3 +407,15 @@ class Lora(nn.Module):
     def forward(self, x):
         out = self.lora_B(self.lora_A(self.lora_dropout(x))) * self.scaling
         return out
+
+
+class WarpBlock(nn.Module):
+    def __init__(self, base_layer, adapter):
+        super().__init__()
+        self.base_layer = base_layer
+        self.adapter = adapter
+        for param in self.base_layer.parameters():
+            param.requires_grad = False
+
+    def forward(self, x):
+        return self.base_layer(x) + self.adapter(x)
