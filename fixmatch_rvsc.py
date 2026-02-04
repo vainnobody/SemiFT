@@ -30,6 +30,7 @@ from util.focal import FocalLoss
 from util.utils import count_params, init_log, AverageMeter, intersectionAndUnion
 from util.dist_helper import setup_distributed
 from util.train_utils import confidence_weighted_loss
+from util.viz import Visualizer
 
 
 def get_parser():
@@ -399,6 +400,11 @@ def main(args, cfg):
         if rank == 0:
             logger.info("************ Load from checkpoint at epoch %i\n" % epoch)
 
+    from datetime import datetime
+
+    filename = datetime.now().strftime("%Y%m%d_%H%M%S")
+    viz = Visualizer(save_dir=f"./viz/{filename}", dataset=cfg["dataset"])
+
     for epoch in range(epoch + 1, cfg["epochs"]):
         if rank == 0:
             logger.info(
@@ -482,6 +488,40 @@ def main(args, cfg):
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
+
+            if i < 10:
+                viz.push(
+                    {
+                        "img_x": (img_x[0], Visualizer.TENSOR),
+                        "mask_x": (mask_x[0], Visualizer.SEGMENTATION),
+                        "pred_x": (pred_x.argmax(dim=1)[0], Visualizer.SEGMENTATION),
+                        "img_x_c": (img_x_c[0], Visualizer.TENSOR),
+                        "mask_x_c": (mask_x_c[0], Visualizer.SEGMENTATION),
+                        "pred_x_rvs": (
+                            pred_x_rvs.argmax(dim=1)[0],
+                            Visualizer.SEGMENTATION,
+                        ),
+                        "img_u_w": (img_u_w[0], Visualizer.TENSOR),
+                        "mask_u_w": (mask_u_w[0], Visualizer.SEGMENTATION),
+                        "img_u_s": (img_u_s[0], Visualizer.TENSOR),
+                        "pred_u_s": (
+                            pred_u_s.argmax(dim=1)[0],
+                            Visualizer.SEGMENTATION,
+                        ),
+                        "img_u_c": (img_u_c[0], Visualizer.TENSOR),
+                        "pred_u_rvs": (
+                            pred_u_rvs.argmax(dim=1)[0],
+                            Visualizer.SEGMENTATION,
+                        ),
+                        "pred_recovered": (
+                            pred_recovered.argmax(dim=1)[0],
+                            Visualizer.SEGMENTATION,
+                        ),
+                        "mask_u_w_rvs": (mask_u_w_rvs[0], Visualizer.SEGMENTATION),
+                    }
+                )
+                viz.render(f"epoch_{epoch}_iter_{i}")
+                viz.reset()
 
             # Update EMA teacher
             iters = epoch * len(trainloader_u) + i
