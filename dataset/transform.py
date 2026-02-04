@@ -10,9 +10,9 @@ def context_crop(img, mask, size, ignore_value, x, y, s):
     w, h = img.size
     padw = size - w if w < size else 0
     padh = size - h if h < size else 0
-    img = ImageOps.expand(img, border=(0,0,padw, padh), fill=0)
-    mask = ImageOps.expand(mask, border=(0,0,padw, padh), fill=ignore_value)
-    
+    img = ImageOps.expand(img, border=(0, 0, padw, padh), fill=0)
+    mask = ImageOps.expand(mask, border=(0, 0, padw, padh), fill=ignore_value)
+
     w, h = img.size
     box_w, box_h = s * size, s * size
     if s > 1.0:
@@ -58,7 +58,6 @@ def crop(img, mask, size, ignore_value=255):
     mask = mask.crop((x, y, x + size, y + size))
 
     return img, mask
-
 
 
 def crop_overlap(img, mask, size, ignore_value=255):
@@ -125,10 +124,9 @@ def crop_overlap(img, mask, size, ignore_value=255):
         rel_bottom2 = rel_top2 + (inter_bottom - inter_top)
         overlap2_array[rel_top2:rel_bottom2, rel_left2:rel_right2] = 1
 
-    overlap1 = Image.fromarray(overlap1_array, mode='L')
-    overlap2 = Image.fromarray(overlap2_array, mode='L')
+    overlap1 = Image.fromarray(overlap1_array, mode="L")
+    overlap2 = Image.fromarray(overlap2_array, mode="L")
     return crop1_img, crop1_mask, crop2_img, crop2_mask, overlap1, overlap2
-
 
 
 def crop_overlap_two(img, mask, size, min_overlap_ratio=0.75, ignore_value=255):
@@ -197,10 +195,7 @@ def crop_overlap_two(img, mask, size, min_overlap_ratio=0.75, ignore_value=255):
             rel_bottomB = rel_topB + (inter_bottom - inter_top)
             maskB[rel_topB:rel_bottomB, rel_leftB:rel_rightB] = 1
 
-        return (
-            Image.fromarray(maskA, mode='L'),
-            Image.fromarray(maskB, mode='L')
-        )
+        return (Image.fromarray(maskA, mode="L"), Image.fromarray(maskB, mode="L"))
 
     # Crop 1
     crop1_img = img.crop((x1, y1, x1 + size, y1 + size))
@@ -219,12 +214,18 @@ def crop_overlap_two(img, mask, size, min_overlap_ratio=0.75, ignore_value=255):
     overlap1_3, overlap3 = get_overlap_mask(x1, y1, x3, y3)
 
     return (
-        crop1_img, crop1_mask,
-        crop2_img, crop2_mask,
-        crop3_img, crop3_mask,
-        overlap1_2, overlap2,
-        overlap1_3, overlap3
+        crop1_img,
+        crop1_mask,
+        crop2_img,
+        crop2_mask,
+        crop3_img,
+        crop3_mask,
+        overlap1_2,
+        overlap2,
+        overlap1_3,
+        overlap3,
     )
+
 
 def crop_overlap_three(img, mask, size, ignore_value=255):
     """
@@ -274,10 +275,7 @@ def crop_overlap_three(img, mask, size, ignore_value=255):
             rel_bottomB = rel_topB + (inter_bottom - inter_top)
             maskB[rel_topB:rel_bottomB, rel_leftB:rel_rightB] = 1
 
-        return (
-            Image.fromarray(maskA, mode='L'),
-            Image.fromarray(maskB, mode='L')
-        )
+        return (Image.fromarray(maskA, mode="L"), Image.fromarray(maskB, mode="L"))
 
     # Crop 1
     crop1_img = img.crop((x1, y1, x1 + size, y1 + size))
@@ -303,10 +301,12 @@ def hflip(img, mask, p=0.5):
 
 
 def normalize(img, mask=None):
-    img = transforms.Compose([
-        transforms.ToTensor(),
-        transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
-    ])(img)
+    img = transforms.Compose(
+        [
+            transforms.ToTensor(),
+            transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
+        ]
+    )(img)
     if mask is not None:
         mask = torch.from_numpy(np.array(mask)).long()
         return img, mask
@@ -315,7 +315,9 @@ def normalize(img, mask=None):
 
 def resize(img, mask, ratio_range):
     w, h = img.size
-    long_side = random.randint(int(max(h, w) * ratio_range[0]), int(max(h, w) * ratio_range[1]))
+    long_side = random.randint(
+        int(max(h, w) * ratio_range[0]), int(max(h, w) * ratio_range[1])
+    )
 
     if h > w:
         oh = long_side
@@ -336,7 +338,9 @@ def blur(img, p=0.5):
     return img
 
 
-def obtain_cutmix_box(img_size, p=0.5, size_min=0.02, size_max=0.4, ratio_1=0.3, ratio_2=1/0.3):
+def obtain_cutmix_box(
+    img_size, p=0.5, size_min=0.02, size_max=0.4, ratio_1=0.3, ratio_2=1 / 0.3
+):
     mask = torch.zeros(img_size, img_size)
     if random.random() > p:
         return mask
@@ -352,6 +356,6 @@ def obtain_cutmix_box(img_size, p=0.5, size_min=0.02, size_max=0.4, ratio_1=0.3,
         if x + cutmix_w <= img_size and y + cutmix_h <= img_size:
             break
 
-    mask[y:y + cutmix_h, x:x + cutmix_w] = 1
+    mask[y : y + cutmix_h, x : x + cutmix_w] = 1
 
     return mask
