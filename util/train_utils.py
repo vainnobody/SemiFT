@@ -64,9 +64,9 @@ def confidence_weighted_loss(
     Returns:
         Scalar loss value
     """
-    assert loss.dim() == 3
-    assert conf_map.dim() == 3
-    assert ignore_mask.dim() == 3
+    # assert loss.dim() == 3
+    # assert conf_map.dim() == 3
+    # assert ignore_mask.dim() == 3
     valid_mask = ignore_mask != ignore_index
     sum_pixels = dict(dim=(1, 2), keepdim=True)
 

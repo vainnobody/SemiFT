@@ -471,7 +471,7 @@ def main(args, cfg):
             )
 
             # Unsupervised loss for RVS augmentation
-            loss_u_s_rvs = criterion_u(pred_recovered, mask_u_w_rvs)
+            loss_u_s_rvs = criterion_l(pred_recovered, mask_u_w_rvs)
             loss_u_s_rvs = confidence_weighted_loss(
                 loss_u_s_rvs,
                 conf_u_w,
