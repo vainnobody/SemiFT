@@ -59,7 +59,7 @@ def validation_cpu(cfg, model, valid_loader):
                         min(b * step, w - size) : min(b * step + size, w),
                     ]
                     # print("sub_input.shape", sub_input.shape)
-                    mask = model(sub_input)["out"]
+                    mask = model(sub_input)[0]
                     final[
                         :,
                         :,
@@ -77,7 +77,7 @@ def validation_cpu(cfg, model, valid_loader):
             resized_x = F.interpolate(
                 x, size=cfg["crop_size"], mode="bilinear", align_corners=True
             )
-            resized_o = model(resized_x)["out"]
+            resized_o = model(resized_x)[0]
             # 将预测结果复原到原始尺寸
             o = F.interpolate(
                 resized_o, size=original_shape, mode="bilinear", align_corners=True
@@ -87,7 +87,7 @@ def validation_cpu(cfg, model, valid_loader):
         else:
             # 直接进行预测（非滑动窗口模式）
 
-            o = model(x)["out"]
+            o = model(x)[0]
             o = o.max(1)[1]
         gray = np.uint8(o.cpu().numpy())
         target = np.array(y, dtype=np.int32)
