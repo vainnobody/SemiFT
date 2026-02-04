@@ -50,7 +50,7 @@ def cutmix_mask(mask, mask_mix, cutmix_box):
 
 
 def confidence_weighted_loss(
-    loss, conf_map, ignore_mask, conf_thresh=0.95, conf_mode="pixelwise"
+    loss, conf_map, ignore_mask, ignore_index, conf_thresh=0.95, conf_mode="pixelwise"
 ):
     """Compute confidence-weighted loss for semi-supervised learning.
 
@@ -67,7 +67,7 @@ def confidence_weighted_loss(
     assert loss.dim() == 3
     assert conf_map.dim() == 3
     assert ignore_mask.dim() == 3
-    valid_mask = ignore_mask != 255
+    valid_mask = ignore_mask != ignore_index
     sum_pixels = dict(dim=(1, 2), keepdim=True)
 
     if conf_mode == "pixelwise":
