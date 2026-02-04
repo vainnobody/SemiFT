@@ -461,7 +461,7 @@ def main(args, cfg):
             # Unsupervised loss for strong augmentation
             loss_u_s = criterion_u(pred_u_s, mask_u_w)
             loss_u_s = confidence_weighted_loss(
-                loss_u_s, conf_u_w, ignore_mask, ignore_index, conf_thresh=conf_thresh
+                loss_u_s, conf_u_w, ignore_mask, conf_thresh=conf_thresh
             )
 
             # Unsupervised loss for RVS augmentation
@@ -470,7 +470,6 @@ def main(args, cfg):
                 loss_u_s_rvs,
                 conf_u_w,
                 mask_u_w_rvs,
-                ignore_index,
                 conf_thresh=conf_thresh,
             )
 
