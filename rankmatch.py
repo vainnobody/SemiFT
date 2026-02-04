@@ -28,7 +28,7 @@ from model.semseg.rankmatch_utils import corr_loss
 from util.classes import CLASSES
 from util.ohem import ProbOhemCrossEntropy2d
 from util.focal import FocalLoss
-from util.utils import count_params, init_log, AverageMeter
+from util.utils import count_params, init_log, AverageMeter, intersectionAndUnion
 from util.dist_helper import setup_distributed
 import numpy as np
 
