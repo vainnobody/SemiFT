@@ -486,7 +486,8 @@ def main(args, cfg):
             )
 
             # Total loss
-            loss = (loss_x + loss_x_rvs + loss_u_s + loss_u_s_rvs) / 4.0
+            # loss_x_rvs is detached to not participate in backward pass, but still logged
+            loss = (loss_x + loss_x_rvs.detach() + loss_u_s + loss_u_s_rvs) / 4.0
 
             torch.distributed.barrier()
 
