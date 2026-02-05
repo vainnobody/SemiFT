@@ -456,6 +456,11 @@ def main(args, cfg):
                 pred_u_rvs, mask_c, cfg["crop_size"], box
             )
 
+            # Compute confidence from recovered predictions (in original coordinate space)
+            conf_u_rvs_recovered = pred_recovered.softmax(dim=1).max(dim=1)[
+                0
+            ]  # [B, H, W]
+
             valid_masks = valid_masks.squeeze(1)
             mask_u_w_rvs = mask_u_w.clone()
             mask_u_w_rvs[valid_masks == 0] = ignore_index
@@ -474,7 +479,7 @@ def main(args, cfg):
             loss_u_s_rvs = criterion_l(pred_recovered, mask_u_w_rvs)
             loss_u_s_rvs = confidence_weighted_loss(
                 loss_u_s_rvs,
-                conf_u_w,
+                conf_u_rvs_recovered,  # Use confidence from recovered predictions
                 mask_u_w_rvs,
                 ignore_index,
                 conf_thresh=conf_thresh,
