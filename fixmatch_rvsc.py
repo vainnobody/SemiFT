@@ -477,6 +477,55 @@ def main(args, cfg):
             )
 
             # Unsupervised loss for RVS augmentation
+            # ========== DEBUG START ==========
+            print(f"\n{'='*50}")
+            print(f"DEBUG: Checking tensors before RVS loss calculation")
+            print(f"{'='*50}")
+
+            # Check pred_recovered
+            print(f"pred_recovered shape: {pred_recovered.shape}")
+            print(f"pred_recovered dtype: {pred_recovered.dtype}")
+            print(
+                f"pred_recovered min/max: {pred_recovered.min().item():.4f} / {pred_recovered.max().item():.4f}"
+            )
+
+            # Check mask_u_w_rvs (target)
+            print(f"\nmask_u_w_rvs shape: {mask_u_w_rvs.shape}")
+            print(f"mask_u_w_rvs dtype: {mask_u_w_rvs.dtype}")
+            print(f"mask_u_w_rvs unique values: {torch.unique(mask_u_w_rvs).tolist()}")
+            print(
+                f"mask_u_w_rvs min/max: {mask_u_w_rvs.min().item()} / {mask_u_w_rvs.max().item()}"
+            )
+
+            # Check for invalid values
+            n_classes = pred_recovered.shape[1]
+            invalid_mask = (mask_u_w_rvs < 0) | (
+                (mask_u_w_rvs >= n_classes) & (mask_u_w_rvs != 255)
+            )
+            n_invalid = invalid_mask.sum().item()
+            print(f"\nn_classes (from pred): {n_classes}")
+            print(
+                f"Number of invalid pixels (not in [0, n_classes) and != 255): {n_invalid}"
+            )
+
+            if n_invalid > 0:
+                invalid_values = mask_u_w_rvs[invalid_mask].unique().tolist()
+                print(f"Invalid values found: {invalid_values}")
+
+            # Check valid_masks
+            print(f"\nvalid_masks shape: {valid_masks.shape}")
+            print(f"valid_masks sum (valid pixels): {valid_masks.sum().item()}")
+            print(f"valid_masks ratio: {valid_masks.float().mean().item():.4f}")
+
+            # Check mask_u_w (original pseudo-labels)
+            print(f"\nmask_u_w unique values: {torch.unique(mask_u_w).tolist()}")
+            print(
+                f"mask_u_w min/max: {mask_u_w.min().item()} / {mask_u_w.max().item()}"
+            )
+
+            print(f"{'='*50}\n")
+            # ========== DEBUG END ==========
+
             loss_u_s_rvs = criterion_u(pred_recovered, mask_u_w_rvs)
             loss_u_s_rvs = confidence_weighted_loss(
                 loss_u_s_rvs,
