@@ -53,7 +53,7 @@ class SemiDataset(Dataset):
             if self.name == "loveda":
                 mask_ori = self.process_mask(mask_ori)
 
-        ignore_value = 254 if self.mode == "train_u" else self.ignore_value
+        ignore_value = self.ignore_value
 
         img, mask, x, y = crop_with_xy(img_ori, mask_ori, self.size, ignore_value)
 
@@ -107,7 +107,7 @@ class SemiDataset(Dataset):
         img_s2 = normalize(img_s2)
 
         mask = torch.from_numpy(np.array(mask)).long()
-        ignore_mask[mask == 254] = 255
+        ignore_mask[mask == ignore_value] = ignore_value
 
         img_s2 = TF.rotate(
             img_s2, angle=theta, interpolation=TF.InterpolationMode.BILINEAR
