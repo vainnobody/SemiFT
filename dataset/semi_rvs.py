@@ -55,7 +55,7 @@ class SemiDataset(Dataset):
 
         ignore_value = 254 if self.mode == "train_u" else self.ignore_value
 
-        img, mask, x, y = crop_with_xy(img_ori, mask_ori, self.size, self.ignore_value)
+        img, mask, x, y = crop_with_xy(img_ori, mask_ori, self.size, ignore_value)
 
         min_theta = 0.0
         max_theta = 360.0
@@ -65,7 +65,7 @@ class SemiDataset(Dataset):
         s = float(np.random.choice([0.5, 0.75, 1.0, 1.25, 1.5, 2.0]))
 
         img_c, mask_c, x_c, y_c = context_crop(
-            img_ori, mask_ori, self.size, self.ignore_value, x, y, s
+            img_ori, mask_ori, self.size, ignore_value, x, y, s
         )
 
         img_c = img_c.resize(img.size)
@@ -76,7 +76,10 @@ class SemiDataset(Dataset):
                 img_c, angle=theta, interpolation=TF.InterpolationMode.BILINEAR
             )
             mask_c = TF.rotate(
-                mask_c, angle=theta, interpolation=TF.InterpolationMode.NEAREST, fill=0
+                mask_c,
+                angle=theta,
+                interpolation=TF.InterpolationMode.NEAREST,
+                fill=ignore_value,
             )
             img, mask = normalize(img, mask)
             img_c, mask_c = normalize(img_c, mask_c)
@@ -110,7 +113,10 @@ class SemiDataset(Dataset):
             img_s2, angle=theta, interpolation=TF.InterpolationMode.BILINEAR
         )
         mask_rotated = TF.rotate(
-            mask_c, angle=theta, interpolation=TF.InterpolationMode.NEAREST, fill=0
+            mask_c,
+            angle=theta,
+            interpolation=TF.InterpolationMode.NEAREST,
+            fill=ignore_value,
         )
 
         return (
