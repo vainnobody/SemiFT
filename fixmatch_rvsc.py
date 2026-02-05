@@ -341,7 +341,6 @@ def main(args, cfg):
         cfg["data_root"],
         "train_l",
         size=cfg["crop_size"],
-        ignore_value=ignore_index,
         id_path=args.labeled_id_path,
         nsample=len(trainset_u.ids),
     )
@@ -476,7 +475,7 @@ def main(args, cfg):
             )
 
             # Unsupervised loss for RVS augmentation
-            loss_u_s_rvs = criterion_l(pred_recovered, mask_u_w_rvs)
+            loss_u_s_rvs = criterion_u(pred_recovered, mask_u_w_rvs)
             loss_u_s_rvs = confidence_weighted_loss(
                 loss_u_s_rvs,
                 conf_u_rvs_recovered,  # Use confidence from recovered predictions
