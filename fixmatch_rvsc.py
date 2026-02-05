@@ -325,7 +325,9 @@ def main(args, cfg):
             f'{cfg["criterion"]["name"]} criterion is not implemented'
         )
 
-    criterion_u = nn.CrossEntropyLoss(reduction="none").cuda(local_rank)
+    criterion_u = nn.CrossEntropyLoss(reduction="none", ignore_index=255).cuda(
+        local_rank
+    )
 
     # Datasets
     trainset_u = SemiDataset(
