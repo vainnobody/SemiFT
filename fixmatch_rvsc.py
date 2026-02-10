@@ -457,14 +457,13 @@ def main(args, cfg):
                 pred_u_rvs, mask_c, cfg["crop_size"], box
             )
 
-            # Compute confidence from recovered predictions (in original coordinate space)
-            conf_u_rvs_recovered = pred_recovered.softmax(dim=1).max(dim=1)[
-                0
-            ]  # [B, H, W]
-
             valid_masks = valid_masks.squeeze(1)
             mask_u_w_rvs = mask_u_w.clone()
             mask_u_w_rvs[valid_masks == 0] = 255
+
+            # Combine dataset ignore regions with RVS invalid regions
+            ignore_mask_rvs = ignore_mask.clone()
+            ignore_mask_rvs[valid_masks == 0] = ignore_index
 
             # Supervised losses
             loss_x = criterion_l(pred_x, mask_x)
@@ -476,18 +475,22 @@ def main(args, cfg):
                 loss_u_s, conf_u_w, ignore_mask, ignore_index, conf_thresh=conf_thresh
             )
 
+            # Unsupervised loss for RVS augmentation
+            # Fix: use EMA teacher confidence (conf_u_w) instead of student confidence
+            # Fix: use ignore_mask_rvs (dataset ignore + RVS invalid) instead of mask_u_w_rvs
             loss_u_s_rvs = criterion_u(pred_recovered, mask_u_w_rvs)
             loss_u_s_rvs = confidence_weighted_loss(
                 loss_u_s_rvs,
-                conf_u_rvs_recovered,  # Use confidence from recovered predictions
-                mask_u_w_rvs,
+                conf_u_w,
+                ignore_mask_rvs,
                 ignore_index,
                 conf_thresh=conf_thresh,
             )
 
             # Total loss
+            # Fix: preserve supervised loss weight at 0.5 (same as baseline FixMatch)
             # loss_x_rvs is detached to not participate in backward pass, but still logged
-            loss = (loss_x + loss_x_rvs.detach() + loss_u_s + loss_u_s_rvs) / 3.0
+            loss = (loss_x + loss_u_s) / 2.0 + 0.25 * loss_u_s_rvs
 
             torch.distributed.barrier()
 
@@ -528,6 +531,30 @@ def main(args, cfg):
                 )
                 viz.render(f"epoch_{epoch}_iter_{i}")
                 viz.reset()
+
+            # RVS diagnostic logging
+            if rank == 0 and i % 100 == 0:
+                with torch.no_grad():
+                    valid_ratio = valid_masks.float().mean().item()
+                    conf_in_valid = conf_u_w[valid_masks > 0]
+                    high_conf_ratio = (
+                        (conf_in_valid >= conf_thresh).float().mean().item()
+                        if conf_in_valid.numel() > 0
+                        else 0
+                    )
+                    agree_ratio = (
+                        (pred_recovered.argmax(1) == mask_u_w)[valid_masks > 0]
+                        .float()
+                        .mean()
+                        .item()
+                        if (valid_masks > 0).any()
+                        else 0
+                    )
+                    logger.info(
+                        f"[RVS Debug] valid_ratio={valid_ratio:.3f}, "
+                        f"high_conf_valid={high_conf_ratio:.3f}, "
+                        f"student-teacher agree={agree_ratio:.3f}"
+                    )
 
             # Update EMA teacher
             iters = epoch * len(trainloader_u) + i
