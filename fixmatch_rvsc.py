@@ -509,7 +509,7 @@ def main(args, cfg):
             # Total loss
             # Fix: preserve supervised loss weight at 0.5 (same as baseline FixMatch)
             # loss_x_rvs is detached to not participate in backward pass, but still logged
-            loss = (loss_x + loss_u_s) / 2.0 + 0.25 * loss_u_s_rvs
+            loss = (loss_x + loss_u_s * 0.5 + loss_u_s_rvs * 0.5) / 2.0
 
             torch.distributed.barrier()
 
