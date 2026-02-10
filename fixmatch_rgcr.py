@@ -414,7 +414,7 @@ def main(args, cfg):
                 mode="bilinear",
                 align_corners=True,
             )
-            feat_recovered, valid_masks_feat = scale_back_features(
+            feat_recovered, _ = scale_back_features(
                 feat_u_rvs_full, mask_c, cfg["crop_size"], box
             )
 
@@ -474,21 +474,18 @@ def main(args, cfg):
             # --- Geometric correlation loss: loss_geo_corr ---
             # Resize features to same spatial resolution for correlation computation
             H, W = pred_u_w.shape[-2:]
+            # Detach feat_u_w: it's the reference (like RankMatch detaches weak features)
+            # Gradients only flow through feat_recovered (RVS student branch)
             feat_u_w_resized = F.interpolate(
-                feat_u_w, size=(H, W), mode="bilinear", align_corners=True
+                feat_u_w.detach(), size=(H, W), mode="bilinear", align_corners=True
             )
             feat_recovered_resized = F.interpolate(
                 feat_recovered, size=(H, W), mode="bilinear", align_corners=True
-            )
-            # Resize valid masks to match feature resolution
-            valid_masks_feat_resized = F.interpolate(
-                valid_masks_feat, size=(H, W), mode="nearest"
             )
 
             loss_geo_corr = geometric_corr_loss(
                 feat_u_w_resized,
                 feat_recovered_resized,
-                valid_masks_feat_resized,
                 local_rank,
                 num_landmarks,
                 rank_k,

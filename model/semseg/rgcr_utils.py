@@ -243,7 +243,7 @@ def corr_loss(feat_w, feat_s, local_rank, num_landmarks=64, k=4):
     Compute pixel-reference correlation consistency loss (from RankMatch).
 
     Args:
-        feat_w: Feature tensor [B, C, H, W] from weak augmentation
+        feat_w: Feature tensor [B, C, H, W] from weak augmentation (should be detached)
         feat_s: Feature tensor [B, C, H, W] from strong augmentation
         local_rank: CUDA device rank for KLDivLoss
         num_landmarks: Number of landmarks
@@ -261,26 +261,27 @@ def corr_loss(feat_w, feat_s, local_rank, num_landmarks=64, k=4):
 
     p2r_w_rank, p2r_s_rank = prob2rank(p2r_w, p2r_s, k=k)
 
-    loss = criterion_c((p2r_s_rank + 1e-10).log(), p2r_w_rank)
+    # Clamp to prevent log(0) and gradient explosion through 1/x
+    loss = criterion_c(p2r_s_rank.clamp(min=1e-7).log(), p2r_w_rank)
 
     return loss
 
 
-def geometric_corr_loss(
-    feat_w, feat_rvs_recovered, valid_masks, local_rank, num_landmarks=64, k=4
-):
+def geometric_corr_loss(feat_w, feat_rvs_recovered, local_rank, num_landmarks=64, k=4):
     """
     Compute geometric-aware correlation consistency loss.
 
     Uses recovered RVS features (aligned to original space) and computes
     rank-based correlation consistency against weak augmentation features.
-    Only considers valid regions where the RVS recovery is reliable.
+
+    NOTE: feat_w should be detached (used as reference, like RankMatch).
+    Gradients only flow through feat_rvs_recovered.
+    Do NOT zero-mask features as it creates zero vectors that cause
+    gradient explosion in prob2rank -> log backward.
 
     Args:
-        feat_w: Feature tensor [B, C, H, W] from weak augmentation
-        feat_rvs_recovered: Recovered RVS features [B, C, H, W] aligned to
-                            the same coordinate space as feat_w
-        valid_masks: Valid region masks [B, 1, H, W], 1 = valid
+        feat_w: Feature tensor [B, C, H, W] from weak augmentation (detached)
+        feat_rvs_recovered: Recovered RVS features [B, C, H, W]
         local_rank: CUDA device rank
         num_landmarks: Number of landmarks
         k: Top-k for ranking
@@ -288,12 +289,10 @@ def geometric_corr_loss(
     Returns:
         loss: Geometric correlation consistency loss (scalar)
     """
-    # Mask out invalid regions (where scale_back couldn't recover)
-    # by zeroing features in invalid regions
-    feat_w_masked = feat_w * valid_masks
-    feat_rvs_masked = feat_rvs_recovered * valid_masks
-
-    # Use the standard corr_loss on the masked features
-    loss = corr_loss(feat_w_masked, feat_rvs_masked, local_rank, num_landmarks, k)
+    # Do NOT mask features with valid_masks:
+    # Zeroing creates zero-vectors -> NaN gradients through log(prob2rank(...))
+    # Invalid regions from scale_back are already zero and will have
+    # naturally low correlation, providing a soft constraint.
+    loss = corr_loss(feat_w, feat_rvs_recovered, local_rank, num_landmarks, k)
 
     return loss
