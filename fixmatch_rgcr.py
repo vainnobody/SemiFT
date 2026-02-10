@@ -405,8 +405,17 @@ def main(args, cfg):
             )
 
             # Recover features for geometric correlation loss
+            # NOTE: feat_u_rvs has backbone spatial resolution (crop_size/patch_size),
+            # but scale_back uses pixel-space coordinates from box.
+            # Must interpolate to full resolution first.
+            feat_u_rvs_full = F.interpolate(
+                feat_u_rvs,
+                size=pred_u_rvs.shape[-2:],
+                mode="bilinear",
+                align_corners=True,
+            )
             feat_recovered, valid_masks_feat = scale_back_features(
-                feat_u_rvs, mask_c, cfg["crop_size"], box
+                feat_u_rvs_full, mask_c, cfg["crop_size"], box
             )
 
             # =====================
