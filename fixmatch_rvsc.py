@@ -438,6 +438,7 @@ def main(args, cfg):
             img_x_c, mask_x_c = img_x_c.cuda(), mask_x_c.cuda()
             img_u_w, img_u_s, img_u_c = img_u_w.cuda(), img_u_s.cuda(), img_u_c.cuda()
             ignore_mask = ignore_mask.cuda()
+            cutmix_box = cutmix_box.cuda()
             mask_c = mask_c.cuda()
 
             # Get pseudo-labels from EMA teacher
@@ -445,6 +446,11 @@ def main(args, cfg):
                 pred_u_w = model_ema(img_u_w).detach()
                 conf_u_w = pred_u_w.softmax(dim=1).max(dim=1)[0]
                 mask_u_w = pred_u_w.argmax(dim=1)
+
+            # Apply CutMix to strong augmentation image
+            img_u_s[cutmix_box.unsqueeze(1).expand(img_u_s.shape) == 1] = img_u_s.flip(
+                0
+            )[cutmix_box.unsqueeze(1).expand(img_u_s.shape) == 1]
 
             # Forward pass
             pred_x = model(img_x)
@@ -469,10 +475,23 @@ def main(args, cfg):
             loss_x = criterion_l(pred_x, mask_x)
             loss_x_rvs = criterion_l(pred_x_rvs, mask_x_c)
 
-            # Unsupervised loss for strong augmentation
-            loss_u_s = criterion_u(pred_u_s, mask_u_w)
+            # CutMix pseudo-labels, confidence, and ignore_mask for strong augmentation
+            mask_u_w_cutmixed = mask_u_w.clone()
+            conf_u_w_cutmixed = conf_u_w.clone()
+            ignore_mask_cutmixed = ignore_mask.clone()
+
+            mask_u_w_cutmixed[cutmix_box == 1] = mask_u_w.flip(0)[cutmix_box == 1]
+            conf_u_w_cutmixed[cutmix_box == 1] = conf_u_w.flip(0)[cutmix_box == 1]
+            ignore_mask_cutmixed[cutmix_box == 1] = ignore_mask.flip(0)[cutmix_box == 1]
+
+            # Unsupervised loss for strong augmentation (with CutMix)
+            loss_u_s = criterion_u(pred_u_s, mask_u_w_cutmixed)
             loss_u_s = confidence_weighted_loss(
-                loss_u_s, conf_u_w, ignore_mask, ignore_index, conf_thresh=conf_thresh
+                loss_u_s,
+                conf_u_w_cutmixed,
+                ignore_mask_cutmixed,
+                ignore_index,
+                conf_thresh=conf_thresh,
             )
 
             # Unsupervised loss for RVS augmentation
