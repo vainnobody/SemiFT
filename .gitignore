@@ -26,3 +26,6 @@ logs/
 
 # train.py
 train.py
+
+# agents
+AGENTS.md
