@@ -59,7 +59,7 @@ def get_parser():
 
 @torch.no_grad()
 def validation_cpu(cfg, model, valid_loader):
-    """Validation function matching fixmatch.py style."""
+
     intersection_meter = AverageMeter()
     union_meter = AverageMeter()
     target_meter = AverageMeter()
@@ -68,48 +68,52 @@ def validation_cpu(cfg, model, valid_loader):
 
     for x, y, _ in valid_loader:
         x = x.cuda()
-
-        if cfg.get("eval_mode") == "slide_window":
-            b, _, h, w = x.shape
-            final = torch.zeros(b, cfg["nclass"], h, w).cuda()
+        if cfg["eval_mode"] == "slide_window":
+            b, _, h, w = x.shape  # 获取输入图像的尺寸 (batch, channels, height, width)
+            final = torch.zeros(b, cfg["nclass"], h, w).cuda()  # 用于存储最终预测结果
             size = cfg["crop_size"]
             step = 510
-            row = 0
-            col = 0
-            while row <= int(h / step):
-                while col <= int(w / step):
+            b = 0
+            a = 0
+            while a <= int(h / step):
+                while b <= int(w / step):
                     sub_input = x[
                         :,
                         :,
-                        min(row * step, h - size) : min(row * step + size, h),
-                        min(col * step, w - size) : min(col * step + size, w),
+                        min(a * step, h - size) : min(a * step + size, h),
+                        min(b * step, w - size) : min(b * step + size, w),
                     ]
-                    # model returns (pred, feat) - take pred only
+                    # print("sub_input.shape", sub_input.shape)
                     mask = model(sub_input)[0]
                     final[
                         :,
                         :,
-                        min(row * step, h - size) : min(row * step + size, h),
-                        min(col * step, w - size) : min(col * step + size, w),
+                        min(a * step, h - size) : min(a * step + size, h),
+                        min(b * step, w - size) : min(b * step + size, w),
                     ] += mask
-                    col += 1
-                col = 0
-                row += 1
+                    b += 1
+                b = 0
+                a += 1
             o = final.argmax(dim=1)
-        elif cfg.get("eval_mode") == "resize":
-            original_shape = x.shape[-2:]
+
+        elif cfg["eval_mode"] == "resize":
+            # 使用缩放方式进行预测
+            original_shape = x.shape[-2:]  # 保存原始图像的尺寸 (h, w)
             resized_x = F.interpolate(
                 x, size=cfg["crop_size"], mode="bilinear", align_corners=True
             )
             resized_o = model(resized_x)[0]
+            # 将预测结果复原到原始尺寸
             o = F.interpolate(
                 resized_o, size=original_shape, mode="bilinear", align_corners=True
             )
             o = o.argmax(dim=1)
+
         else:
+            # 直接进行预测（非滑动窗口模式）
+
             o = model(x)[0]
             o = o.max(1)[1]
-
         gray = np.uint8(o.cpu().numpy())
         target = np.array(y, dtype=np.int32)
         intersection, union, target_area = intersectionAndUnion(
@@ -118,7 +122,6 @@ def validation_cpu(cfg, model, valid_loader):
         intersection_meter.update(intersection)
         union_meter.update(union)
         target_meter.update(target_area)
-
     iou_class = intersection_meter.sum / (union_meter.sum + 1e-10)
 
     if cfg["dataset"] == "iSAID":
@@ -126,7 +129,7 @@ def validation_cpu(cfg, model, valid_loader):
     else:
         mIoU = np.nanmean(iou_class) * 100.0
 
-    return mIoU, iou_class * 100.0
+    return mIoU, iou_class
 
 
 def main(args, cfg):
@@ -361,6 +364,7 @@ def main(args, cfg):
             img_x_c, mask_x_c = img_x_c.cuda(), mask_x_c.cuda()
             img_u_w, img_u_s, img_u_c = img_u_w.cuda(), img_u_s.cuda(), img_u_c.cuda()
             ignore_mask = ignore_mask.cuda()
+            cutmix_box = cutmix_box.cuda()
             mask_c = mask_c.cuda()
 
             iters = epoch * len(trainloader_u) + i
@@ -393,8 +397,13 @@ def main(args, cfg):
             pred_u_w_fp = preds_fp[num_lb:]  # FP prediction for unlabeled only
 
             # =====================
-            # 3. Student forward: strong augmentation
+            # 3. Student forward: strong augmentation (with CutMix)
             # =====================
+            # Apply CutMix to strong augmentation image
+            img_u_s[cutmix_box.unsqueeze(1).expand(img_u_s.shape) == 1] = img_u_s.flip(
+                0
+            )[cutmix_box.unsqueeze(1).expand(img_u_s.shape) == 1]
+
             pred_u_s = model(img_u_s)[0]  # returns (pred, feat), take pred
 
             # =====================
@@ -435,37 +444,44 @@ def main(args, cfg):
             mask_u_w_rvs = mask_u_w.clone()
             mask_u_w_rvs[valid_masks_pred_sq == 0] = 255
 
-            # Confidence for RVS branch: use recovered prediction's own confidence
-            # in valid regions, zero elsewhere
-            conf_u_rvs = pred_recovered.softmax(dim=1).max(dim=1)[0]  # [B, H, W]
+            # Combine dataset ignore regions with RVS invalid regions
+            ignore_mask_rvs = ignore_mask.clone()
+            ignore_mask_rvs[valid_masks_pred_sq == 0] = ignore_index
 
             # =====================
             # 7. Compute losses
             # =====================
 
             # --- Supervised loss: loss_x ---
-            # pred_x: [B, nclass, H, W] student prediction for labeled images
-            # mask_x: [B, H, W] ground truth labels
             loss_x = criterion_l(pred_x, mask_x)
 
-            # --- Unsupervised loss (strong aug): loss_u_s ---
-            # pred_u_s: [B, nclass, H, W] student prediction for strong augmentation
-            # mask_u_w: [B, H, W] pseudo-labels from EMA teacher (weak aug)
-            # conf_u_w: [B, H, W] confidence from EMA teacher
-            loss_u_s = criterion_u(pred_u_s, mask_u_w)
+            # --- Unsupervised loss (strong aug with CutMix): loss_u_s ---
+            # CutMix pseudo-labels, confidence, and ignore_mask for strong augmentation
+            mask_u_w_cutmixed = mask_u_w.clone()
+            conf_u_w_cutmixed = conf_u_w.clone()
+            ignore_mask_cutmixed = ignore_mask.clone()
+
+            mask_u_w_cutmixed[cutmix_box == 1] = mask_u_w.flip(0)[cutmix_box == 1]
+            conf_u_w_cutmixed[cutmix_box == 1] = conf_u_w.flip(0)[cutmix_box == 1]
+            ignore_mask_cutmixed[cutmix_box == 1] = ignore_mask.flip(0)[cutmix_box == 1]
+
+            loss_u_s = criterion_u(pred_u_s, mask_u_w_cutmixed)
             loss_u_s = confidence_weighted_loss(
-                loss_u_s, conf_u_w, ignore_mask, ignore_index, conf_thresh=conf_thresh
+                loss_u_s,
+                conf_u_w_cutmixed,
+                ignore_mask_cutmixed,
+                ignore_index,
+                conf_thresh=conf_thresh,
             )
 
             # --- Unsupervised loss (RVS): loss_u_rvs ---
-            # pred_recovered: [B, nclass, H, W] recovered RVS prediction (in original space)
-            # mask_u_w_rvs: [B, H, W] pseudo-labels (EMA teacher), 255 in invalid regions
-            # conf_u_rvs: [B, H, W] confidence from recovered prediction
+            # Fix: use EMA teacher confidence (conf_u_w) instead of student confidence
+            # Fix: use ignore_mask_rvs (dataset ignore + RVS invalid) instead of mask_u_w_rvs
             loss_u_rvs = criterion_u(pred_recovered, mask_u_w_rvs)
             loss_u_rvs = confidence_weighted_loss(
                 loss_u_rvs,
-                conf_u_rvs,
-                mask_u_w_rvs,  # use mask_u_w_rvs as ignore_mask (255 = invalid)
+                conf_u_w,
+                ignore_mask_rvs,
                 ignore_index,
                 conf_thresh=conf_thresh,
             )
@@ -554,6 +570,30 @@ def main(args, cfg):
                 )
                 viz.render(f"epoch_{epoch}_iter_{i}")
                 viz.reset()
+
+            # RVS diagnostic logging
+            if rank == 0 and i % 100 == 0:
+                with torch.no_grad():
+                    valid_ratio = valid_masks_pred_sq.float().mean().item()
+                    conf_in_valid = conf_u_w[valid_masks_pred_sq > 0]
+                    high_conf_ratio = (
+                        (conf_in_valid >= conf_thresh).float().mean().item()
+                        if conf_in_valid.numel() > 0
+                        else 0
+                    )
+                    agree_ratio = (
+                        (pred_recovered.argmax(1) == mask_u_w)[valid_masks_pred_sq > 0]
+                        .float()
+                        .mean()
+                        .item()
+                        if (valid_masks_pred_sq > 0).any()
+                        else 0
+                    )
+                    logger.info(
+                        f"[RVS Debug] valid_ratio={valid_ratio:.3f}, "
+                        f"high_conf_valid={high_conf_ratio:.3f}, "
+                        f"student-teacher agree={agree_ratio:.3f}"
+                    )
 
             # =====================
             # 9. Update EMA teacher
