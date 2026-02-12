@@ -32,7 +32,9 @@ import numpy as np
 from dataset.semi_rvs import SemiDataset
 from dataset.val import ValDataset
 from model.semseg.dpt_rankmatch import DPT_RankMatch
-from model.semseg.rgcr_utils import scale_back, scale_back_features, geometric_corr_loss
+from model.semseg.rgcr_utils import (
+    scale_back,
+)  # , scale_back_features, geometric_corr_loss
 
 from util.classes import CLASSES
 from util.ohem import ProbOhemCrossEntropy2d
@@ -250,9 +252,9 @@ def main(args, cfg):
     )
 
     # RGCR hyperparameters (hardcoded)
-    geo_corr_weight = 0.1  # Weight for geometric correlation loss
-    num_landmarks = 64  # Number of orthogonal landmarks
-    rank_k = 4  # Top-k for rank computation
+    # geo_corr_weight = 0.1  # Weight for geometric correlation loss
+    # num_landmarks = 64  # Number of orthogonal landmarks
+    # rank_k = 4  # Top-k for rank computation
 
     # Datasets (use semi_rvs for geometric augmentation)
     trainset_u = SemiDataset(
@@ -345,7 +347,7 @@ def main(args, cfg):
         total_loss_u_s = AverageMeter()
         total_loss_u_rvs = AverageMeter()
         total_loss_fp = AverageMeter()
-        total_loss_geo_corr = AverageMeter()
+        # total_loss_geo_corr = AverageMeter()
         total_mask_ratio = AverageMeter()
 
         trainloader_l.sampler.set_epoch(epoch)
@@ -419,19 +421,19 @@ def main(args, cfg):
                 pred_u_rvs, mask_c, cfg["crop_size"], box
             )
 
-            # Recover features for geometric correlation loss
-            # NOTE: feat_u_rvs has backbone spatial resolution (crop_size/patch_size),
-            # but scale_back uses pixel-space coordinates from box.
-            # Must interpolate to full resolution first.
-            feat_u_rvs_full = F.interpolate(
-                feat_u_rvs,
-                size=pred_u_rvs.shape[-2:],
-                mode="bilinear",
-                align_corners=True,
-            )
-            feat_recovered, _ = scale_back_features(
-                feat_u_rvs_full, mask_c, cfg["crop_size"], box
-            )
+            # # Recover features for geometric correlation loss
+            # # NOTE: feat_u_rvs has backbone spatial resolution (crop_size/patch_size),
+            # # but scale_back uses pixel-space coordinates from box.
+            # # Must interpolate to full resolution first.
+            # feat_u_rvs_full = F.interpolate(
+            #     feat_u_rvs,
+            #     size=pred_u_rvs.shape[-2:],
+            #     mode="bilinear",
+            #     align_corners=True,
+            # )
+            # feat_recovered, _ = scale_back_features(
+            #     feat_u_rvs_full, mask_c, cfg["crop_size"], box
+            # )
 
             # =====================
             # 6. Prepare masks for RVS pseudo-label loss
@@ -493,38 +495,36 @@ def main(args, cfg):
             loss_fp_mask = (conf_u_w >= conf_thresh) & (ignore_mask != ignore_index)
             loss_fp = (loss_fp * loss_fp_mask).sum() / loss_fp_mask.sum().clamp(min=1.0)
 
-            # --- Geometric correlation loss: loss_geo_corr ---
-            # Resize features to same spatial resolution for correlation computation
-            H, W = pred_u_w.shape[-2:]
-            # Detach feat_u_w: it's the reference (like RankMatch detaches weak features)
-            # Gradients only flow through feat_recovered (RVS student branch)
-            feat_u_w_resized = F.interpolate(
-                feat_u_w.detach(), size=(H, W), mode="bilinear", align_corners=True
-            )
-            feat_recovered_resized = F.interpolate(
-                feat_recovered, size=(H, W), mode="bilinear", align_corners=True
-            )
+            # # --- Geometric correlation loss: loss_geo_corr ---
+            # # Resize features to same spatial resolution for correlation computation
+            # H, W = pred_u_w.shape[-2:]
+            # # Detach feat_u_w: it's the reference (like RankMatch detaches weak features)
+            # # Gradients only flow through feat_recovered (RVS student branch)
+            # feat_u_w_resized = F.interpolate(
+            #     feat_u_w.detach(), size=(H, W), mode="bilinear", align_corners=True
+            # )
+            # feat_recovered_resized = F.interpolate(
+            #     feat_recovered, size=(H, W), mode="bilinear", align_corners=True
+            # )
 
-            loss_geo_corr = geometric_corr_loss(
-                feat_u_w_resized,
-                feat_recovered_resized,
-                local_rank,
-                num_landmarks,
-                rank_k,
-            )
+            # loss_geo_corr = geometric_corr_loss(
+            #     feat_u_w_resized,
+            #     feat_recovered_resized,
+            #     local_rank,
+            #     num_landmarks,
+            #     rank_k,
+            # )
 
             # =====================
             # 8. Total loss (following RankMatch-style weighting)
             # =====================
-            # loss_x + (loss_u_s + loss_u_rvs) + (loss_fp + loss_geo_corr)
+            # loss_x + (loss_u_s + loss_u_rvs) + loss_fp
             # Following rankmatch weighting style:
             #   supervised:    loss_x
             #   pseudo-label:  (loss_u_s * 0.25 + loss_u_rvs * 0.25)
             #   FP:            loss_fp * 0.5
-            #   geo_corr:      geo_corr_weight * loss_geo_corr
-            loss = (
-                loss_x + loss_u_s * 0.25 + loss_u_rvs * 0.25 + loss_fp * 0.5
-            ) / 2.0 + geo_corr_weight * loss_geo_corr
+            loss = (loss_x + loss_u_s * 0.25 + loss_u_rvs * 0.25 + loss_fp * 0.5) / 2.0
+            # + geo_corr_weight * loss_geo_corr  # disabled to reduce memory
 
             torch.distributed.barrier()
 
@@ -617,7 +617,7 @@ def main(args, cfg):
             total_loss_u_s.update(loss_u_s.item())
             total_loss_u_rvs.update(loss_u_rvs.item())
             total_loss_fp.update(loss_fp.item())
-            total_loss_geo_corr.update(loss_geo_corr.item())
+            # total_loss_geo_corr.update(loss_geo_corr.item())
 
             mask_ratio = (
                 (conf_u_w >= conf_thresh) & (ignore_mask != ignore_index)
@@ -635,14 +635,14 @@ def main(args, cfg):
                 writer.add_scalar("train/loss_u_s", loss_u_s.item(), iters)
                 writer.add_scalar("train/loss_u_rvs", loss_u_rvs.item(), iters)
                 writer.add_scalar("train/loss_fp", loss_fp.item(), iters)
-                writer.add_scalar("train/loss_geo_corr", loss_geo_corr.item(), iters)
+                # writer.add_scalar("train/loss_geo_corr", loss_geo_corr.item(), iters)
                 writer.add_scalar("train/mask_ratio", mask_ratio, iters)
 
             if (i % (len(trainloader_u) // 8) == 0) and (rank == 0):
                 logger.info(
                     "Iters: {:}, LR: {:.7f}, Total loss: {:.3f}, Loss x: {:.3f}, "
                     "Loss u_s: {:.3f}, Loss u_rvs: {:.3f}, Loss fp: {:.3f}, "
-                    "Loss geo_corr: {:.3f}, Mask ratio: {:.3f}".format(
+                    "Mask ratio: {:.3f}".format(
                         i,
                         optimizer.param_groups[0]["lr"],
                         total_loss.avg,
@@ -650,7 +650,6 @@ def main(args, cfg):
                         total_loss_u_s.avg,
                         total_loss_u_rvs.avg,
                         total_loss_fp.avg,
-                        total_loss_geo_corr.avg,
                         total_mask_ratio.avg,
                     )
                 )
