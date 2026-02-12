@@ -21,7 +21,6 @@ import pprint
 
 import torch
 from torch import nn
-from torch.cuda.amp import autocast, GradScaler
 import torch.nn.functional as F
 import torch.backends.cudnn as cudnn
 from torch.optim import AdamW
@@ -332,8 +331,6 @@ def main(args, cfg):
     filename = datetime.now().strftime("%Y%m%d_%H%M%S")
     viz = Visualizer(save_dir=f"./viz/{filename}", dataset=cfg["dataset"])
 
-    scaler = GradScaler()
-
     for epoch in range(epoch + 1, cfg["epochs"]):
         if rank == 0:
             logger.info(
@@ -376,13 +373,14 @@ def main(args, cfg):
             # 1. EMA Teacher: Generate pseudo-labels from weak augmentation
             # =====================
             with torch.no_grad():
-                with autocast():
-                    # model_ema returns (pred, feat) via DPT_RankMatch.forward
-                    pred_u_w_ema, feat_u_w_ema = model_ema(img_u_w)
-                pred_u_w_ema = pred_u_w_ema.detach().float()
-                feat_u_w_ema = feat_u_w_ema.detach().float()
+                # model_ema returns (pred, feat) via DPT_RankMatch.forward
+                pred_u_w_ema, feat_u_w_ema = model_ema(img_u_w)
+                pred_u_w_ema = pred_u_w_ema.detach()
+                feat_u_w_ema = feat_u_w_ema.detach()
 
                 # Pseudo-labels from EMA teacher
+                # mask_u_w: [B, H, W] - argmax class indices as pseudo-labels
+                # conf_u_w: [B, H, W] - max softmax probability as confidence
                 conf_u_w = pred_u_w_ema.softmax(dim=1).max(dim=1)[0]
                 mask_u_w = pred_u_w_ema.argmax(dim=1)
 
@@ -393,10 +391,7 @@ def main(args, cfg):
             # Concatenate labeled and unlabeled weak images
             num_lb, num_ulb = img_x.shape[0], img_u_w.shape[0]
 
-            with autocast():
-                preds, preds_fp, feats = model(
-                    torch.cat((img_x, img_u_w)), need_fp=True
-                )
+            preds, preds_fp, feats = model(torch.cat((img_x, img_u_w)), need_fp=True)
             pred_x, pred_u_w = preds.split([num_lb, num_ulb])
             _, feat_u_w = feats.split([num_lb, num_ulb])
             pred_u_w_fp = preds_fp[num_lb:]  # FP prediction for unlabeled only
@@ -409,14 +404,12 @@ def main(args, cfg):
                 0
             )[cutmix_box.unsqueeze(1).expand(img_u_s.shape) == 1]
 
-            with autocast():
-                pred_u_s = model(img_u_s)[0]  # returns (pred, feat), take pred
+            pred_u_s = model(img_u_s)[0]  # returns (pred, feat), take pred
 
             # =====================
             # 4. Student forward: RVS (rotated-varied-scaled) augmentation
             # =====================
-            with autocast():
-                pred_u_rvs, feat_u_rvs = model(img_u_c)  # returns (pred, feat)
+            pred_u_rvs, feat_u_rvs = model(img_u_c)  # returns (pred, feat)
 
             # =====================
             # 5. Scale-back: recover RVS predictions and features to original space
@@ -536,9 +529,8 @@ def main(args, cfg):
             torch.distributed.barrier()
 
             optimizer.zero_grad()
-            scaler.scale(loss).backward()
-            scaler.step(optimizer)
-            scaler.update()
+            loss.backward()
+            optimizer.step()
 
             # =====================
             # 8.5 Visualization (first 10 iters per epoch)
