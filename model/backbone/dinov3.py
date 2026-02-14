@@ -408,7 +408,7 @@ def DINOv3(model_name):
         ffn_layer="mlp" if model_name not in ["giant", "huge", "so400m"] else "swiglu",
         n_storage_tokens=4,
         mask_k_bias=True,
-        layerscale_init=1.0,
+        layerscale_init=1.0e-05,
         pos_embed_rope_rescale_coords=2,
         norm_layer="layernormbf16",
     )
