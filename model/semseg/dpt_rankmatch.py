@@ -53,7 +53,7 @@ class DPT_RankMatch(DPT):
                 B, N, C = f.shape
                 f_4d = f.permute(0, 2, 1).reshape(B, C, patch_h, patch_w)
                 f_drop_4d = nn.Dropout2d(0.5)(f_4d)
-                f_drop = f_drop_4d.reshape(B, C, N).permute(0, 2, 1)
+                f_drop = f_drop_4d.reshape(B, C, N).permute(0, 2, 1).contiguous()
                 f_cat = torch.cat((f, f_drop), dim=0)  # [2B, N, C]
                 features_expanded.append(f_cat)
 
@@ -70,8 +70,12 @@ class DPT_RankMatch(DPT):
 
             # Get features for corr_loss (from the deepest backbone feature)
             feat_deepest = features[-1]  # [B, N, C]
-            feat = feat_deepest.permute(0, 2, 1).reshape(
-                feat_deepest.shape[0], feat_deepest.shape[-1], patch_h, patch_w
+            feat = (
+                feat_deepest.permute(0, 2, 1)
+                .reshape(
+                    feat_deepest.shape[0], feat_deepest.shape[-1], patch_h, patch_w
+                )
+                .contiguous()
             )
 
             return out, out_fp, feat
@@ -87,8 +91,12 @@ class DPT_RankMatch(DPT):
 
             # Get features for corr_loss (from the deepest backbone feature)
             feat_deepest = features[-1]  # [B, N, C]
-            feat = feat_deepest.permute(0, 2, 1).reshape(
-                feat_deepest.shape[0], feat_deepest.shape[-1], patch_h, patch_w
+            feat = (
+                feat_deepest.permute(0, 2, 1)
+                .reshape(
+                    feat_deepest.shape[0], feat_deepest.shape[-1], patch_h, patch_w
+                )
+                .contiguous()
             )
 
             return out, feat
