@@ -21,6 +21,7 @@ class DPT_RankMatch(DPT):
 
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
+        self.fp_dropout = nn.Dropout2d(0.5)
 
     def forward(self, x, need_fp=False):
         """
@@ -52,7 +53,7 @@ class DPT_RankMatch(DPT):
                 # f is [B, N, C], Dropout2d expects [B, C, H, W]
                 B, N, C = f.shape
                 f_4d = f.permute(0, 2, 1).reshape(B, C, patch_h, patch_w)
-                f_drop_4d = nn.Dropout2d(0.5)(f_4d)
+                f_drop_4d = self.fp_dropout(f_4d)
                 f_drop = f_drop_4d.reshape(B, C, N).permute(0, 2, 1).contiguous()
                 f_cat = torch.cat((f, f_drop), dim=0)  # [2B, N, C]
                 features_expanded.append(f_cat)
