@@ -65,7 +65,7 @@ class DPT_RankMatch(DPT):
                 (patch_h * patch_size, patch_w * patch_size),
                 mode="bilinear",
                 align_corners=True,
-            )
+            ).contiguous()
 
             out, out_fp = out_expanded.chunk(2, dim=0)
 
@@ -88,7 +88,7 @@ class DPT_RankMatch(DPT):
                 (patch_h * patch_size, patch_w * patch_size),
                 mode="bilinear",
                 align_corners=True,
-            )
+            ).contiguous()
 
             # Get features for corr_loss (from the deepest backbone feature)
             feat_deepest = features[-1]  # [B, N, C]
