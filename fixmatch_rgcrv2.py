@@ -142,9 +142,6 @@ def build_stable_geo_mask(
     ignore_mask,
     ignore_index,
     conf_thresh,
-    feat_u_w_resized=None,
-    feat_recovered=None,
-    feat_cos_thresh=0.0,
 ):
     """Build a geometry-stable mask from weak/RVS agreement."""
     stable_mask = (
@@ -153,15 +150,6 @@ def build_stable_geo_mask(
         & (ignore_mask != ignore_index)
         & (pred_recovered.argmax(dim=1) == mask_u_w)
     )
-
-    if (
-        feat_u_w_resized is not None
-        and feat_recovered is not None
-        and feat_cos_thresh > 0
-    ):
-        feat_cos = F.cosine_similarity(feat_u_w_resized, feat_recovered, dim=1)
-        stable_mask = stable_mask & (feat_cos >= feat_cos_thresh)
-
     return stable_mask
 
 
@@ -231,6 +219,11 @@ def compute_gmp_loss(
     """Align uncertain pixels to geometry memories using KL distillation."""
     if geo_memory is None or (not geo_memory_valid.any()) or (not query_mask.any()):
         return student_logits.new_zeros(())
+
+    if student_logits.shape[-2:] != feat_map.shape[-2:]:
+        student_logits = F.interpolate(
+            student_logits, size=feat_map.shape[-2:], mode="bilinear", align_corners=True
+        )
 
     valid_classes = geo_memory_valid.nonzero(as_tuple=False).flatten()
     memory_logits = compute_memory_logits(feat_map, geo_memory[valid_classes], temperature)
@@ -432,7 +425,6 @@ def main(args, cfg):
     gmp_momentum = cfg.get("gmp_momentum", 0.95)
     gmp_query_low = cfg.get("gmp_query_low", 0.5)
     gmp_temperature = cfg.get("gmp_temperature", 0.07)
-    gmp_feat_cos_thresh = cfg.get("gmp_feat_cos_thresh", 0.0)
     geo_memory = None
     geo_memory_valid = torch.zeros(cfg["nclass"], dtype=torch.bool, device=local_rank)
 
@@ -583,20 +575,10 @@ def main(args, cfg):
             # =====================
             # 6.5 Geometry-Memory Prompting (GMP) preparation
             # =====================
-            feat_u_w_resized = F.interpolate(
-                feat_u_w, size=pred_u_w.shape[-2:], mode="bilinear", align_corners=True
-            )
-            feat_u_rvs_resized = F.interpolate(
-                feat_u_rvs, size=pred_u_rvs.shape[-2:], mode="bilinear", align_corners=True
-            )
-            feat_recovered, _ = scale_back(
-                feat_u_rvs_resized, mask_c, cfg["crop_size"], box
-            )
-            feat_recovered = F.normalize(feat_recovered, dim=1)
-            feat_u_w_resized = F.normalize(feat_u_w_resized, dim=1)
+            feat_u_w_lowres = F.normalize(feat_u_w, dim=1)
 
             if geo_memory is None:
-                geo_memory = feat_u_w_resized.new_zeros((cfg["nclass"], feat_u_w_resized.shape[1]))
+                geo_memory = feat_u_w_lowres.new_zeros((cfg["nclass"], feat_u_w_lowres.shape[1]))
 
             stable_geo_mask = build_stable_geo_mask(
                 conf_u_w,
@@ -606,17 +588,6 @@ def main(args, cfg):
                 ignore_mask,
                 ignore_index,
                 conf_thresh,
-                feat_u_w_resized=feat_u_w_resized.detach(),
-                feat_recovered=feat_recovered.detach(),
-                feat_cos_thresh=gmp_feat_cos_thresh,
-            )
-            geo_memory, geo_memory_valid = update_geo_memory(
-                geo_memory,
-                geo_memory_valid,
-                feat_u_w_resized.detach(),
-                mask_u_w.detach(),
-                stable_geo_mask.detach(),
-                momentum=gmp_momentum,
             )
             disagreement_mask = (pred_recovered.detach().argmax(dim=1) != mask_u_w) & (valid_masks_pred_sq > 0)
             query_mask = (
@@ -624,6 +595,26 @@ def main(args, cfg):
                 & (valid_masks_pred_sq > 0)
                 & (~stable_geo_mask)
                 & (((conf_u_w < conf_thresh) & (conf_u_w >= gmp_query_low)) | disagreement_mask)
+            )
+
+            feat_hw = feat_u_w_lowres.shape[-2:]
+            stable_geo_mask_lowres = F.interpolate(
+                stable_geo_mask.unsqueeze(1).float(), size=feat_hw, mode="nearest"
+            ).squeeze(1) > 0
+            query_mask_lowres = F.interpolate(
+                query_mask.unsqueeze(1).float(), size=feat_hw, mode="nearest"
+            ).squeeze(1) > 0
+            mask_u_w_lowres = F.interpolate(
+                mask_u_w.unsqueeze(1).float(), size=feat_hw, mode="nearest"
+            ).squeeze(1).long()
+
+            geo_memory, geo_memory_valid = update_geo_memory(
+                geo_memory,
+                geo_memory_valid,
+                feat_u_w_lowres.detach(),
+                mask_u_w_lowres.detach(),
+                stable_geo_mask_lowres.detach(),
+                momentum=gmp_momentum,
             )
 
             # =====================
@@ -694,10 +685,10 @@ def main(args, cfg):
             # --- Geometry-memory prompting loss: loss_gmp ---
             loss_gmp = compute_gmp_loss(
                 pred_u_w,
-                feat_u_w_resized,
+                feat_u_w_lowres,
                 geo_memory,
                 geo_memory_valid,
-                query_mask,
+                query_mask_lowres,
                 temperature=gmp_temperature,
             )
 
