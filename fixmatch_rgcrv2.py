@@ -7,6 +7,11 @@ Changes vs fixmatch_rgcr.py:
 - no per-iteration barrier
 - rank0-only visualization / logging / writer / checkpoints
 - separate best student and best EMA checkpoints
+
+Note:
+- this variant keeps the RVS + FP training path from fixmatch_rgcr.py
+- geometric correlation loss is intentionally not enabled here because the
+  current feature recovery utility only supports full-resolution logits
 """
 
 import argparse
@@ -35,7 +40,6 @@ from util.classes import CLASSES
 from util.dist_helper import setup_distributed
 from util.focal import FocalLoss
 from util.ohem import ProbOhemCrossEntropy2d
-from util.train_utils import confidence_weighted_loss
 from util.utils import AverageMeter, count_params, init_log, intersectionAndUnion
 from util.viz import Visualizer
 
@@ -67,6 +71,7 @@ def validation_distributed(cfg, model, valid_loader, eval_mode, ignore_index):
         if eval_mode == "slide_window":
             bsz, _, h, w = x.shape
             final = torch.zeros(bsz, cfg["nclass"], h, w, device=x.device)
+            count = torch.zeros(bsz, 1, h, w, device=x.device)
             size = cfg["crop_size"]
             step = 510 if cfg["dataset"] == "cityscapes" else max(size * 2 // 3, 1)
             row = 0
@@ -78,8 +83,10 @@ def validation_distributed(cfg, model, valid_loader, eval_mode, ignore_index):
                     sub_input = x[:, :, h0 : min(h0 + size, h), w0 : min(w0 + size, w)]
                     pred = model(sub_input)[0]
                     final[:, :, h0 : min(h0 + size, h), w0 : min(w0 + size, w)] += pred
+                    count[:, :, h0 : min(h0 + size, h), w0 : min(w0 + size, w)] += 1
                     col += 1
                 row += 1
+            final = final / count.clamp_min(1.0)
             pred_label = final.argmax(dim=1)
         elif eval_mode == "resize":
             original_shape = x.shape[-2:]
@@ -118,6 +125,11 @@ def validation_distributed(cfg, model, valid_loader, eval_mode, ignore_index):
         miou = np.nanmean(iou_class) * 100.0
 
     return miou, iou_class
+
+
+def masked_high_conf_loss(loss_map, conf_map, ignore_mask, ignore_index, conf_thresh):
+    valid_mask = (conf_map >= conf_thresh) & (ignore_mask != ignore_index)
+    return (loss_map * valid_mask).sum() / valid_mask.sum().clamp(min=1.0)
 
 
 def main(args, cfg):
@@ -246,7 +258,7 @@ def main(args, cfg):
             f'{cfg["criterion"]["name"]} criterion is not implemented'
         )
 
-    criterion_u = nn.CrossEntropyLoss(reduction="none", ignore_index=255).cuda(
+    criterion_u = nn.CrossEntropyLoss(reduction="none", ignore_index=ignore_index).cuda(
         local_rank
     )
 
@@ -369,11 +381,10 @@ def main(args, cfg):
                 mask_u_w = pred_u_w_ema.argmax(dim=1)
 
             num_lb, num_ulb = img_x.shape[0], img_u_w.shape[0]
-            preds, preds_fp, feats = model(torch.cat((img_x, img_u_w)), need_fp=True)
+            preds, preds_fp, _ = model(torch.cat((img_x, img_u_w)), need_fp=True)
             pred_x, pred_u_w = preds.split([num_lb, num_ulb])
-            _, feat_u_w = feats.split([num_lb, num_ulb])
             pred_u_w_fp = preds_fp[num_lb:]
-            del pred_u_w, feat_u_w, feat_u_w_ema
+            del pred_u_w, feat_u_w_ema
 
             cutmix_mask = cutmix_box.unsqueeze(1).expand(img_u_s.shape) == 1
             img_u_s[cutmix_mask] = img_u_s.flip(0)[cutmix_mask]
@@ -401,22 +412,20 @@ def main(args, cfg):
             conf_u_w_cutmixed[cutmix_box == 1] = conf_u_w.flip(0)[cutmix_box == 1]
             ignore_mask_cutmixed[cutmix_box == 1] = ignore_mask.flip(0)[cutmix_box == 1]
 
-            loss_u_s = criterion_u(pred_u_s, mask_u_w_cutmixed)
-            loss_u_s = confidence_weighted_loss(
-                loss_u_s,
+            loss_u_s = masked_high_conf_loss(
+                criterion_u(pred_u_s, mask_u_w_cutmixed),
                 conf_u_w_cutmixed,
                 ignore_mask_cutmixed,
                 ignore_index,
-                conf_thresh=conf_thresh,
+                conf_thresh,
             )
 
-            loss_u_rvs = criterion_u(pred_recovered, mask_u_w_rvs)
-            loss_u_rvs = confidence_weighted_loss(
-                loss_u_rvs,
+            loss_u_rvs = masked_high_conf_loss(
+                criterion_u(pred_recovered, mask_u_w_rvs),
                 conf_u_w,
                 ignore_mask_rvs,
                 ignore_index,
-                conf_thresh=conf_thresh,
+                conf_thresh,
             )
 
             loss_fp = criterion_u(pred_u_w_fp, mask_u_w)
