@@ -29,7 +29,9 @@ import torchvision.transforms.functional as TF
 
 from dataset.semi_rvs import SemiDataset
 from dataset.val import ValDataset
-from model.semseg.dpt_rankmatch import DPT_RankMatch
+from model.semseg.dpt import DPT
+from model.semseg.my_upernet import MyUperNet
+from model.semseg.upernet import UperNet
 from model.semseg.rgcr_utils import (
     scale_back,
 )  # , scale_back_features, geometric_corr_loss
@@ -84,7 +86,7 @@ def validation_cpu(cfg, model, valid_loader):
                         min(b * step, w - size) : min(b * step + size, w),
                     ]
                     # print("sub_input.shape", sub_input.shape)
-                    mask = model(sub_input)[0]
+                    mask = model(sub_input)
                     final[
                         :,
                         :,
@@ -102,7 +104,7 @@ def validation_cpu(cfg, model, valid_loader):
             resized_x = F.interpolate(
                 x, size=cfg["crop_size"], mode="bilinear", align_corners=True
             )
-            resized_o = model(resized_x)[0]
+            resized_o = model(resized_x)
             # 将预测结果复原到原始尺寸
             o = F.interpolate(
                 resized_o, size=original_shape, mode="bilinear", align_corners=True
@@ -112,7 +114,7 @@ def validation_cpu(cfg, model, valid_loader):
         else:
             # 直接进行预测（非滑动窗口模式）
 
-            o = model(x)[0]
+            o = model(x)
             o = o.max(1)[1]
         gray = np.uint8(o.cpu().numpy())
         target = np.array(y, dtype=np.int32)
@@ -287,11 +289,18 @@ def main(args, cfg):
     backbone_size = cfg["backbone"].split("_")[-1]
     backbone_version = cfg["backbone"].split("_")[0]
 
-    # Use DPT_RankMatch for prediction + feature outputs used by the RVS branch
-    model = DPT_RankMatch(
-        **{**model_configs[backbone_size], "nclass": cfg["nclass"]},
-        backbone_version=backbone_version,
-    )
+    if cfg["model"] == "dpt":
+        model = DPT(
+            **{**model_configs[backbone_size], "nclass": cfg["nclass"]},
+            backbone_version=backbone_version,
+        )
+    elif cfg["model"] == "upernet":
+        model = UperNet(
+            **{**model_configs[backbone_size], "nclass": cfg["nclass"]},
+            backbone_version=backbone_version,
+        )
+    else:
+        raise NotImplementedError(f"Unsupported model: {cfg['model']}")
 
     state_dict = torch.load(f'./pretrained/{cfg["backbone"]}.pth')
     model.backbone.load_state_dict(state_dict)
@@ -336,7 +345,7 @@ def main(args, cfg):
         find_unused_parameters=True,
     )
 
-    # EMA Teacher (uses standard DPT_RankMatch, returns pred + feat)
+    # EMA Teacher follows the same configurable model path as UniMatch v2
     model_ema = deepcopy(model)
     model_ema.eval()
     for param in model_ema.parameters():
@@ -497,8 +506,7 @@ def main(args, cfg):
             # 1. EMA Teacher: Generate pseudo-labels from weak augmentation
             # =====================
             with torch.no_grad():
-                pred_u_w_ema, _ = model_ema(img_u_w)
-                pred_u_w_ema = pred_u_w_ema.detach()
+                pred_u_w_ema = model_ema(img_u_w).detach()
 
                 conf_u_w = pred_u_w_ema.softmax(dim=1).max(dim=1)[0]
                 mask_u_w = pred_u_w_ema.argmax(dim=1)
@@ -524,10 +532,11 @@ def main(args, cfg):
             # =====================
             # 2. Student forward: labeled data
             # =====================
-            pred_x, _ = model(img_x)
+            pred_x = model(img_x)
 
             # =====================
-            # 3. Student forward: dual strong augmentations (with independent CutMix)
+            # 3. Student forward: dual strong augmentations with UniMatch-v2-style
+            #    complementary feature dropout (after independent CutMix)
             # =====================
             img_u_s1[cutmix_box1.unsqueeze(1).expand(img_u_s1.shape) == 1] = (
                 img_u_s1.flip(0)[cutmix_box1.unsqueeze(1).expand(img_u_s1.shape) == 1]
@@ -536,8 +545,9 @@ def main(args, cfg):
                 img_u_s2.flip(0)[cutmix_box2.unsqueeze(1).expand(img_u_s2.shape) == 1]
             )
 
-            pred_u_s1, _ = model(img_u_s1)
-            pred_u_s2, _ = model(img_u_s2)
+            pred_u_s1, pred_u_s2 = model(
+                torch.cat((img_u_s1, img_u_s2)), comp_drop=True
+            ).chunk(2)
 
             # =====================
             # 4. Student forward: RVS (rotated-varied-scaled) augmentation
