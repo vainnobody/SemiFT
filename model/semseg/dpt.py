@@ -5,6 +5,7 @@ import torch.nn.functional as F
 
 from model.backbone.dinov2 import DINOv2
 from model.backbone.dinov3 import DINOv3
+from model.semseg.feature_perturb import apply_structured_feature_perturbation
 from model.util.blocks import FeatureFusionBlock, _make_scratch
 
 
@@ -173,8 +174,9 @@ class DPT(nn.Module):
         for p in self.backbone.parameters():
             p.requires_grad = False
 
-    def forward(self, x, comp_drop=False):
+    def forward(self, x, comp_drop=False, feature_perturb=None):
         patch_size = self.backbone.patch_size
+        batch_size = x.shape[0]
         patch_h, patch_w = x.shape[-2] // patch_size, x.shape[-1] // patch_size
 
         features = self.backbone.get_intermediate_layers(
@@ -194,7 +196,10 @@ class DPT(nn.Module):
 
             dropout_mask = torch.cat((dropout_mask1, dropout_mask2))
 
-            features = (feature * dropout_mask.unsqueeze(1) for feature in features)
+            features = tuple(
+                feature * dropout_mask.unsqueeze(1).to(feature.device)
+                for feature in features
+            )
 
             out = self.head(features, patch_h, patch_w)
 
@@ -206,6 +211,23 @@ class DPT(nn.Module):
             )
 
             return out
+
+        if feature_perturb is not None:
+            perturbed_features = []
+            for feature in features:
+                feat_map = feature.permute(0, 2, 1).reshape(
+                    batch_size, feature.shape[-1], patch_h, patch_w
+                )
+                feat_map = apply_structured_feature_perturbation(
+                    feat_map.float(), feature_perturb
+                )
+                perturbed_feature = feat_map.reshape(batch_size, feature.shape[-1], -1)
+                perturbed_feature = perturbed_feature.permute(0, 2, 1).to(
+                    dtype=feature.dtype
+                )
+                perturbed_features.append(perturbed_feature)
+
+            features = tuple(perturbed_features)
 
         out = self.head(features, patch_h, patch_w)
         out = F.interpolate(

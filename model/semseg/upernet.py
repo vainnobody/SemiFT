@@ -9,6 +9,7 @@ import torch.nn.functional as F
 
 from model.backbone.dinov2 import DINOv2
 from model.backbone.dinov3 import DINOv3
+from model.semseg.feature_perturb import apply_structured_feature_perturbation
 
 
 class PPM(nn.Module):
@@ -273,13 +274,14 @@ class UperNet(nn.Module):
         for p in self.backbone.parameters():
             p.requires_grad = False
 
-    def forward(self, x, comp_drop=False):
+    def forward(self, x, comp_drop=False, feature_perturb=None):
         """
         Forward pass.
 
         Args:
             x: Input tensor of shape (B, 3, H, W)
             comp_drop: Whether to apply complementary dropout (same as DPT)
+            feature_perturb: Optional structured perturbation config
 
         Returns:
             Segmentation logits of shape (B, nclass, H, W)
@@ -307,14 +309,18 @@ class UperNet(nn.Module):
 
             dropout_mask = torch.cat((dropout_mask1, dropout_mask2))
             features = tuple(
-                feature * dropout_mask.unsqueeze(1) for feature in features
+                feature * dropout_mask.unsqueeze(1).to(feature.device)
+                for feature in features
             )
 
         # Reshape features from (B, N, C) to (B, C, H, W)
         feat_maps = []
         for feat in features:
             feat = feat.permute(0, 2, 1).reshape(B, -1, patch_h, patch_w)
-            feat_maps.append(feat.float())
+            feat = feat.float()
+            if feature_perturb is not None:
+                feat = apply_structured_feature_perturbation(feat, feature_perturb)
+            feat_maps.append(feat)
 
         # Neck: build feature pyramid
         pyramid_feats = self.neck(tuple(feat_maps))
