@@ -229,6 +229,21 @@ def project_weak_map_to_rvs(map_tensor, box, size, mode="nearest", fill_value=0)
     return projected
 
 
+@torch.no_grad()
+def validate_target_range(name, target, nclass, ignore_index, logger=None, rank=0):
+    valid = (target != ignore_index) & ((target < 0) | (target >= nclass))
+    if valid.any():
+        bad_vals = torch.unique(target[valid]).detach().cpu().tolist()
+        msg = (
+            f"[TargetRangeError] {name}: invalid target values {bad_vals}, "
+            f"min={target.min().item()}, max={target.max().item()}, "
+            f"ignore_index={ignore_index}, nclass={nclass}"
+        )
+        if logger is not None and rank == 0:
+            logger.error(msg)
+        raise ValueError(msg)
+
+
 def main(args, cfg):
     logger = init_log("global", logging.INFO)
     logger.propagate = 0
@@ -489,7 +504,11 @@ def main(args, cfg):
                 mask_u_w = pred_u_w_ema.argmax(dim=1)
 
                 mask_u_rvs_view = project_weak_map_to_rvs(
-                    mask_u_w, box, cfg["crop_size"], mode="nearest", fill_value=255
+                    mask_u_w,
+                    box,
+                    cfg["crop_size"],
+                    mode="nearest",
+                    fill_value=ignore_index,
                 )
                 conf_u_rvs_view = project_weak_map_to_rvs(
                     conf_u_w, box, cfg["crop_size"], mode="bilinear", fill_value=0
@@ -539,9 +558,9 @@ def main(args, cfg):
 
             # mask_u_w_rvs: pseudo-labels for RVS branch
             # In valid regions: use EMA teacher pseudo-labels (mask_u_w)
-            # In invalid regions: set to ignore_index (255)
+            # In invalid regions: set to ignore_index
             mask_u_w_rvs = mask_u_w.clone()
-            mask_u_w_rvs[valid_masks_pred_sq == 0] = 255
+            mask_u_w_rvs[valid_masks_pred_sq == 0] = ignore_index
 
             # Combine dataset ignore regions with RVS invalid regions
             ignore_mask_rvs = ignore_mask.clone()
@@ -564,6 +583,14 @@ def main(args, cfg):
             ignore_mask_cutmixed1[cutmix_box1 == 1] = ignore_mask.flip(0)[
                 cutmix_box1 == 1
             ]
+            validate_target_range(
+                "loss_u_s1_target",
+                mask_u_w_cutmixed1,
+                cfg["nclass"],
+                ignore_index,
+                logger=logger,
+                rank=rank,
+            )
 
             loss_u_s1 = criterion_u(pred_u_s1, mask_u_w_cutmixed1)
             loss_u_s1 = confidence_weighted_loss(
@@ -588,6 +615,14 @@ def main(args, cfg):
             ignore_mask_cutmixed2[cutmix_box2 == 1] = ignore_mask_rvs_view.flip(0)[
                 cutmix_box2 == 1
             ]
+            validate_target_range(
+                "loss_u_s2_target",
+                mask_u_w_cutmixed2,
+                cfg["nclass"],
+                ignore_index,
+                logger=logger,
+                rank=rank,
+            )
 
             loss_u_s2 = criterion_u(pred_u_s2, mask_u_w_cutmixed2)
             loss_u_s2 = confidence_weighted_loss(
@@ -599,6 +634,14 @@ def main(args, cfg):
             )
 
             # --- Unsupervised loss (RVS): loss_u_rvs ---
+            validate_target_range(
+                "loss_u_rvs_target",
+                mask_u_w_rvs,
+                cfg["nclass"],
+                ignore_index,
+                logger=logger,
+                rank=rank,
+            )
             loss_u_rvs = criterion_u(pred_recovered, mask_u_w_rvs)
             loss_u_rvs = confidence_weighted_loss(
                 loss_u_rvs,
@@ -664,7 +707,7 @@ def main(args, cfg):
                             pred_u_s2.argmax(dim=1)[0],
                             Visualizer.SEGMENTATION,
                         ),
-                        # RVS pseudo-label target (255 in invalid regions)
+                        # RVS pseudo-label target (ignore_index in invalid regions)
                         "mask_u_w_rvs": (mask_u_w_rvs[0], Visualizer.SEGMENTATION),
                     }
                 )
