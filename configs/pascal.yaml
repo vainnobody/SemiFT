@@ -1,0 +1,72 @@
+# arguments for dataset
+dataset: pascal
+data_root: Your/PASCAL/Path
+nclass: 21
+crop_size: 518
+
+# arguments for training
+epochs: 60
+batch_size: 4 # per GPU x 4 GPUs
+lr: 0.000005
+lr_multi: 40.0
+criterion:
+  name: CELoss
+  kwargs:
+    ignore_index: 255
+conf_thresh: 0.95
+
+# arguments for model
+model: dpt
+backbone: dinov2_small
+lock_backbone: False
+
+# arguments for PEFT
+peft:
+  method: semift
+  target_modules: ["mlp"]
+  freeze_backbone: True
+  modules_to_save: ["head"]
+  bias: lora_only
+  # supported methods:
+  # semift | lora | ssf | bitfit | adaptformer | fact_tt | fact_tk | conv_lora | hydralora
+
+  # LoRA parameters
+  r: 32
+  lora_alpha: 64
+  lora_dropout: 0.1
+
+  # SSF parameters
+  ssf_init_scale: 1.0
+  ssf_init_shift_std: 0.02
+
+  # AdaptFormer parameters
+  adapter_dim: 64
+  adapter_dropout: 0.1
+  adapter_scale: 0.1
+  adapter_layernorm_option: none
+
+  # FacT parameters
+  fact_rank: 8
+  fact_scale: 1.0
+  fact_dropout: 0.1
+
+  # Conv-LoRA / HydraLoRA parameters
+  conv_lora_kernel_size: 3
+  conv_lora_dropout: 0.1
+  hydra_num_branches: 4
+  hydra_router_hidden: 64
+  hydra_router_dropout: 0.1
+
+  # SemiFT / MoE / ConvExpert parameters
+  moe_num_experts: 4
+  moe_topk: 2
+  moe_router_aux_loss_coef: 0.01
+  moe_router_z_loss_coef: 0.001
+  moe_router_jitter_noise: 0.01
+  moe_num_prefix_tokens: 5
+  moe_use_shared_expert: True
+  moe_conv_hidden_ratio: 2.0
+  moe_conv_kernel_size: 3
+  moe_conv_context_kernel_size: 5
+  moe_conv_use_grn: True
+  moe_conv_norm_type: layernorm

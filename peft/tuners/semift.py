@@ -1,123 +1,101 @@
 # coding=utf-8
-# Copyright 2023-present the HuggingFace Inc. team.
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
-import importlib
 import math
 import re
-import warnings
 from dataclasses import asdict, dataclass, field
 from enum import Enum
-from typing import List, Optional, Union
+from typing import Dict, List, Optional, Tuple, Union
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from transformers.pytorch_utils import Conv1D
 
-from ..utils import PeftConfig, PeftType, transpose
+from ..utils import PeftConfig, PeftType
 from .moe import SemiFt
 
 
 @dataclass
 class SemiFTConfig(PeftConfig):
-    """
-    This is the configuration class to store the configuration of a [`~peft.Lora`].
-
-    Args:
-        r (`int`): Lora attention dimension
-        target_modules (`Union[List[str],str]`): The names of the modules to apply Lora to.
-        lora_alpha (`float`): The alpha parameter for Lora scaling.
-        lora_dropout (`float`): The dropout probability for Lora layers.
-        merge_weights (`bool`):
-            Whether to merge the weights of the Lora layers with the base transformer model in `eval` mode.
-        fan_in_fan_out (`bool`): Set this to True if the layer to replace stores weight like (fan_in, fan_out)
-        enable_lora ( `List[bool]`): Used with `lora.MergedLinear`.
-        bias (`str`): Bias type for Lora. Can be 'none', 'all' or 'lora_only'
-        modules_to_save (`List[str]`):List of modules apart from LoRA layers to be set as trainable
-            and saved in the final checkpoint.
-    """
-
     method: str = field(default="lora")
+    target_modules: Optional[Union[List[str], str]] = field(default=None)
+    bias: str = field(default="none")
+    modules_to_save: Optional[List[str]] = field(default=None)
 
-    r: int = field(default=8, metadata={"help": "Lora attention dimension"})
-    target_modules: Optional[Union[List[str], str]] = field(
-        default=None,
-        metadata={
-            "help": "List of module names or regex expression of the module names to replace with Lora."
-            "For example, ['q', 'v'] or '.*decoder.*(SelfAttention|EncDecAttention).*(q|v)$' "
-        },
-    )
-    bias: str = field(
-        default="none",
-        metadata={"help": "Bias type for Lora. Can be 'none', 'all' or 'lora_only'"},
-    )
-    nclass: int = field(default=5, metadata={"help": "Numbers of classes"})
-    moe_num_experts: int = field(default=4, metadata={"help": "Number of routed experts in SemiFT MoE adapter"})
-    moe_topk: int = field(default=2, metadata={"help": "Top-k experts selected per token in SemiFT MoE adapter"})
-    moe_router_aux_loss_coef: float = field(default=1e-2, metadata={"help": "Load balancing auxiliary loss coefficient for SemiFT router"})
-    moe_router_z_loss_coef: float = field(default=1e-3, metadata={"help": "Router z-loss coefficient for SemiFT router"})
-    moe_router_jitter_noise: float = field(default=1e-2, metadata={"help": "Input jitter noise for SemiFT router during training"})
-    moe_num_prefix_tokens: int = field(default=5, metadata={"help": "Number of prefix tokens excluded from sparse routing"})
-    moe_use_shared_expert: bool = field(default=True, metadata={"help": "Whether SemiFT adapter uses a shared dense expert branch"})
-    moe_conv_hidden_ratio: float = field(default=2.0, metadata={"help": "Expansion ratio used inside ConvExpert"})
-    moe_conv_kernel_size: int = field(default=3, metadata={"help": "Local depthwise kernel size used inside ConvExpert"})
-    moe_conv_context_kernel_size: int = field(default=5, metadata={"help": "Context depthwise kernel size used inside ConvExpert"})
-    moe_conv_use_grn: bool = field(default=True, metadata={"help": "Whether ConvExpert uses GRN normalization"})
-    moe_conv_norm_type: str = field(default="layernorm", metadata={"help": "Normalization type used after ConvExpert convolution mixing"})
-    modules_to_save: Optional[List[str]] = field(
-        default=None,
-        metadata={
-            "help": "List of modules apart from LoRA layers to be set as trainable and saved in the final checkpoint. "
-            "For example, in Sequence Classification or Token Classification tasks, "
-            "the final layer `classifier/score` are randomly initialized and as such need to be trainable and saved."
-        },
-    )
+    # LoRA-family defaults
+    r: int = field(default=8)
+    lora_alpha: int = field(default=32)
+    lora_dropout: float = field(default=0.1)
+
+    # SSF
+    ssf_init_scale: float = field(default=1.0)
+    ssf_init_shift_std: float = field(default=0.02)
+
+    # AdaptFormer
+    adapter_dim: int = field(default=64)
+    adapter_dropout: float = field(default=0.1)
+    adapter_scale: float = field(default=0.1)
+    adapter_layernorm_option: str = field(default="none")
+
+    # FacT
+    fact_rank: int = field(default=8)
+    fact_scale: float = field(default=1.0)
+    fact_dropout: float = field(default=0.1)
+
+    # Conv-LoRA / HydraLoRA
+    conv_lora_kernel_size: int = field(default=3)
+    conv_lora_dropout: float = field(default=0.1)
+    hydra_num_branches: int = field(default=4)
+    hydra_router_hidden: int = field(default=64)
+    hydra_router_dropout: float = field(default=0.1)
+
+    # SemiFT / MoE
+    nclass: int = field(default=5)
+    moe_num_experts: int = field(default=4)
+    moe_topk: int = field(default=2)
+    moe_router_aux_loss_coef: float = field(default=1e-2)
+    moe_router_z_loss_coef: float = field(default=1e-3)
+    moe_router_jitter_noise: float = field(default=1e-2)
+    moe_num_prefix_tokens: int = field(default=5)
+    moe_use_shared_expert: bool = field(default=True)
+    moe_conv_hidden_ratio: float = field(default=2.0)
+    moe_conv_kernel_size: int = field(default=3)
+    moe_conv_context_kernel_size: int = field(default=5)
+    moe_conv_use_grn: bool = field(default=True)
+    moe_conv_norm_type: str = field(default="layernorm")
 
     def __post_init__(self):
         self.peft_type = PeftType.LORA
 
 
-class AdaptModel(torch.nn.Module):
-    """
-    Creates Low Rank Adapter (Lora) model from a pretrained transformers model.
+METHOD_DEFAULT_TARGETS = {
+    "semift": ["mlp"],
+    "lora": ["qkv", "proj", "fc1", "fc2"],
+    "ssf": ["patch_embed", "norm1", "norm2", "qkv", "proj", "fc1", "fc2"],
+    "bitfit": ["qkv", "proj", "fc1", "fc2", "norm1", "norm2", "head"],
+    "adaptformer": ["mlp"],
+    "fact_tt": ["mlp"],
+    "fact_tk": ["mlp"],
+    "conv_lora": ["qkv", "proj", "fc1", "fc2"],
+    "hydralora": ["qkv", "proj", "fc1", "fc2"],
+}
 
-    Args:
-        model ([`transformers.PreTrainedModel`]): The model to be adapted.
-        config ([`LoraConfig`]): The configuration of the Lora model.
+HIGH_LEVEL_TO_SUBMODULES = {
+    "attn": ["qkv", "proj"],
+    "mlp": ["fc1", "fc2"],
+}
+BLOCK_LEVEL_METHODS = {"semift", "adaptformer", "fact_tt", "fact_tk"}
+PARAMETER_ONLY_METHODS = {"bitfit"}
+SSF_METHODS = {"ssf"}
 
-    Returns:
-        `torch.nn.Module`: The Lora model.
 
-    Example::
-
-        >>> from transformers import AutoModelForSeq2SeqLM, LoraConfig >>> from peft import LoraModel, LoraConfig >>>
-        config = LoraConfig(
-            peft_type="LORA", task_type="SEQ_2_SEQ_LM", r=8, lora_alpha=32, target_modules=["q", "v"],
-            lora_dropout=0.01, )
-        >>> model = AutoModelForSeq2SeqLM.from_pretrained("t5-base") >>> lora_model = LoraModel(config, model)
-
-    **Attributes**:
-        - **model** ([`transformers.PreTrainedModel`]) -- The model to be adapted.
-        - **peft_config** ([`LoraConfig`]): The configuration of the Lora model.
-    """
-
-    def __init__(self, config, model):  # LoraConfig, CasualLM
+class AdaptModel(nn.Module):
+    def __init__(self, config, model):
         super().__init__()
         self.peft_config = config
         self.model = model
+        self._fact_tt_shared: Dict[Tuple[int, int], FactTTShared] = {}
+        self._fact_tk_shared: Dict[Tuple[int, int], FactTKShared] = {}
+        self._method_counters: Dict[Tuple[str, int, int], int] = {}
         self._find_and_replace()
-        # mark_only_lora_as_trainable(self.model, self.peft_config.bias)
         self.forward = self.model.forward
 
     def _find_and_replace(self):
@@ -125,24 +103,180 @@ class AdaptModel(torch.nn.Module):
         loaded_in_8bit = getattr(self.model, "is_loaded_in_8bit", False)
         if loaded_in_4bit or loaded_in_8bit:
             raise ImportError(
-                "To use Lora with 8-bit or 4-bit quantization, please install the `bitsandbytes` package. "
-                "You can install it with `pip install bitsandbytes`."
+                "To use PEFT adapters with 8-bit or 4-bit quantization, please install `bitsandbytes`."
             )
-        is_target_modules_in_base_model = False
-        is_hf_device_map_available = hasattr(self.model, "hf_device_map")
-        # kwargs = {
-        #     "r": self.peft_config.r,
-        #     "lora_alpha": self.peft_config.lora_alpha,
-        #     "lora_dropout": self.peft_config.lora_dropout,
-        #     "lora_nums": self.peft_config.lora_nums,
-        #     "fan_in_fan_out": self.peft_config.fan_in_fan_out,
-        #     "merge_weights": (
-        #         self.peft_config.merge_weights or self.peft_config.inference_mode
-        #     )
-        #     and not is_hf_device_map_available,
-        # }
-        kwargs = {
-            "r": 32,
+
+        matched = False
+        expanded_targets = self._expand_target_modules(self.peft_config.target_modules)
+        key_list = [key for key, _ in self.model.named_modules() if key]
+        visited = set()
+
+        for key in key_list:
+            if key in visited:
+                continue
+            if not self._matches(key, expanded_targets):
+                continue
+            parent, target, target_name = self._get_submodules(key)
+            if self.peft_config.method in PARAMETER_ONLY_METHODS:
+                self._enable_bitfit(target_name, target)
+                matched = True
+                visited.add(key)
+                continue
+
+            if self.peft_config.method in BLOCK_LEVEL_METHODS and target_name in {"attn", "mlp"}:
+                new_module = self._build_block_level_adapter(target_name, target)
+                self._insert_module(parent, target_name, new_module)
+                matched = True
+                visited.add(key)
+                continue
+
+            if self.peft_config.method in SSF_METHODS:
+                new_module = self._build_ssf_wrapper(target_name, target)
+                self._insert_module(parent, target_name, new_module)
+                matched = True
+                visited.add(key)
+                continue
+
+            if target_name in HIGH_LEVEL_TO_SUBMODULES:
+                for child_name in HIGH_LEVEL_TO_SUBMODULES[target_name]:
+                    child_key = f"{key}.{child_name}"
+                    child_parent = target
+                    child_target = getattr(target, child_name, None)
+                    if child_target is None:
+                        continue
+                    new_module = self._build_leaf_adapter(child_name, child_target)
+                    self._insert_module(child_parent, child_name, new_module)
+                    visited.add(child_key)
+                    matched = True
+                visited.add(key)
+                continue
+
+            new_module = self._build_leaf_adapter(target_name, target)
+            self._insert_module(parent, target_name, new_module)
+            matched = True
+            visited.add(key)
+
+        if not matched:
+            raise ValueError(
+                f"Target modules {self.peft_config.target_modules} not found in the base model for method {self.peft_config.method}."
+            )
+
+    def _expand_target_modules(self, targets):
+        if isinstance(targets, str):
+            return targets
+        if targets is None:
+            targets = METHOD_DEFAULT_TARGETS.get(self.peft_config.method, ["mlp"])
+        expanded = []
+        for target in targets:
+            target = str(target)
+            if self.peft_config.method not in BLOCK_LEVEL_METHODS and target in HIGH_LEVEL_TO_SUBMODULES:
+                expanded.extend(HIGH_LEVEL_TO_SUBMODULES[target])
+                expanded.append(target)
+            else:
+                expanded.append(target)
+        # preserve order, remove duplicates
+        result = []
+        for item in expanded:
+            if item not in result:
+                result.append(item)
+        return result
+
+    def _matches(self, key, targets):
+        if isinstance(targets, str):
+            return re.fullmatch(targets, key) is not None
+        return any(key.endswith(target_key) for target_key in targets)
+
+    def _build_block_level_adapter(self, target_name, target):
+        input_dim, output_dim = self._infer_block_dims(target_name, target)
+        if self.peft_config.method == "semift":
+            adapter = SemiFt(input_dim, output_dim, **self._semift_kwargs())
+        elif self.peft_config.method == "adaptformer":
+            adapter = AdapterFormer(
+                input_dim,
+                output_dim,
+                r=self.peft_config.adapter_dim,
+                dropout=self.peft_config.adapter_dropout,
+                scale=self.peft_config.adapter_scale,
+                layernorm_option=self.peft_config.adapter_layernorm_option,
+            )
+        elif self.peft_config.method == "fact_tt":
+            shared = self._get_fact_tt_shared(input_dim, output_dim)
+            adapter = FactTTAdapter(
+                shared,
+                dropout=self.peft_config.fact_dropout,
+                scale=self.peft_config.fact_scale,
+            )
+        elif self.peft_config.method == "fact_tk":
+            shared = self._get_fact_tk_shared(input_dim, output_dim)
+            slice_index = self._next_method_counter((self.peft_config.method, input_dim, output_dim))
+            adapter = FactTKAdapter(
+                shared,
+                slice_index=slice_index,
+                dropout=self.peft_config.fact_dropout,
+                scale=self.peft_config.fact_scale,
+            )
+        else:
+            raise ValueError(f"Unsupported block-level method: {self.peft_config.method}")
+        return WarpBlock(target, adapter)
+
+    def _build_ssf_wrapper(self, target_name, target):
+        output_dim = self._infer_output_dim(target_name, target)
+        return SsfWrapper(
+            target,
+            output_dim=output_dim,
+            init_scale=self.peft_config.ssf_init_scale,
+            init_shift_std=self.peft_config.ssf_init_shift_std,
+        )
+
+    def _build_leaf_adapter(self, target_name, target):
+        input_dim, output_dim = self._infer_linear_dims(target_name, target)
+        method = self.peft_config.method
+        if method == "lora":
+            adapter = Lora(
+                input_dim,
+                output_dim,
+                r=self.peft_config.r,
+                lora_alpha=self.peft_config.lora_alpha,
+                p=self.peft_config.lora_dropout,
+            )
+            return WarpBlock(target, adapter)
+        if method == "conv_lora":
+            adapter = ConvLora(
+                input_dim,
+                output_dim,
+                r=self.peft_config.r,
+                lora_alpha=self.peft_config.lora_alpha,
+                dropout=self.peft_config.conv_lora_dropout,
+                kernel_size=self.peft_config.conv_lora_kernel_size,
+                num_prefix_tokens=self.peft_config.moe_num_prefix_tokens,
+            )
+            return WarpBlock(target, adapter)
+        if method == "hydralora":
+            adapter = HydraLora(
+                input_dim,
+                output_dim,
+                r=self.peft_config.r,
+                num_branches=self.peft_config.hydra_num_branches,
+                router_hidden=self.peft_config.hydra_router_hidden,
+                router_dropout=self.peft_config.hydra_router_dropout,
+                lora_alpha=self.peft_config.lora_alpha,
+                dropout=self.peft_config.lora_dropout,
+            )
+            return WarpBlock(target, adapter)
+        if method == "ssf":
+            return self._build_ssf_wrapper(target_name, target)
+        raise ValueError(f"Unsupported leaf adapter method: {method}")
+
+    def _enable_bitfit(self, target_name, target):
+        for param in target.parameters():
+            param.requires_grad = False
+        for name, param in target.named_parameters(recurse=True):
+            if name.endswith("bias") or ".bias" in name:
+                param.requires_grad = True
+
+    def _semift_kwargs(self):
+        return {
+            "r": self.peft_config.r,
             "num_experts": self.peft_config.moe_num_experts,
             "topk": self.peft_config.moe_topk,
             "router_aux_loss_coef": self.peft_config.moe_router_aux_loss_coef,
@@ -157,46 +291,70 @@ class AdaptModel(torch.nn.Module):
             "conv_norm_type": self.peft_config.moe_conv_norm_type,
         }
 
-        key_list = [key for key, _ in self.model.named_modules()]
-        for key in key_list:
-            if isinstance(self.peft_config.target_modules, str):
-                target_module_found = re.fullmatch(self.peft_config.target_modules, key)
-            else:
-                target_module_found = any(
-                    key.endswith(target_key)
-                    for target_key in self.peft_config.target_modules
-                )
-            if target_module_found:  # here
-                if not is_target_modules_in_base_model:
-                    is_target_modules_in_base_model = True
-                parent, target, target_name = self._get_submodules(key)
+    def _infer_block_dims(self, target_name, target):
+        if target_name == "attn":
+            return target.qkv.in_features, target.proj.out_features
+        if target_name == "mlp":
+            return target.fc1.in_features, target.fc2.out_features
+        return self._infer_linear_dims(target_name, target)
 
-                if self.peft_config.method == "semift":
-                    if target_name == "attn":
-                        new_module = SemiFt(
-                            target.qkv.in_features, target.qkv.out_features, **kwargs
-                        )
-                    elif target_name == "mlp":
-                        new_module = SemiFt(
-                            target.fc1.in_features, target.fc2.out_features, **kwargs
-                        )
-                elif self.peft_config.method == "lora":
-                    new_module = Lora(
-                        target.in_features, target.out_features, r=32, lora_alpha=64
-                    )
+    def _infer_linear_dims(self, target_name, target):
+        if isinstance(target, nn.Linear):
+            return target.in_features, target.out_features
+        if target_name == "patch_embed" and hasattr(target, "proj"):
+            proj = target.proj
+            in_features = proj.in_channels * proj.kernel_size[0] * proj.kernel_size[1]
+            return in_features, proj.out_channels
+        if hasattr(target, "weight") and target.weight.ndim == 2:
+            return target.weight.shape[1], target.weight.shape[0]
+        raise ValueError(f"Cannot infer input/output dimensions for target '{target_name}' ({type(target)}).")
 
-                new_module = WarpBlock(target, new_module)
-                self._insert_module(parent, target_name, new_module, target)
+    def _infer_output_dim(self, target_name, target):
+        if target_name == "attn":
+            return target.proj.out_features
+        if target_name == "mlp":
+            return target.fc2.out_features
+        if hasattr(target, "normalized_shape"):
+            shape = target.normalized_shape
+            return int(shape[0] if isinstance(shape, (list, tuple)) else shape)
+        if isinstance(target, nn.Linear):
+            return target.out_features
+        if target_name == "patch_embed" and hasattr(target, "proj"):
+            return target.proj.out_channels
+        if hasattr(target, "weight"):
+            if target.weight.ndim >= 1:
+                return int(target.weight.shape[0])
+        raise ValueError(f"Cannot infer output dimension for target '{target_name}' ({type(target)}).")
 
-        if not is_target_modules_in_base_model:
-            raise ValueError(
-                f"Target modules {self.peft_config.target_modules} not found in the base model. "
-                f"Please check the target modules and try again."
+    def _get_fact_tt_shared(self, input_dim, output_dim):
+        key = (input_dim, output_dim)
+        if key not in self._fact_tt_shared:
+            self._fact_tt_shared[key] = FactTTShared(
+                input_dim,
+                output_dim,
+                rank=self.peft_config.fact_rank,
             )
+            self.add_module(f"fact_tt_shared_{input_dim}_{output_dim}", self._fact_tt_shared[key])
+        return self._fact_tt_shared[key]
 
-    def _insert_module(self, parent_module, child_name, new_module, old_module):
-        old_module = new_module
-        setattr(parent_module, child_name, old_module)
+    def _get_fact_tk_shared(self, input_dim, output_dim):
+        key = (input_dim, output_dim)
+        if key not in self._fact_tk_shared:
+            self._fact_tk_shared[key] = FactTKShared(
+                input_dim,
+                output_dim,
+                rank=self.peft_config.fact_rank,
+            )
+            self.add_module(f"fact_tk_shared_{input_dim}_{output_dim}", self._fact_tk_shared[key])
+        return self._fact_tk_shared[key]
+
+    def _next_method_counter(self, key):
+        idx = self._method_counters.get(key, 0)
+        self._method_counters[key] = idx + 1
+        return idx
+
+    def _insert_module(self, parent_module, child_name, new_module):
+        setattr(parent_module, child_name, new_module)
 
     def _get_submodules(self, key):
         parent = self.model.get_submodule(".".join(key.split(".")[:-1]))
@@ -204,24 +362,9 @@ class AdaptModel(torch.nn.Module):
         target = self.model.get_submodule(key)
         return parent, target, target_name
 
-    def _replace_module(self, parent_module, child_name, new_module, old_module):
-        setattr(parent_module, child_name, new_module)
-        new_module.weight = old_module.weight
-        if old_module.bias is not None:
-            new_module.bias = old_module.bias
-        if getattr(old_module, "state", None) is not None:
-            new_module.state = old_module.state
-            new_module.to(old_module.weight.device)
-
-        # dispatch to correct device
-        for name, module in new_module.named_modules():
-            if "lora_" in name:
-                module.to(old_module.weight.device)
-
     def __getattr__(self, name: str):
-        """Forward missing attributes to the wrapped module."""
         try:
-            return super().__getattr__(name)  # defer to nn.Module's logic
+            return super().__getattr__(name)
         except AttributeError:
             return getattr(self.model, name)
 
@@ -238,178 +381,15 @@ class AdaptModel(torch.nn.Module):
             config["inference_mode"] = True
         return config
 
-    def _set_adapter_layers(self, enabled=True):
-        for module in self.model.modules():
-            if isinstance(module, LoraLayer):
-                module.disable_adapters = False if enabled else True
-
-    def enable_adapter_layers(self):
-        self._set_adapter_layers(enabled=True)
-
-    def disable_adapter_layers(self):
-        self._set_adapter_layers(enabled=False)
-
-
-# Below code is based on https://github.com/microsoft/LoRA/blob/main/loralib/layers.py
-# and modified to work with PyTorch FSDP
-
-
-#  ------------------------------------------------------------------------------------------
-#  Copyright (c) Microsoft Corporation. All rights reserved.
-#  Licensed under the MIT License (MIT). See LICENSE in the repo root for license information.
-#  ------------------------------------------------------------------------------------------
-
-
-# had to adapt it for `lora_only` to work
-def mark_only_lora_as_trainable(model: nn.Module, bias: str = "none") -> None:
-    for n, p in model.named_parameters():
-        if "lora_" not in n:
-            p.requires_grad = False
-    if bias == "none":
-        return
-    elif bias == "all":
-        for n, p in model.named_parameters():
-            if "bias" in n:
-                p.requires_grad = True
-    elif bias == "lora_only":
-        for m in model.modules():
-            if isinstance(m, LoraLayer) and hasattr(m, "bias") and m.bias is not None:
-                m.bias.requires_grad = True
-    else:
-        raise NotImplementedError
-
 
 class LoraLayer:
-    def __init__(
-        self,
-        r: int,
-        lora_alpha: int,
-        lora_dropout: float,
-        merge_weights: bool,
-    ):
+    def __init__(self, r: int, lora_alpha: int, lora_dropout: float, merge_weights: bool):
         self.r = r
         self.lora_alpha = lora_alpha
-        # Optional dropout
-        if lora_dropout > 0.0:
-            self.lora_dropout = nn.Dropout(p=lora_dropout)
-        else:
-            self.lora_dropout = lambda x: x
-        # Mark the weight as unmerged
+        self.lora_dropout = nn.Dropout(p=lora_dropout) if lora_dropout > 0.0 else lambda x: x
         self.merged = False
         self.merge_weights = merge_weights
         self.disable_adapters = False
-
-
-class Linear(nn.Linear, LoraLayer):
-    # Lora implemented in a dense layer
-    def __init__(
-        self,
-        in_features: int,
-        out_features: int,
-        r: int = 0,
-        lora_alpha: int = 1,
-        lora_nums: int = 2,
-        lora_dropout: float = 0.0,
-        fan_in_fan_out: bool = False,  # Set this to True if the layer to replace stores weight like (fan_in, fan_out)
-        merge_weights: bool = True,
-        **kwargs,
-    ):
-        nn.Linear.__init__(self, in_features, out_features, **kwargs)
-        LoraLayer.__init__(
-            self,
-            r=r,
-            lora_alpha=lora_alpha,
-            lora_dropout=lora_dropout,
-            merge_weights=merge_weights,
-        )
-
-        self.lora_num = lora_nums
-
-        self.fan_in_fan_out = fan_in_fan_out
-
-        # Actual trainable parameters
-        if r > 0:
-            self.lora_route = nn.Linear(in_features, self.lora_num, bias=False)
-            setattr(self, f"lora_A", nn.Linear(in_features, r, bias=False))
-            for i in range(self.lora_num):
-                setattr(self, f"lora_B{i}", nn.Linear(r, out_features, bias=False))
-
-            self.scaling = self.lora_alpha / self.r
-            # Freezing the pre-trained weight matrix
-            self.weight.requires_grad = False
-        self.reset_parameters()
-        if fan_in_fan_out:
-            self.weight.data = self.weight.data.T
-
-    def reset_parameters(self):
-        nn.Linear.reset_parameters(self)
-
-        if hasattr(self, "lora_A"):
-            nn.init.kaiming_uniform_(getattr(self, f"lora_A").weight, a=math.sqrt(5))
-            for i in range(self.lora_num):
-                nn.init.zeros_(getattr(self, f"lora_B{i}").weight)
-
-            nn.init.kaiming_uniform_(self.lora_route.weight, a=math.sqrt(5))
-
-    def train(self, mode: bool = True):
-        nn.Linear.train(self, mode)
-        self.lora_route.train(mode)
-        getattr(self, f"lora_A").train(mode)
-        for i in range(self.lora_num):
-            getattr(self, f"lora_B{i}").train(mode)
-
-    def eval(self):
-        nn.Linear.eval(self)
-        self.lora_route.eval()
-        getattr(self, f"lora_A").eval()
-        for i in range(self.lora_num):
-            getattr(self, f"lora_B{i}").eval()
-
-    def cv_squared(self, x):
-        """The squared coefficient of variation of a sample.
-        Useful as a loss to encourage a positive distribution to be more uniform.
-        Epsilons added for numerical stability.
-        Returns 0 for an empty Tensor.
-        Args:
-        x: a `Tensor`.
-        Returns:
-        a `Scalar`.
-        """
-        eps = 1e-10
-        if x.shape[0] == 1:
-            return torch.tensor([0], device=x.device, dtype=x.dtype)[0]
-        return x.float().var() / (x.float().mean() ** 2 + eps)
-
-    def forward(self, x: torch.Tensor, task_types=None):
-
-        if self.disable_adapters:
-            result = F.linear(
-                x, transpose(self.weight, self.fan_in_fan_out), bias=self.bias
-            )
-            raise ImportError(":(")
-        elif self.r > 0 and not self.merged:
-            result = F.linear(
-                x, transpose(self.weight, self.fan_in_fan_out), bias=self.bias
-            )
-
-            if self.r > 0:
-                route_weight = nn.functional.softmax(
-                    self.lora_route(x), dim=-1, dtype=torch.float32
-                ).to(result.dtype)
-
-                for i in range(self.lora_num):
-                    result = (
-                        result
-                        + torch.unsqueeze(route_weight[:, :, i], -1)
-                        * getattr(self, f"lora_B{i}")(
-                            getattr(self, f"lora_A")(self.lora_dropout(x))
-                        )
-                        * self.scaling
-                    )
-
-        blcls = torch.zeros(1)[0].to(result)
-
-        return result, blcls
 
 
 class Lora(nn.Module):
@@ -419,9 +399,8 @@ class Lora(nn.Module):
         self.lora_alpha = lora_alpha
         self.lora_A = nn.Linear(in_features, r, bias=False)
         self.lora_B = nn.Linear(r, out_features, bias=False)
-
         self.lora_dropout = nn.Dropout(p)
-        self.scaling = self.lora_alpha / self.r
+        self.scaling = self.lora_alpha / max(self.r, 1)
         self.reset_parameters()
 
     def reset_parameters(self):
@@ -429,8 +408,7 @@ class Lora(nn.Module):
         nn.init.zeros_(self.lora_B.weight)
 
     def forward(self, x):
-        out = self.lora_B(self.lora_A(self.lora_dropout(x))) * self.scaling
-        return out
+        return self.lora_B(self.lora_A(self.lora_dropout(x))) * self.scaling
 
 
 class WarpBlock(nn.Module):
@@ -441,25 +419,11 @@ class WarpBlock(nn.Module):
         for param in self.base_layer.parameters():
             param.requires_grad = False
 
-    def forward(self, x):
-        return self.base_layer(x) + self.adapter(x)
+    def forward(self, x, *args, **kwargs):
+        return self.base_layer(x, *args, **kwargs) + self.adapter(x)
 
 
 class AdapterFormer(nn.Module):
-    """
-    AdapterFormer: Optimized adapter module based on AdaptFormer paper (NeurIPS 2022)
-
-    Key optimizations:
-    1. Dropout placed after activation (not on input) - better regularization
-    2. ReLU activation (consistent with original paper)
-    3. Fixed scale factor (0.1) instead of learnable parameter - more stable training
-    4. Added bias parameters - better expressiveness
-    5. Improved initialization strategy - matches paper's best practices
-
-    Paper: AdaptFormer: Adapting Vision Transformers for Scalable Visual Recognition
-    ArXiv: https://arxiv.org/abs/2205.13535
-    """
-
     def __init__(
         self,
         in_features: int,
@@ -467,67 +431,179 @@ class AdapterFormer(nn.Module):
         r: int,
         dropout: float = 0.1,
         scale: float = 0.1,
+        layernorm_option: str = "none",
     ):
         super().__init__()
-        self.in_features = in_features
-        self.out_features = out_features
-        self.r = r
-        self.scale = scale  # Fixed scale value (not learnable)
-
-        # Down projection: in_features -> r (with bias)
+        self.layernorm_option = layernorm_option
+        self.adapter_layer_norm_before = None
+        if layernorm_option in {"in", "out"}:
+            self.adapter_layer_norm_before = nn.LayerNorm(in_features)
         self.down_proj = nn.Linear(in_features, r, bias=True)
-
-        # Activation function: ReLU (consistent with AdaptFormer paper)
         self.act = nn.ReLU()
-
-        # Up projection: r -> out_features (with bias)
         self.up_proj = nn.Linear(r, out_features, bias=True)
-
-        # Dropout layer (will be applied after activation in forward)
         self.dropout = nn.Dropout(dropout)
-
-        # Initialize parameters
+        self.scale = scale
         self.reset_parameters()
 
     def reset_parameters(self):
-        """
-        Improved initialization strategy based on AdaptFormer paper:
-        - Kaiming uniform for down_proj (with gain sqrt(5))
-        - Zero initialization for down_proj bias
-        - Zero initialization for up_proj weights and bias
-        - This ensures the adapter starts close to identity
-        """
-        # Down projection: Kaiming uniform (He initialization)
         nn.init.kaiming_uniform_(self.down_proj.weight, a=math.sqrt(5))
         nn.init.zeros_(self.down_proj.bias)
-
-        # Up projection: Zero initialization
         nn.init.zeros_(self.up_proj.weight)
         nn.init.zeros_(self.up_proj.bias)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        Forward pass with optimized dropout placement.
-
-        Args:
-            x: Input tensor of shape (B, N, in_features) or (N, in_features)
-
-        Returns:
-            output: Adapted tensor of shape (B, N, out_features) or (N, out_features)
-        """
-        # Down projection
+    def forward(self, x):
+        if self.layernorm_option == "in" and self.adapter_layer_norm_before is not None:
+            x = self.adapter_layer_norm_before(x)
         x = self.down_proj(x)
-
-        # Activation
         x = self.act(x)
-
-        # Dropout applied AFTER activation (optimized placement)
         x = self.dropout(x)
-
-        # Up projection
         x = self.up_proj(x)
+        if self.layernorm_option == "out" and self.adapter_layer_norm_before is not None:
+            x = self.adapter_layer_norm_before(x)
+        return x * self.scale
 
-        # Scale with fixed factor
-        x = x * self.scale
 
-        return x
+class SsfWrapper(nn.Module):
+    def __init__(self, base_layer, output_dim: int, init_scale: float = 1.0, init_shift_std: float = 0.02):
+        super().__init__()
+        self.base_layer = base_layer
+        for param in self.base_layer.parameters():
+            param.requires_grad = False
+        self.scale = nn.Parameter(torch.ones(output_dim) * init_scale)
+        self.shift = nn.Parameter(torch.zeros(output_dim))
+        if init_shift_std > 0:
+            nn.init.normal_(self.shift, std=init_shift_std)
+            nn.init.normal_(self.scale, mean=init_scale, std=min(init_shift_std, 0.02))
+
+    def forward(self, x, *args, **kwargs):
+        out = self.base_layer(x, *args, **kwargs)
+        if out.dim() >= 3 and out.shape[-1] == self.scale.shape[0]:
+            return out * self.scale + self.shift
+        if out.dim() == 4 and out.shape[1] == self.scale.shape[0]:
+            return out * self.scale.view(1, -1, 1, 1) + self.shift.view(1, -1, 1, 1)
+        raise ValueError("SSF wrapper got unsupported output shape.")
+
+
+class FactTTShared(nn.Module):
+    def __init__(self, input_dim: int, output_dim: int, rank: int):
+        super().__init__()
+        self.fac_tu = nn.Linear(input_dim, rank, bias=False)
+        self.fac_tv = nn.Linear(rank, output_dim, bias=False)
+        nn.init.kaiming_uniform_(self.fac_tu.weight, a=math.sqrt(5))
+        nn.init.zeros_(self.fac_tv.weight)
+
+
+class FactTTAdapter(nn.Module):
+    def __init__(self, shared: FactTTShared, dropout: float = 0.1, scale: float = 1.0):
+        super().__init__()
+        self.shared = shared
+        rank = shared.fac_tu.out_features
+        self.middle = nn.Linear(rank, rank, bias=False)
+        self.dropout = nn.Dropout(dropout)
+        self.scale = scale
+        nn.init.eye_(self.middle.weight)
+
+    def forward(self, x):
+        return self.shared.fac_tv(self.middle(self.dropout(self.shared.fac_tu(x)))) * self.scale
+
+
+class FactTKShared(nn.Module):
+    def __init__(self, input_dim: int, output_dim: int, rank: int):
+        super().__init__()
+        self.rank = rank
+        self.fac_tu = nn.Linear(input_dim, rank, bias=False)
+        self.fac_tv = nn.Linear(rank, output_dim, bias=False)
+        self.tensor_core = nn.Parameter(torch.empty(rank, rank, rank))
+        self.selector_bank = nn.Parameter(torch.empty(rank, max(rank * 4, 16)))
+        nn.init.kaiming_uniform_(self.fac_tu.weight, a=math.sqrt(5))
+        nn.init.zeros_(self.fac_tv.weight)
+        nn.init.xavier_uniform_(self.tensor_core)
+        nn.init.xavier_uniform_(self.selector_bank)
+
+    def get_matrix(self, slice_index: int):
+        selector = self.selector_bank[:, slice_index % self.selector_bank.shape[1]]
+        return torch.einsum("abc,c->ab", self.tensor_core, selector)
+
+
+class FactTKAdapter(nn.Module):
+    def __init__(self, shared: FactTKShared, slice_index: int, dropout: float = 0.1, scale: float = 1.0):
+        super().__init__()
+        self.shared = shared
+        self.slice_index = slice_index
+        self.dropout = nn.Dropout(dropout)
+        self.scale = scale
+
+    def forward(self, x):
+        hidden = self.shared.fac_tu(x)
+        matrix = self.shared.get_matrix(self.slice_index)
+        hidden = hidden @ matrix
+        hidden = self.dropout(hidden)
+        return self.shared.fac_tv(hidden) * self.scale
+
+
+class ConvLora(nn.Module):
+    def __init__(self, in_features, out_features, r=8, lora_alpha=32, dropout=0.1, kernel_size=3, num_prefix_tokens=5):
+        super().__init__()
+        self.lora = Lora(in_features, out_features, r=r, lora_alpha=lora_alpha, p=dropout)
+        self.num_prefix_tokens = num_prefix_tokens
+        self.spatial_proj = nn.Linear(in_features, out_features, bias=False)
+        self.depthwise = nn.Conv2d(
+            in_features,
+            in_features,
+            kernel_size=kernel_size,
+            padding=kernel_size // 2,
+            groups=in_features,
+            bias=False,
+        )
+        self.dropout = nn.Dropout(dropout)
+        nn.init.zeros_(self.spatial_proj.weight)
+
+    def forward(self, x):
+        delta = self.lora(x)
+        if x.dim() != 3:
+            return delta
+        bsz, tokens, channels = x.shape
+        spatial_tokens = tokens - self.num_prefix_tokens
+        side = int(math.sqrt(max(spatial_tokens, 0)))
+        if spatial_tokens <= 0 or side * side != spatial_tokens:
+            return delta
+        prefix = delta[:, : self.num_prefix_tokens]
+        spatial_x = x[:, self.num_prefix_tokens :].transpose(1, 2).reshape(bsz, channels, side, side)
+        conv_out = self.depthwise(spatial_x).flatten(2).transpose(1, 2)
+        conv_out = self.spatial_proj(self.dropout(conv_out))
+        return torch.cat([prefix, delta[:, self.num_prefix_tokens :] + conv_out], dim=1)
+
+
+class HydraLora(nn.Module):
+    def __init__(
+        self,
+        in_features,
+        out_features,
+        r=8,
+        num_branches=4,
+        router_hidden=64,
+        router_dropout=0.1,
+        lora_alpha=32,
+        dropout=0.1,
+    ):
+        super().__init__()
+        self.shared_A = nn.Linear(in_features, r, bias=False)
+        self.branches = nn.ModuleList([nn.Linear(r, out_features, bias=False) for _ in range(num_branches)])
+        self.router = nn.Sequential(
+            nn.Linear(in_features, router_hidden),
+            nn.GELU(),
+            nn.Dropout(router_dropout),
+            nn.Linear(router_hidden, num_branches),
+        )
+        self.dropout = nn.Dropout(dropout)
+        self.scaling = lora_alpha / max(r, 1)
+        nn.init.kaiming_uniform_(self.shared_A.weight, a=math.sqrt(5))
+        for branch in self.branches:
+            nn.init.zeros_(branch.weight)
+
+    def forward(self, x):
+        hidden = self.shared_A(self.dropout(x))
+        logits = self.router(x)
+        weights = torch.softmax(logits, dim=-1)
+        outputs = torch.stack([branch(hidden) for branch in self.branches], dim=-1)
+        return (outputs * weights.unsqueeze(-2)).sum(dim=-1) * self.scaling
