@@ -29,3 +29,10 @@ train.py
 
 # agents
 AGENTS.md
+# local experiments
+notebook/
+test/test_moe_adapter.py
+
+# local experiments
+notebook/
+test/test_moe_adapter.py

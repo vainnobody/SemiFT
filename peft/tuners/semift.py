@@ -26,7 +26,7 @@ import torch.nn.functional as F
 from transformers.pytorch_utils import Conv1D
 
 from ..utils import PeftConfig, PeftType, transpose
-from moe import SemiFt
+from .moe import SemiFt
 
 
 @dataclass
@@ -63,6 +63,18 @@ class SemiFTConfig(PeftConfig):
         metadata={"help": "Bias type for Lora. Can be 'none', 'all' or 'lora_only'"},
     )
     nclass: int = field(default=5, metadata={"help": "Numbers of classes"})
+    moe_num_experts: int = field(default=4, metadata={"help": "Number of routed experts in SemiFT MoE adapter"})
+    moe_topk: int = field(default=2, metadata={"help": "Top-k experts selected per token in SemiFT MoE adapter"})
+    moe_router_aux_loss_coef: float = field(default=1e-2, metadata={"help": "Load balancing auxiliary loss coefficient for SemiFT router"})
+    moe_router_z_loss_coef: float = field(default=1e-3, metadata={"help": "Router z-loss coefficient for SemiFT router"})
+    moe_router_jitter_noise: float = field(default=1e-2, metadata={"help": "Input jitter noise for SemiFT router during training"})
+    moe_num_prefix_tokens: int = field(default=5, metadata={"help": "Number of prefix tokens excluded from sparse routing"})
+    moe_use_shared_expert: bool = field(default=True, metadata={"help": "Whether SemiFT adapter uses a shared dense expert branch"})
+    moe_conv_hidden_ratio: float = field(default=2.0, metadata={"help": "Expansion ratio used inside ConvExpert"})
+    moe_conv_kernel_size: int = field(default=3, metadata={"help": "Local depthwise kernel size used inside ConvExpert"})
+    moe_conv_context_kernel_size: int = field(default=5, metadata={"help": "Context depthwise kernel size used inside ConvExpert"})
+    moe_conv_use_grn: bool = field(default=True, metadata={"help": "Whether ConvExpert uses GRN normalization"})
+    moe_conv_norm_type: str = field(default="layernorm", metadata={"help": "Normalization type used after ConvExpert convolution mixing"})
     modules_to_save: Optional[List[str]] = field(
         default=None,
         metadata={
@@ -131,6 +143,18 @@ class AdaptModel(torch.nn.Module):
         # }
         kwargs = {
             "r": 32,
+            "num_experts": self.peft_config.moe_num_experts,
+            "topk": self.peft_config.moe_topk,
+            "router_aux_loss_coef": self.peft_config.moe_router_aux_loss_coef,
+            "router_z_loss_coef": self.peft_config.moe_router_z_loss_coef,
+            "router_jitter_noise": self.peft_config.moe_router_jitter_noise,
+            "num_prefix_tokens": self.peft_config.moe_num_prefix_tokens,
+            "use_shared_expert": self.peft_config.moe_use_shared_expert,
+            "conv_hidden_ratio": self.peft_config.moe_conv_hidden_ratio,
+            "conv_kernel_size": self.peft_config.moe_conv_kernel_size,
+            "conv_context_kernel_size": self.peft_config.moe_conv_context_kernel_size,
+            "conv_use_grn": self.peft_config.moe_conv_use_grn,
+            "conv_norm_type": self.peft_config.moe_conv_norm_type,
         }
 
         key_list = [key for key, _ in self.model.named_modules()]
@@ -419,3 +443,91 @@ class WarpBlock(nn.Module):
 
     def forward(self, x):
         return self.base_layer(x) + self.adapter(x)
+
+
+class AdapterFormer(nn.Module):
+    """
+    AdapterFormer: Optimized adapter module based on AdaptFormer paper (NeurIPS 2022)
+
+    Key optimizations:
+    1. Dropout placed after activation (not on input) - better regularization
+    2. ReLU activation (consistent with original paper)
+    3. Fixed scale factor (0.1) instead of learnable parameter - more stable training
+    4. Added bias parameters - better expressiveness
+    5. Improved initialization strategy - matches paper's best practices
+
+    Paper: AdaptFormer: Adapting Vision Transformers for Scalable Visual Recognition
+    ArXiv: https://arxiv.org/abs/2205.13535
+    """
+
+    def __init__(
+        self,
+        in_features: int,
+        out_features: int,
+        r: int,
+        dropout: float = 0.1,
+        scale: float = 0.1,
+    ):
+        super().__init__()
+        self.in_features = in_features
+        self.out_features = out_features
+        self.r = r
+        self.scale = scale  # Fixed scale value (not learnable)
+
+        # Down projection: in_features -> r (with bias)
+        self.down_proj = nn.Linear(in_features, r, bias=True)
+
+        # Activation function: ReLU (consistent with AdaptFormer paper)
+        self.act = nn.ReLU()
+
+        # Up projection: r -> out_features (with bias)
+        self.up_proj = nn.Linear(r, out_features, bias=True)
+
+        # Dropout layer (will be applied after activation in forward)
+        self.dropout = nn.Dropout(dropout)
+
+        # Initialize parameters
+        self.reset_parameters()
+
+    def reset_parameters(self):
+        """
+        Improved initialization strategy based on AdaptFormer paper:
+        - Kaiming uniform for down_proj (with gain sqrt(5))
+        - Zero initialization for down_proj bias
+        - Zero initialization for up_proj weights and bias
+        - This ensures the adapter starts close to identity
+        """
+        # Down projection: Kaiming uniform (He initialization)
+        nn.init.kaiming_uniform_(self.down_proj.weight, a=math.sqrt(5))
+        nn.init.zeros_(self.down_proj.bias)
+
+        # Up projection: Zero initialization
+        nn.init.zeros_(self.up_proj.weight)
+        nn.init.zeros_(self.up_proj.bias)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Forward pass with optimized dropout placement.
+
+        Args:
+            x: Input tensor of shape (B, N, in_features) or (N, in_features)
+
+        Returns:
+            output: Adapted tensor of shape (B, N, out_features) or (N, out_features)
+        """
+        # Down projection
+        x = self.down_proj(x)
+
+        # Activation
+        x = self.act(x)
+
+        # Dropout applied AFTER activation (optimized placement)
+        x = self.dropout(x)
+
+        # Up projection
+        x = self.up_proj(x)
+
+        # Scale with fixed factor
+        x = x * self.scale
+
+        return x

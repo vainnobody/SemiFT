@@ -1,7 +1,8 @@
+import math
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import math
 
 
 class AddAuxiliaryLoss(torch.autograd.Function):
@@ -35,103 +36,270 @@ class LayerScale(nn.Module):
         return x.mul_(self.gamma) if self.inplace else x * self.gamma
 
 
+class GatedMLPExpert(nn.Module):
+    def __init__(self, dim, hidden_dim=None, dropout=0.0):
+        super().__init__()
+        hidden_dim = hidden_dim or dim * 2
+        self.up_proj = nn.Linear(dim, hidden_dim, bias=False)
+        self.gate_proj = nn.Linear(dim, hidden_dim, bias=False)
+        self.down_proj = nn.Linear(hidden_dim, dim, bias=False)
+        self.dropout = nn.Dropout(dropout) if dropout > 0 else nn.Identity()
+        self.reset_parameters()
+
+    def reset_parameters(self):
+        nn.init.kaiming_uniform_(self.up_proj.weight, a=math.sqrt(5))
+        nn.init.kaiming_uniform_(self.gate_proj.weight, a=math.sqrt(5))
+        nn.init.zeros_(self.down_proj.weight)
+
+    def forward(self, x):
+        x = F.silu(self.gate_proj(x)) * self.up_proj(x)
+        x = self.dropout(x)
+        return self.down_proj(x)
+
+
+class GRN(nn.Module):
+    def __init__(self, dim, eps=1e-6):
+        super().__init__()
+        self.gamma = nn.Parameter(torch.zeros(1, 1, 1, dim))
+        self.beta = nn.Parameter(torch.zeros(1, 1, 1, dim))
+        self.eps = eps
+
+    def forward(self, x):
+        gx = torch.norm(x, p=2, dim=(1, 2), keepdim=True)
+        nx = gx / (gx.mean(dim=-1, keepdim=True) + self.eps)
+        return self.gamma * (x * nx) + self.beta + x
+
+
 class GatingNetwork(nn.Module):
     def __init__(
         self,
         r,
         num_experts,
-        topk=1,
+        topk=2,
         loss_coef=1e-2,
-        temperature=1.0,
-        scoring_func="softmax",
-        norm_topk_prob=True,
+        z_loss_coef=1e-3,
+        jitter_noise=0.01,
     ):
         super().__init__()
         self.r = r
         self.num_experts = num_experts
-        self.topk = topk
+        self.topk = max(1, min(topk, num_experts))
         self.loss_coef = loss_coef
-        self.temperature = temperature
-        self.scoring_func = scoring_func
-        self.norm_topk_prob = norm_topk_prob
+        self.z_loss_coef = z_loss_coef
+        self.jitter_noise = jitter_noise
 
+        self.norm = nn.LayerNorm(r)
         self.gate_proj = nn.Linear(r, num_experts, bias=False)
 
         nn.init.kaiming_uniform_(self.gate_proj.weight, a=math.sqrt(5))
 
+    def _load_balancing_loss(self, router_probs, topk_idx):
+        expert_mask = F.one_hot(topk_idx.reshape(-1), num_classes=self.num_experts).float()
+        tokens_per_expert = expert_mask.mean(dim=0)
+        router_prob_per_expert = router_probs.mean(dim=0)
+        return self.num_experts * torch.sum(tokens_per_expert * router_prob_per_expert)
+
+    def _z_loss(self, router_logits):
+        log_z = torch.logsumexp(router_logits.float(), dim=-1)
+        return torch.mean(log_z.square())
+
     def forward(self, x):
-        B, N, r = x.shape
+        bsz, n_tokens, dim = x.shape
+        flat_x = x.reshape(-1, dim)
+        flat_x = self.norm(flat_x)
 
-        # Flatten tokens: (B, N, r) -> (B*N, r)
-        # Use reshape to handle non-contiguous tensors
-        flat_x = x.reshape(-1, r)
+        if self.training and self.jitter_noise > 0:
+            noise = torch.empty_like(flat_x).uniform_(1.0 - self.jitter_noise, 1.0 + self.jitter_noise)
+            flat_x = flat_x * noise
 
-        # Compute gating scores for each token
-        gate_logits = self.gate_proj(flat_x)
+        router_logits = self.gate_proj(flat_x)
+        router_probs = torch.softmax(router_logits.float(), dim=-1).to(flat_x.dtype)
 
-        # Apply softmax to get probabilities
-        if self.scoring_func == "softmax":
-            scores = torch.softmax(gate_logits / self.temperature, dim=-1)
-        else:
-            scores = gate_logits
+        topk_weight, topk_idx = torch.topk(router_probs, k=self.topk, dim=-1, sorted=False)
+        topk_weight = topk_weight / topk_weight.sum(dim=-1, keepdim=True).clamp_min(torch.finfo(topk_weight.dtype).eps)
 
-        # Select top-k experts per token
-        topk_weight, topk_idx = torch.topk(scores, k=self.topk, dim=-1, sorted=False)
+        aux_loss = router_logits.new_zeros(())
+        z_loss = router_logits.new_zeros(())
+        if self.training and self.num_experts > 1:
+            if self.loss_coef > 0:
+                aux_loss = self._load_balancing_loss(router_probs, topk_idx) * self.loss_coef
+            if self.z_loss_coef > 0:
+                z_loss = self._z_loss(router_logits) * self.z_loss_coef
 
-        # Renormalize top-k weights if topk > 1
-        if self.topk > 1 and self.norm_topk_prob:
-            topk_weight = topk_weight / topk_weight.sum(dim=-1, keepdim=True)
+        stats = {
+            'aux_loss': aux_loss.to(x.dtype),
+            'z_loss': z_loss.to(x.dtype),
+            'router_logits': router_logits.view(bsz, n_tokens, self.num_experts),
+            'router_probs': router_probs.view(bsz, n_tokens, self.num_experts),
+        }
+        return (
+            topk_idx.view(bsz, n_tokens, self.topk),
+            topk_weight.view(bsz, n_tokens, self.topk),
+            stats,
+        )
 
-        # Reshape back to (B, N, topk)
-        topk_weight = topk_weight.view(B, N, self.topk)
-        topk_idx = topk_idx.view(B, N, self.topk)
 
-        # Compute auxiliary loss for load balancing (DeepSeek-MoE style)
-        aux_loss = torch.tensor(0.0, device=x.device, dtype=x.dtype)
-        if self.training and self.loss_coef > 0.0:
-            # Pi: Mean gating probability for each expert (importance)
-            Pi = scores.mean(dim=0)
+class ConvExpert(nn.Module):
+    def __init__(
+        self,
+        r,
+        hidden_ratio=2.0,
+        kernel_size=3,
+        context_kernel_size=5,
+        dropout=0.0,
+        use_grn=True,
+        norm_type="layernorm",
+    ):
+        super().__init__()
+        self.r = r
+        self.hidden_dim = max(int(r * hidden_ratio), r)
+        self.kernel_size = kernel_size
+        self.context_kernel_size = context_kernel_size
+        self.use_grn = use_grn
+        self.norm_type = norm_type
 
-            # fi: Fraction of tokens routed to each expert (frequency)
-            mask_ce = torch.nn.functional.one_hot(
-                topk_idx.view(-1), num_classes=self.num_experts
+        self.pre_norm = nn.LayerNorm(r)
+        self.pw_expand = nn.Linear(r, self.hidden_dim * 2, bias=False)
+        self.dwconv_local = nn.Conv2d(
+            self.hidden_dim,
+            self.hidden_dim,
+            kernel_size=kernel_size,
+            stride=1,
+            padding=kernel_size // 2,
+            groups=self.hidden_dim,
+            bias=True,
+        )
+        self.dwconv_context = nn.Conv2d(
+            self.hidden_dim,
+            self.hidden_dim,
+            kernel_size=context_kernel_size,
+            stride=1,
+            padding=context_kernel_size // 2,
+            groups=self.hidden_dim,
+            bias=True,
+        )
+        self.mid_norm = nn.LayerNorm(self.hidden_dim) if norm_type == "layernorm" else nn.Identity()
+        self.grn = GRN(self.hidden_dim) if use_grn else nn.Identity()
+        self.pw_project = nn.Linear(self.hidden_dim, r, bias=False)
+        self.dropout = nn.Dropout(dropout) if dropout > 0 else nn.Identity()
+        self.reset_parameters()
+
+    def reset_parameters(self):
+        nn.init.kaiming_uniform_(self.pw_expand.weight, a=math.sqrt(5))
+        nn.init.kaiming_uniform_(self.dwconv_local.weight, a=math.sqrt(5))
+        nn.init.kaiming_uniform_(self.dwconv_context.weight, a=math.sqrt(5))
+        nn.init.zeros_(self.dwconv_local.bias)
+        nn.init.zeros_(self.dwconv_context.bias)
+        nn.init.zeros_(self.pw_project.weight)
+
+    def _resolve_hw(self, n_tokens, hw=None):
+        if hw is not None:
+            if isinstance(hw, torch.Size):
+                hw = tuple(hw)
+            if isinstance(hw, (list, tuple)) and len(hw) == 2:
+                h, w = int(hw[0]), int(hw[1])
+            else:
+                raise ValueError(f"hw must be a tuple/list of length 2, got {hw}")
+            if h * w != n_tokens:
+                raise ValueError(f"Invalid hw={hw} for {n_tokens} patch tokens")
+            return h, w
+
+        h = int(math.sqrt(n_tokens))
+        w = h
+        if h * w != n_tokens:
+            raise ValueError(
+                f"Cannot infer square patch grid from {n_tokens} tokens. "
+                "Please pass hw=(H, W) to SemiFt.forward(..., hw=...)."
             )
-            ce = mask_ce.float().mean(0)
-            fi = ce * self.num_experts
+        return h, w
 
-            # Compute load balancing loss: alpha * sum(Pi * fi)
-            aux_loss = (Pi * fi).sum() * self.loss_coef
+    def forward(self, x, hw=None):
+        if x.numel() == 0:
+            return x
+        bsz, n_tokens, channels = x.shape
+        if channels != self.r:
+            raise ValueError(f"Expected channel dim {self.r}, got {channels}")
 
-        return topk_idx, topk_weight, aux_loss
+        h, w = self._resolve_hw(n_tokens, hw)
+        x_norm = self.pre_norm(x)
+        value, gate = self.pw_expand(x_norm).chunk(2, dim=-1)
+        x_hidden = value * F.silu(gate)
+
+        x_2d = x_hidden.transpose(1, 2).reshape(bsz, self.hidden_dim, h, w).contiguous()
+        x_local = self.dwconv_local(x_2d)
+        x_context = self.dwconv_context(x_2d)
+        x_2d = x_2d + x_local + x_context
+
+        x_hidden = x_2d.permute(0, 2, 3, 1).contiguous()
+        x_hidden = self.grn(x_hidden)
+        x_hidden = self.mid_norm(x_hidden)
+        x_hidden = self.pw_project(x_hidden.view(bsz, n_tokens, self.hidden_dim))
+        x_hidden = self.dropout(x_hidden)
+        return x_hidden
 
 
 class SemiFt(nn.Module):
     def __init__(
-        self, in_features, out_features, r, num_experts=4, scales=[1, 2, 4, 8], topk=1
+        self,
+        in_features,
+        out_features,
+        r,
+        num_experts=4,
+        topk=2,
+        num_prefix_tokens=5,
+        router_aux_loss_coef=1e-2,
+        router_z_loss_coef=1e-3,
+        router_jitter_noise=0.01,
+        use_shared_expert=True,
+        expert_dropout=0.0,
+        scales=None,
+        conv_hidden_ratio=2.0,
+        conv_kernel_size=3,
+        conv_context_kernel_size=5,
+        conv_use_grn=True,
+        conv_norm_type="layernorm",
     ):
         super().__init__()
         self.in_features = in_features
         self.out_features = out_features
         self.r = r
         self.num_experts = num_experts
-        self.scales = scales
-        self.topk = topk
+        self.topk = max(1, min(topk, num_experts))
+        self.num_prefix_tokens = num_prefix_tokens
+        self.scales = scales or [1, 2, 4, 8]
+        self.use_shared_expert = use_shared_expert
 
-        self.experts = nn.ModuleList([nn.Linear(r, r) for _ in range(num_experts)])
+        self.proj_down = nn.Linear(in_features, r, bias=False)
+        self.proj_up = nn.Linear(r, out_features, bias=False)
+        self.input_act = nn.GELU()
+        self.ls = LayerScale(out_features, init_values=1.0)
+
+        expert_kwargs = dict(
+            r=r,
+            hidden_ratio=conv_hidden_ratio,
+            kernel_size=conv_kernel_size,
+            context_kernel_size=conv_context_kernel_size,
+            dropout=expert_dropout,
+            use_grn=conv_use_grn,
+            norm_type=conv_norm_type,
+        )
+        self.shared_expert = ConvExpert(**expert_kwargs) if use_shared_expert else None
+        self.experts = nn.ModuleList([ConvExpert(**expert_kwargs) for _ in range(num_experts)])
 
         self.gating_network = GatingNetwork(
             r=r,
             num_experts=num_experts,
-            topk=topk,
+            topk=self.topk,
+            loss_coef=router_aux_loss_coef,
+            z_loss_coef=router_z_loss_coef,
+            jitter_noise=router_jitter_noise,
         )
         self.aux_loss = None
-
-        self.proj_down = nn.Linear(in_features, r, bias=False)
-
-        self.proj_up = nn.Linear(r, out_features, bias=False)
-
-        self.act = nn.GELU()
-        self.ls = LayerScale(out_features, init_values=1.0)
+        self.router_aux_loss = None
+        self.router_z_loss = None
+        self.router_logits = None
+        self.router_probs = None
+        self.last_hw = None
 
         self.reset_parameters()
 
@@ -139,118 +307,88 @@ class SemiFt(nn.Module):
         nn.init.kaiming_uniform_(self.proj_down.weight, a=math.sqrt(5))
         nn.init.zeros_(self.proj_up.weight)
 
-    def forward(self, x):
-        x = self.act(self.proj_down(x))
+    def _resolve_hw(self, n_tokens, hw=None):
+        if hw is not None:
+            if isinstance(hw, torch.Size):
+                hw = tuple(hw)
+            if isinstance(hw, (list, tuple)) and len(hw) == 2:
+                h, w = int(hw[0]), int(hw[1])
+            else:
+                raise ValueError(f"hw must be a tuple/list of length 2, got {hw}")
+            if h * w != n_tokens:
+                raise ValueError(f"Invalid hw={hw} for {n_tokens} patch tokens")
+            return h, w
 
-        # Extract special tokens (not routed through MoE)
-        cls_token = x[:, :1, :]
-        rel_token = x[:, 1:5, :]
+        h = int(math.sqrt(n_tokens))
+        w = h
+        if h * w != n_tokens:
+            raise ValueError(
+                f"Cannot infer square patch grid from {n_tokens} tokens in SemiFt. "
+                "Please pass hw=(H, W) to the adapter forward call."
+            )
+        return h, w
 
-        # Get patch tokens for MoE routing
-        x = x[:, 5:, :]
-        _x = x
+    def _dense_moe_forward(self, patch_tokens, topk_idx, topk_weight, hw):
+        router_weight = patch_tokens.new_zeros(
+            patch_tokens.shape[0], patch_tokens.shape[1], self.num_experts
+        )
+        router_weight.scatter_add_(-1, topk_idx, topk_weight)
 
-        # Get routing decisions from gating network
-        topk_idx, topk_weight, aux_loss = self.gating_network(x)
+        sparse_out = patch_tokens.new_zeros(patch_tokens.shape)
+        for expert_idx, expert in enumerate(self.experts):
+            expert_out = expert(patch_tokens, hw=hw)
+            sparse_out = sparse_out + expert_out * router_weight[..., expert_idx : expert_idx + 1]
+        return sparse_out
 
-        # Flatten tokens for efficient routing: (B, N, r) -> (B*N, r)
-        B, N, r = x.shape
-        flat_x = x.reshape(-1, r)
-        flat_topk_idx = topk_idx.reshape(-1)
+    def forward(self, x, hw=None):
+        x = self.input_act(self.proj_down(x))
 
-        # Initialize combined features
-        combine_features = torch.zeros_like(flat_x)
+        prefix = x[:, : self.num_prefix_tokens, :]
+        patch_tokens = x[:, self.num_prefix_tokens :, :]
 
-        # Process each expert on its assigned tokens
-        if self.training:
-            # Training mode: repeat tokens for each selected expert
-            flat_x_expanded = flat_x.repeat_interleave(self.topk, dim=0)
+        if patch_tokens.numel() == 0:
+            out = self.ls(self.proj_up(x))
+            zero = x.new_zeros(())
+            self.aux_loss = zero
+            self.router_aux_loss = zero
+            self.router_z_loss = zero
+            self.router_logits = None
+            self.router_probs = None
+            self.last_hw = None
+            return out
 
-            for i, expert in enumerate(self.experts):
-                # Get tokens assigned to this expert
-                expert_mask = flat_topk_idx == i
-                if expert_mask.any():
-                    expert_tokens = flat_x_expanded[expert_mask]
-                    expert_out = expert(expert_tokens)
+        resolved_hw = self._resolve_hw(patch_tokens.shape[1], hw=hw)
+        self.last_hw = resolved_hw
+        residual = patch_tokens
 
-                    # Get weights for this expert's tokens
-                    # Need to map back to original indices
-                    expert_indices = torch.where(expert_mask)[0]
-                    original_indices = expert_indices // self.topk
-                    topk_positions = expert_indices % self.topk
+        topk_idx, topk_weight, router_stats = self.gating_network(patch_tokens)
+        sparse_out = self._dense_moe_forward(patch_tokens, topk_idx, topk_weight, hw=resolved_hw)
 
-                    # Get corresponding weights
-                    flat_topk_weight = topk_weight.view(-1)
-                    weights = flat_topk_weight[
-                        original_indices * self.topk + topk_positions
-                    ]
+        shared_out = self.shared_expert(patch_tokens, hw=resolved_hw) if self.shared_expert is not None else 0.0
+        combined = residual + shared_out + sparse_out
 
-                    # Accumulate weighted outputs
-                    combine_features[
-                        original_indices
-                    ] += expert_out * weights.unsqueeze(-1)
+        total_aux = router_stats['aux_loss'] + router_stats['z_loss']
+        combined = AddAuxiliaryLoss.apply(combined, total_aux)
 
-            # Reshape back to (B, N, r)
-            combine_features = combine_features.view(B, N, r)
-        else:
-            # Inference mode: more efficient processing
-            # Process each expert on tokens assigned to it
-            for i, expert in enumerate(self.experts):
-                # Find all (token_idx, topk_pos) pairs where this expert is selected
-                expert_mask = flat_topk_idx == i
-                if not expert_mask.any():
-                    continue
+        self.router_aux_loss = router_stats['aux_loss']
+        self.router_z_loss = router_stats['z_loss']
+        self.router_logits = router_stats['router_logits']
+        self.router_probs = router_stats['router_probs']
+        self.aux_loss = total_aux
 
-                # Get original token indices (divide by topk to get original position)
-                expert_flat_indices = torch.where(expert_mask)[0]
-                original_token_indices = expert_flat_indices // self.topk
-
-                # Get unique token indices for this expert
-                unique_token_indices, inverse_indices = torch.unique(
-                    original_token_indices, return_inverse=True
-                )
-
-                # Process unique tokens through this expert
-                expert_tokens = flat_x[unique_token_indices]
-                expert_out = expert(expert_tokens)
-
-                # Get weights for each occurrence
-                flat_topk_weight = topk_weight.view(-1)
-                weights = flat_topk_weight[expert_flat_indices]
-
-                # Accumulate weighted outputs using inverse indices
-                for idx in range(len(unique_token_indices)):
-                    token_idx = unique_token_indices[idx]
-                    # Find all occurrences of this token for this expert
-                    occurrences = original_token_indices == token_idx
-                    occurrence_weights = weights[occurrences]
-                    occurrence_outputs = (
-                        expert_out[idx].unsqueeze(0).repeat(len(occurrence_weights), 1)
-                    )
-
-                    # Weighted sum
-                    weighted_output = (
-                        occurrence_outputs * occurrence_weights.unsqueeze(-1)
-                    ).sum(dim=0)
-                    combine_features[token_idx] += weighted_output
-
-            # Reshape back to (B, N, r)
-            combine_features = combine_features.view(B, N, r)
-
-        # Add auxiliary loss to computation graph
-        combine_features = AddAuxiliaryLoss.apply(combine_features, aux_loss)
-        self.aux_loss = aux_loss
-
-        # Final projection
-        x = torch.cat([cls_token, rel_token, _x + combine_features], dim=1)
+        x = torch.cat([prefix, combined], dim=1)
         x = self.ls(self.proj_up(x))
-
         return x
 
 
 class DWConv(nn.Module):
     def __init__(self, in_channels, out_channels, kernel_size=3, stride=1, padding=1):
         super().__init__()
+        self.in_channels = in_channels
+        self.out_channels = out_channels
+        self.kernel_size = kernel_size
+        self.stride = stride
+        self.padding = padding
 
         # 1. 深度卷积 (Depthwise Convolution)
         # 每个通道使用独立的卷积核，groups = in_channels
@@ -261,17 +399,159 @@ class DWConv(nn.Module):
             stride=stride,
             padding=padding,
             groups=in_channels,
+            bias=True,
         )
 
         # 2. 逐点卷积 (Pointwise Convolution)
         # 使用 1x1 卷积核来融合深度卷积后的通道信息
         self.pointwise = nn.Conv2d(
-            in_channels, out_channels, kernel_size=1, stride=1, padding=0
+            in_channels,
+            out_channels,
+            kernel_size=1,
+            stride=1,
+            padding=0,
+            bias=True,
         )
+        self.reset_parameters()
+
+    def reset_parameters(self):
+        nn.init.kaiming_normal_(self.depthwise.weight, a=math.sqrt(5))
+        nn.init.kaiming_normal_(self.pointwise.weight, a=math.sqrt(5))
+        nn.init.constant_(self.depthwise.bias, 0)
+        nn.init.constant_(self.pointwise.bias, 0)
 
     def forward(self, x):
         x = self.depthwise(x)
         x = self.pointwise(x)
+        return x
+
+
+class LegacyConvExpert(nn.Module):
+    def __init__(
+        self,
+        r,
+        kernel_size=3,
+        use_norm=True,
+        activate="gelu",
+        temperature=1.0,
+        scale=2.0,
+    ):
+        super().__init__()
+        self.r = r
+        self.kernel_size = kernel_size
+        self.use_norm = use_norm
+        self.activate = activate
+        self.temperature = temperature
+        self.scale = scale
+
+        if activate == "gelu":
+            self.act = nn.GELU()
+        elif activate == "relu":
+            self.act = nn.ReLU()
+        elif activate == "silu":
+            self.act = nn.SiLU()
+        else:
+            raise ValueError(f"Unknown activation function: {activate}")
+
+        self.conv1 = DWConv(
+            r,
+            r,
+            kernel_size=kernel_size,
+            stride=1,
+            padding=kernel_size // 2,
+        )
+        self.conv2 = DWConv(
+            r, r, kernel_size=kernel_size, stride=1, padding=kernel_size // 2
+        )
+
+        self.dropout = nn.Dropout(0.1)
+
+        if use_norm:
+            self.norm1 = nn.LayerNorm(r)
+            self.norm2 = nn.LayerNorm(r)
+
+        self._init_parameters()
+
+    def _init_parameters(self):
+        if self.use_norm and hasattr(self, "norm1"):
+            nn.init.ones_(self.norm1.weight)
+            nn.init.zeros_(self.norm1.bias)
+        if self.use_norm and hasattr(self, "norm2"):
+            nn.init.ones_(self.norm2.weight)
+            nn.init.zeros_(self.norm2.bias)
+
+    def forward(self, x, scale=None):
+        cls_token = x[:, :5, :]
+        x = x[:, 5:, :]
+
+        if scale is None:
+            scale = self.scale
+
+        B, N, r = x.shape
+        H = W = int(N**0.5)
+
+        x_2d = x.permute(0, 2, 1).reshape(B, r, H, W).contiguous()
+
+        x_scale1 = F.interpolate(
+            x_2d,
+            scale_factor=scale,
+            mode="bilinear",
+            align_corners=False,
+        )
+
+        x_conv1 = self.dropout(self.act(self.conv1(x_scale1)))
+        x_conv1 = F.interpolate(
+            x_conv1, size=(H, W), mode="bilinear", align_corners=False
+        )
+        x_out1 = x_conv1
+
+        x_scale2 = F.interpolate(
+            x_2d, scale_factor=1.0 / scale, mode="bilinear", align_corners=False
+        )
+        x_conv2 = self.dropout(self.act(self.conv2(x_scale2)))
+        x_conv2 = F.interpolate(
+            x_conv2, size=(H, W), mode="bilinear", align_corners=False
+        )
+        x_out2 = x_conv2
+
+        if self.use_norm:
+            x_out1 = x_out1.permute(0, 2, 3, 1).contiguous()
+            x_out2 = x_out2.permute(0, 2, 3, 1).contiguous()
+            x_out1 = self.norm1(x_out1)
+            x_out2 = self.norm2(x_out2)
+            x_out1 = x_out1.permute(0, 3, 1, 2).contiguous()
+            x_out2 = x_out2.permute(0, 3, 1, 2).contiguous()
+
+        x = (x_out1 + x_out2) / 2.0
+        x = x.reshape(B, r, N).permute(0, 2, 1).contiguous()
+        x = torch.cat([cls_token, x], dim=1)
+        return x
+
+
+class SingleConvExpert(nn.Module):
+    def __init__(self, in_channels, out_channels, r, dropout=0.1):
+        super().__init__()
+        self.in_channels = in_channels
+        self.out_channels = out_channels
+        self.r = r
+        self.dropout = nn.Dropout(dropout)
+
+        self.proj_down = nn.Linear(in_channels, r, bias=False)
+        self.act = nn.GELU()
+        self.conv = LegacyConvExpert(r)
+        self.proj_up = nn.Linear(r, out_channels, bias=False)
+        self.scale = nn.Parameter(torch.ones(1))
+
+        self.reset_parameters()
+
+    def reset_parameters(self):
+        nn.init.kaiming_normal_(self.proj_down.weight)
+        nn.init.zeros_(self.proj_up.weight)
+
+    def forward(self, x):
+        x = self.dropout(self.act(self.proj_down(x)))
+        x = self.dropout(self.act(self.conv(x)))
+        x = self.proj_up(x) * self.scale
         return x
 
 
