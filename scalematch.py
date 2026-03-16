@@ -161,8 +161,7 @@ def main(args, cfg):
         device_ids=[local_rank],
         broadcast_buffers=False,
         output_device=local_rank,
-        find_unused_parameters=False,
-        static_graph=True,
+        find_unused_parameters=True,
     )
 
     if cfg["criterion"]["name"] == "CELoss":
@@ -351,23 +350,22 @@ def main(args, cfg):
                 ignore_mask, ignore_mask_mix, cutmix_box1
             )
 
-            with model.no_sync():
-                with torch.cuda.amp.autocast(enabled=amp):
-                    pred_u_s = model(img_u_s1, scale_factor=None)
-                    if isinstance(pred_u_s, dict):
-                        pred_u_s = pred_u_s["pred_ori"]
+            with torch.cuda.amp.autocast(enabled=amp):
+                pred_u_s = model(img_u_s1, scale_factor=None)
+                if isinstance(pred_u_s, dict):
+                    pred_u_s = pred_u_s["pred_ori"]
 
-                    loss_u_s1 = criterion_u(pred_u_s, mask_u_w_cutmixed1)
-                    loss_u_s1 = confidence_weighted_loss(
-                        loss_u_s1,
-                        conf_u_w_cutmixed1,
-                        ignore_mask_cutmixed1,
-                        ignore_index,
-                        conf_thresh=conf_thresh,
-                    )
-                    loss_strong = (0.25 * loss_u_s1) / 2.0
+                loss_u_s1 = criterion_u(pred_u_s, mask_u_w_cutmixed1)
+                loss_u_s1 = confidence_weighted_loss(
+                    loss_u_s1,
+                    conf_u_w_cutmixed1,
+                    ignore_mask_cutmixed1,
+                    ignore_index,
+                    conf_thresh=conf_thresh,
+                )
+                loss_strong = (0.25 * loss_u_s1) / 2.0
 
-                scaler.scale(loss_strong).backward()
+            scaler.scale(loss_strong).backward()
 
             with torch.cuda.amp.autocast(enabled=amp):
                 pred = model(

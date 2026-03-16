@@ -114,3 +114,10 @@ def test_lock_backbone_freezes_parameters(monkeypatch):
     assert any(p.requires_grad for p in model.backbone.parameters())
     model.lock_backbone()
     assert all(not p.requires_grad for p in model.backbone.parameters())
+
+
+def test_scalematch_trainer_uses_safe_ddp_settings():
+    source = open("scalematch.py", "r", encoding="utf-8").read()
+    assert "find_unused_parameters=True" in source
+    assert "static_graph=True" not in source
+    assert "model.no_sync()" not in source
