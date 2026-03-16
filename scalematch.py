@@ -327,13 +327,7 @@ def main(args, cfg):
                     if isinstance(pred_u_w_mix, dict):
                         pred_u_w_mix = pred_u_w_mix["pred_ori"]
                     conf_u_w_mix, mask_u_w_mix = pred_u_w_mix.softmax(dim=1).max(dim=1)
-            model.train()
 
-            num_lb = img_x.shape[0]
-            optimizer.zero_grad()
-
-            with torch.no_grad():
-                with torch.cuda.amp.autocast(enabled=amp):
                     pred_teacher_for_strong = model.module(
                         img_u_w, scale_factor=random_scale, feature_scale=feature_scale
                     )
@@ -343,6 +337,10 @@ def main(args, cfg):
                         else pred_teacher_for_strong["pred_joint"]
                     )
                     conf_u_w, mask_u_w = pred_u_w.detach().softmax(dim=1).max(dim=1)
+            model.train()
+
+            num_lb = img_x.shape[0]
+            optimizer.zero_grad()
 
             mask_u_w_cutmixed1 = cutmix_mask(mask_u_w, mask_u_w_mix, cutmix_box1)
             conf_u_w_cutmixed1 = cutmix_mask(conf_u_w, conf_u_w_mix, cutmix_box1)

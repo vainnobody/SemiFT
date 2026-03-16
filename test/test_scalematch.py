@@ -121,3 +121,12 @@ def test_scalematch_trainer_uses_safe_ddp_settings():
     assert "find_unused_parameters=True" in source
     assert "static_graph=True" not in source
     assert "model.no_sync()" not in source
+
+
+def test_scalematch_teacher_pseudo_labels_run_in_eval_block():
+    source = open("scalematch.py", "r", encoding="utf-8").read()
+    start = source.index("model.eval()")
+    end = source.index("model.train()", start)
+    block = source[start:end]
+    assert "pred_u_w_mix = model.module" in block
+    assert "pred_teacher_for_strong = model.module" in block
