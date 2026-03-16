@@ -36,3 +36,11 @@ test/test_moe_adapter.py
 # local experiments
 notebook/
 test/test_moe_adapter.py
+
+# local-only artifacts
+.DS_Store
+docs/
+fig1_reference_beautified.png
+paper/
+skills/
+test/
