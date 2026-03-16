@@ -754,10 +754,6 @@ def main(args, cfg):
                             mask_u_w_cutmixed1[0],
                             Visualizer.SEGMENTATION,
                         ),
-                        "mask_u_w_cutmixed2": (
-                            mask_u_w_cutmixed2[0],
-                            Visualizer.SEGMENTATION,
-                        ),
                         "perturb_score_s1": (
                             perturb_score_s1[0].unsqueeze(0),
                             Visualizer.TENSOR,
