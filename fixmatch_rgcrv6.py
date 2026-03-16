@@ -708,13 +708,13 @@ def main(args, cfg):
             )
 
             # =====================
-            # 8. Total loss (following RankMatch-style weighting)
+            # 8. Total loss
             # =====================
             loss = (
-                loss_x
+                loss_x * 0.5
                 + loss_u_s1 * 0.25
                 + loss_u_rvs * 0.25
-            ) / 2.0
+            )
 
             torch.distributed.barrier()
 
