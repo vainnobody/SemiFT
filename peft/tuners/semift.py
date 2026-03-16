@@ -144,10 +144,17 @@ class AdaptModel(nn.Module):
                     child_target = getattr(target, child_name, None)
                     if child_target is None:
                         continue
+                    if not self._supports_leaf_adapter_target(child_name, child_target):
+                        visited.add(child_key)
+                        continue
                     new_module = self._build_leaf_adapter(child_name, child_target)
                     self._insert_module(child_parent, child_name, new_module)
                     visited.add(child_key)
                     matched = True
+                visited.add(key)
+                continue
+
+            if not self._supports_leaf_adapter_target(target_name, target):
                 visited.add(key)
                 continue
 
@@ -227,6 +234,15 @@ class AdaptModel(nn.Module):
             init_scale=self.peft_config.ssf_init_scale,
             init_shift_std=self.peft_config.ssf_init_shift_std,
         )
+
+    def _supports_leaf_adapter_target(self, target_name, target):
+        if self.peft_config.method == "ssf":
+            return True
+        try:
+            self._infer_linear_dims(target_name, target)
+        except ValueError:
+            return False
+        return True
 
     def _build_leaf_adapter(self, target_name, target):
         input_dim, output_dim = self._infer_linear_dims(target_name, target)

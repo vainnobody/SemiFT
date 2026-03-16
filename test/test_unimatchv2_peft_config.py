@@ -223,3 +223,42 @@ def test_bitfit_only_enables_biases_for_target_module():
     assert adapted.model.block.mlp.fc2.weight.requires_grad is False
     assert adapted.model.block.mlp.fc1.bias.requires_grad is True
     assert adapted.model.block.mlp.fc2.bias.requires_grad is True
+
+
+def test_adaptmodel_skips_non_linear_proj_suffix_matches():
+    semift = load_semift_module()
+    import torch.nn as nn
+
+    class Attn(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.qkv = nn.Linear(8, 24)
+            self.proj = nn.Linear(8, 8)
+
+        def forward(self, x):
+            return self.proj(self.qkv(x).chunk(3, dim=-1)[0])
+
+    class Decoder(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.proj = nn.Sequential(nn.Conv2d(8, 8, kernel_size=1), nn.ReLU())
+
+        def forward(self, x):
+            return self.proj(x)
+
+    class Model(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.attn = Attn()
+            self.decoder = Decoder()
+
+        def forward(self, x):
+            return self.attn(x)
+
+    model = Model()
+    decoder_proj = model.decoder.proj
+    cfg = semift.SemiFTConfig(method="lora", target_modules=["proj"], r=4, lora_alpha=8)
+    adapted = semift.AdaptModel(cfg, model)
+
+    assert isinstance(adapted.model.attn.proj, semift.WarpBlock)
+    assert adapted.model.decoder.proj is decoder_proj
