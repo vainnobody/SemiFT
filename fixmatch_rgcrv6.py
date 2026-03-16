@@ -8,7 +8,7 @@ Combines:
 - RVS: Rotation-Variation-Scale geometric augmentation
 - RGCR-native structured feature perturbation
 
-Loss = loss_x + loss_u_s1 + loss_u_s2 + loss_u_rvs
+Loss = loss_x + loss_u_s1 + loss_u_rvs
 """
 
 import argparse
@@ -502,7 +502,6 @@ def main(args, cfg):
         total_loss = AverageMeter()
         total_loss_x = AverageMeter()
         total_loss_u_s1 = AverageMeter()
-        total_loss_u_s2 = AverageMeter()
         total_loss_u_rvs = AverageMeter()
         total_mask_ratio = AverageMeter()
 
@@ -688,24 +687,8 @@ def main(args, cfg):
                 conf_thresh=conf_thresh,
             )
 
-            # --- Unsupervised loss (strong view 2 in RVS space) ---
-            validate_target_range(
-                "loss_u_s2_target",
-                mask_u_w_cutmixed2,
-                cfg["nclass"],
-                ignore_index,
-                logger=logger,
-                rank=rank,
-            )
-
-            loss_u_s2 = criterion_u(pred_u_s2, mask_u_w_cutmixed2)
-            loss_u_s2 = confidence_weighted_loss(
-                loss_u_s2,
-                conf_u_w_cutmixed2,
-                ignore_mask_cutmixed2,
-                ignore_index,
-                conf_thresh=conf_thresh,
-            )
+            # strong2 already serves as the RVS-space branch; do not add a second
+            # pseudo-label loss on the same prediction path to avoid duplicate supervision.
 
             # --- Unsupervised loss (RVS): loss_u_rvs ---
             validate_target_range(
@@ -731,7 +714,6 @@ def main(args, cfg):
             loss = (
                 loss_x
                 + loss_u_s1 * 0.25
-                + loss_u_s2 * 0.25
                 + loss_u_rvs * 0.25
             ) / 2.0
 
@@ -855,7 +837,6 @@ def main(args, cfg):
             total_loss.update(loss.item())
             total_loss_x.update(loss_x.item())
             total_loss_u_s1.update(loss_u_s1.item())
-            total_loss_u_s2.update(loss_u_s2.item())
             total_loss_u_rvs.update(loss_u_rvs.item())
 
             valid_s1 = (ignore_mask != ignore_index).sum().item()
@@ -883,21 +864,19 @@ def main(args, cfg):
                 writer.add_scalar("train/loss_all", loss.item(), iters)
                 writer.add_scalar("train/loss_x", loss_x.item(), iters)
                 writer.add_scalar("train/loss_u_s1", loss_u_s1.item(), iters)
-                writer.add_scalar("train/loss_u_s2", loss_u_s2.item(), iters)
                 writer.add_scalar("train/loss_u_rvs", loss_u_rvs.item(), iters)
                 writer.add_scalar("train/mask_ratio", mask_ratio, iters)
 
             if (i % (len(trainloader_u) // 8) == 0) and (rank == 0):
                 logger.info(
                     "Iters: {:}, LR: {:.7f}, Total loss: {:.3f}, Loss x: {:.3f}, "
-                    "Loss u_s1: {:.3f}, Loss u_s2: {:.3f}, Loss u_rvs: {:.3f}, "
+                    "Loss u_s1: {:.3f}, Loss u_rvs: {:.3f}, "
                     "Mask ratio: {:.3f}".format(
                         i,
                         optimizer.param_groups[0]["lr"],
                         total_loss.avg,
                         total_loss_x.avg,
                         total_loss_u_s1.avg,
-                        total_loss_u_s2.avg,
                         total_loss_u_rvs.avg,
                         total_mask_ratio.avg,
                     )
