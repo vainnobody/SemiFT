@@ -59,7 +59,6 @@ class ScaleMatchRemoteSemiDataset(RemoteSemiDataset):
         return len(self.ids) * self.epoch_repeat_factor
 
 
-
 def get_scalematch_dataset_cls(dataset_name):
     if dataset_name in NATURAL_IMAGE_DATASETS:
         return NaturalSemiDataset, "semi"
@@ -198,7 +197,7 @@ def main(args, cfg):
         device_ids=[local_rank],
         broadcast_buffers=False,
         output_device=local_rank,
-        find_unused_parameters=False,
+        find_unused_parameters=True,
     )
 
     if cfg["criterion"]["name"] == "CELoss":
@@ -215,9 +214,9 @@ def main(args, cfg):
         )
 
     ignore_index = cfg.get("ignore_index", 255)
-    criterion_u = nn.CrossEntropyLoss(
-        reduction="none", ignore_index=ignore_index
-    ).cuda(local_rank)
+    criterion_u = nn.CrossEntropyLoss(reduction="none", ignore_index=ignore_index).cuda(
+        local_rank
+    )
 
     SemiDataset, dataset_loader_name = get_scalematch_dataset_cls(cfg["dataset"])
     epoch_repeat_factor = cfg.get("epoch_repeat_factor", 1)
@@ -417,7 +416,11 @@ def main(args, cfg):
                     feature_scale=feature_scale,
                 )
 
-                pred_u_w = pred["pred_ori"][num_lb:] if epoch < warm_up else pred["pred_joint"][num_lb:]
+                pred_u_w = (
+                    pred["pred_ori"][num_lb:]
+                    if epoch < warm_up
+                    else pred["pred_joint"][num_lb:]
+                )
                 pred_u_w = pred_u_w.detach()
                 conf_u_w, mask_u_w = pred_u_w.softmax(dim=1).max(dim=1)
 
@@ -456,9 +459,8 @@ def main(args, cfg):
 
             valid_mask = ignore_mask != ignore_index
             mask_ratio = (
-                ((conf_u_w >= conf_thresh) & valid_mask).sum().float()
-                / valid_mask.sum().clamp(min=1.0)
-            )
+                (conf_u_w >= conf_thresh) & valid_mask
+            ).sum().float() / valid_mask.sum().clamp(min=1.0)
 
             log_avg.update(
                 {
@@ -506,7 +508,9 @@ def main(args, cfg):
 
             writer.add_scalar("eval/mIoU", mIoU, epoch)
             for i, iou in enumerate(iou_class):
-                writer.add_scalar("eval/%s_IoU" % CLASSES[cfg["dataset"]][i], iou, epoch)
+                writer.add_scalar(
+                    "eval/%s_IoU" % CLASSES[cfg["dataset"]][i], iou, epoch
+                )
 
         is_best = mIoU > previous_best
         previous_best = max(mIoU, previous_best)
