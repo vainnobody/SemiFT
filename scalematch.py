@@ -155,7 +155,7 @@ def main(args, cfg):
         device_ids=[local_rank],
         broadcast_buffers=False,
         output_device=local_rank,
-        find_unused_parameters=True,
+        find_unused_parameters=False,
     )
 
     # Loss functions
@@ -327,7 +327,7 @@ def main(args, cfg):
             model.eval()
             with torch.no_grad():
                 with torch.cuda.amp.autocast(enabled=amp):
-                    pred_u_w_mix = model(img_u_w_mix, scale_factor=None)
+                    pred_u_w_mix = model.module(img_u_w_mix, scale_factor=None)
                     if isinstance(pred_u_w_mix, dict):
                         pred_u_w_mix = pred_u_w_mix["pred_ori"]
                     conf_u_w_mix, mask_u_w_mix = pred_u_w_mix.softmax(dim=1).max(dim=1)
