@@ -1,13 +1,340 @@
 # SemiFT
 
-## Codex research skills
+SemiFT 是一个基于 PyTorch 的半监督语义分割研究仓库，核心目标是在 **DINOv2 / DINOv3 + DPT** 框架上，以 **参数高效微调（PEFT）** 的方式完成半监督训练。
 
-This repo includes a Codex-oriented research skill pack under `skills/` for
-literature review, novelty checking, experiment launch/monitoring, and
-ARIS-style review loops adapted to SemiFT.
+当前仓库的主方法是 **SemiFT**：
+- 以 `peft/tuners/semift.py` 中的 `semift` 适配器为核心；
+- 默认作用在 Transformer 的 `mlp` 模块；
+- 支持 Mixture-of-Experts / prefix / conv expert 等配置；
+- 已集成到 `unimatchv2_peft.py` 与 `scalematch_peft.py` 两个训练入口中。
 
-See:
+除了 SemiFT，本仓库也保留了多种半监督分割方法与实验入口，例如 `fixmatch.py`、`fixmatch_rgcr.py`、`unimatch.py`、`unimatch_v2.py`、`rankmatch.py`、`corrmatch.py`、`scalematch.py` 等，方便做对比实验。
 
-- `skills/README.md`
-- `docs/CODEX_RESEARCH_SKILLS.md`
-- `docs/PROJECT_ENV.example.md`
+---
+
+## 1. 仓库结构
+
+```text
+SemiFT/
+├── configs/                 # 数据集/训练配置
+├── dataset/                 # 数据集与增强
+├── model/
+│   ├── backbone/            # DINOv2 / DINOv3
+│   └── semseg/              # DPT / UperNet / ScaleMatch 等分割头
+├── peft/                    # PEFT 与 SemiFT 适配器实现
+├── splits/                  # 半监督划分文件
+├── test/                    # 轻量测试
+├── unimatchv2_peft.py       # UniMatchV2 + PEFT（推荐 SemiFT 入口）
+├── scalematch_peft.py       # ScaleMatch + PEFT
+├── fixmatch_rgcr.py         # FixMatch-RGCR 对比入口
+└── README.md
+```
+
+---
+
+## 2. SemiFT 方法概览
+
+从代码实现看，仓库中的 SemiFT 训练流程由两部分组成：
+
+1. **半监督训练框架**
+   - `unimatchv2_peft.py`
+   - `scalematch_peft.py`
+
+2. **PEFT / SemiFT 适配器**
+   - `peft/tuners/semift.py`
+
+默认配置下：
+- `method: semift`
+- `target_modules: ["mlp"]`
+- `freeze_backbone: True`
+- `modules_to_save: ["head"]`
+
+也就是说，主干 DINO 参数通常冻结，只训练：
+- SemiFT 适配器参数
+- 解码头参数
+- 配置中指定的可保存模块
+
+这也是当前仓库最推荐的使用方式。
+
+---
+
+## 3. 环境安装
+
+建议使用 Python 3.10+ 与 CUDA 环境。
+
+```bash
+python -m pip install -r requirements.txt
+```
+
+如果要使用分布式训练，确保本机已经正确安装：
+- PyTorch
+- NCCL / CUDA
+- TensorBoard（训练日志会写入 `SummaryWriter`）
+
+---
+
+## 4. 数据与预训练权重准备
+
+### 4.1 数据集路径
+在 `configs/*.yaml` 中设置：
+
+```yaml
+data_root: Your/Dataset/Path
+```
+
+### 4.2 半监督划分文件
+训练命令通常需要：
+- `--labeled-id-path`
+- `--unlabeled-id-path`
+
+例如：
+- `splits/pascal/1_16/labeled.txt`
+- `splits/pascal/1_16/unlabeled.txt`
+
+请根据你实际的划分文件名替换。
+
+### 4.3 Backbone 预训练权重
+代码默认从如下位置读取主干权重：
+
+```text
+./pretrained/<backbone>.pth
+```
+
+例如：
+- `./pretrained/dinov2_small.pth`
+- `./pretrained/dinov2_base.pth`
+- `./pretrained/dinov3_small.pth`
+
+请先手动准备好对应权重文件。
+
+---
+
+## 5. 推荐训练入口
+
+## 5.1 UniMatchV2 + SemiFT（推荐）
+
+这是当前最标准的 **SemiFT 主方法入口**。
+
+### 单机多卡训练
+```bash
+torchrun --nproc_per_node=4 unimatchv2_peft.py \
+  --config configs/pascal.yaml \
+  --labeled-id-path splits/pascal/1_16/labeled.txt \
+  --unlabeled-id-path splits/pascal/1_16/unlabeled.txt \
+  --save-path experiments/semift_pascal \
+  --port 29500
+```
+
+### 配置文件示例
+`configs/pascal.yaml` 中默认已经给出 SemiFT 配置：
+
+```yaml
+peft:
+  method: semift
+  target_modules: ["mlp"]
+  freeze_backbone: True
+  modules_to_save: ["head"]
+  bias: lora_only
+  moe_num_experts: 4
+  moe_topk: 2
+```
+
+### 命令行覆盖示例
+```bash
+torchrun --nproc_per_node=4 unimatchv2_peft.py \
+  --config configs/pascal.yaml \
+  --labeled-id-path splits/pascal/1_16/labeled.txt \
+  --unlabeled-id-path splits/pascal/1_16/unlabeled.txt \
+  --save-path experiments/semift_pascal_mlp \
+  --peft-method semift \
+  --peft-target-modules mlp \
+  --freeze-backbone \
+  --port 29500
+```
+
+---
+
+## 5.2 ScaleMatch + SemiFT
+
+如果你想把 SemiFT 放在 ScaleMatch 框架中训练，可以使用：
+
+```bash
+torchrun --nproc_per_node=4 scalematch_peft.py \
+  --config configs/pascal.yaml \
+  --labeled-id-path splits/pascal/1_16/labeled.txt \
+  --unlabeled-id-path splits/pascal/1_16/unlabeled.txt \
+  --save-path experiments/scalematch_semift_pascal \
+  --peft-method semift \
+  --peft-target-modules mlp \
+  --freeze-backbone \
+  --port 29501
+```
+
+当前代码中，ScaleMatch 默认图像尺度上限已经限制为 **1.25**，以减少过高分辨率带来的显存与时间开销。
+
+---
+
+## 6. PEFT 方法支持
+
+`peft/tuners/semift.py` 当前支持以下方法：
+
+- `semift`
+- `lora`
+- `ssf`
+- `bitfit`
+- `adaptformer`
+- `fact_tt`
+- `fact_tk`
+- `conv_lora`
+- `hydralora`
+
+默认目标模块：
+
+| method | default target_modules |
+|---|---|
+| semift | `["mlp"]` |
+| lora | `["qkv", "proj", "fc1", "fc2"]` |
+| ssf | `["patch_embed", "norm1", "norm2", "qkv", "proj", "fc1", "fc2"]` |
+| bitfit | `["qkv", "proj", "fc1", "fc2", "norm1", "norm2", "head"]` |
+| adaptformer | `["mlp"]` |
+| fact_tt | `["mlp"]` |
+| fact_tk | `["mlp"]` |
+| conv_lora | `["qkv", "proj", "fc1", "fc2"]` |
+| hydralora | `["qkv", "proj", "fc1", "fc2"]` |
+
+如果你只想使用主方法，请优先采用：
+
+```yaml
+peft:
+  method: semift
+  target_modules: ["mlp"]
+  freeze_backbone: True
+```
+
+---
+
+## 7. 其他对比方法入口
+
+仓库中保留了多个对比方法脚本，便于做消融和横向比较：
+
+- `supervised.py`
+- `fixmatch.py`
+- `fixmatch_rgcr.py`
+- `unimatch.py`
+- `unimatch_v2.py`
+- `rankmatch.py`
+- `corrmatch.py`
+- `scalematch.py`
+- `wscl.py`
+- `dwl.py`
+- `ranpaste.py`
+- `segmind.py`
+
+例如，`fixmatch_rgcr.py` 是一个较完整的半监督训练入口，包含：
+- 配置读取
+- DDP 初始化
+- DPT 模型构建
+- teacher / student 训练逻辑
+- 验证与 checkpoint 保存
+
+本仓库新的 PEFT 入口基本延续了这种训练脚本组织方式，但把重点放在 **SemiFT 适配器 + 半监督分割** 上。
+
+---
+
+## 8. 常用配置说明
+
+以 `configs/pascal.yaml` 为例：
+
+```yaml
+dataset: pascal
+nclass: 21
+crop_size: 518
+
+epochs: 60
+batch_size: 4
+lr: 0.000005
+lr_multi: 40.0
+conf_thresh: 0.95
+
+model: dpt
+backbone: dinov2_small
+```
+
+说明：
+- `batch_size` 为 **每张卡** 的 batch size
+- `lr_multi` 通常用于 decoder / 非 backbone 参数组
+- `conf_thresh` 是伪标签置信度阈值
+- `backbone` 目前主要围绕 `dinov2_*` / `dinov3_*`
+
+---
+
+## 9. 训练输出
+
+训练过程中通常会在 `--save-path` 下保存：
+
+- `latest.pth`
+- `best.pth`
+- TensorBoard 日志
+
+推荐用 TensorBoard 查看：
+
+```bash
+tensorboard --logdir experiments
+```
+
+---
+
+## 10. 测试与调试
+
+仓库中有一部分轻量测试，建议在修改后至少做语法或定向测试。
+
+示例：
+
+```bash
+python -m py_compile unimatchv2_peft.py scalematch_peft.py peft/tuners/semift.py
+```
+
+如果本地安装了 `pytest`：
+
+```bash
+python -m pytest test/test_unimatchv2_peft_config.py
+python -m pytest test/test_scalematch_peft.py
+```
+
+---
+
+## 11. 实用建议
+
+1. **优先从 `unimatchv2_peft.py` 跑通 SemiFT**，再迁移到 ScaleMatch。  
+2. 如果显存紧张：
+   - 降低 `batch_size`
+   - 使用 `dinov2_small`
+   - 减少 `crop_size`
+   - 保持 `freeze_backbone: True`
+3. 如果训练很慢：
+   - 避免过大的多尺度范围
+   - 检查 `img_scales`
+   - 优先使用默认 SemiFT 配置
+4. 若更换 PEFT 方法，建议同步检查：
+   - `target_modules`
+   - `freeze_backbone`
+   - `modules_to_save`
+
+---
+
+## 12. 总结
+
+如果你只关心本仓库的主方法，可以直接记住下面这条：
+
+> **SemiFT = `unimatchv2_peft.py` / `scalematch_peft.py` + `peft/tuners/semift.py` + `configs/*.yaml` 中的 `peft.method: semift` 配置。**
+
+推荐起步命令：
+
+```bash
+torchrun --nproc_per_node=4 unimatchv2_peft.py \
+  --config configs/pascal.yaml \
+  --labeled-id-path splits/pascal/1_16/labeled.txt \
+  --unlabeled-id-path splits/pascal/1_16/unlabeled.txt \
+  --save-path experiments/semift_pascal \
+  --port 29500
+```
