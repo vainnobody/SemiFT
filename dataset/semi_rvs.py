@@ -116,7 +116,7 @@ class SemiDataset(Dataset):
             mask_c,
             angle=theta,
             interpolation=TF.InterpolationMode.NEAREST,
-            fill=ignore_value,
+            fill=0,
         )
 
         return (

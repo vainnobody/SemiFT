@@ -251,6 +251,10 @@ def apply_cutmix_to_map(map_tensor, cutmix_box):
     return mixed
 
 
+def binarize_valid_mask(mask_tensor, threshold=0.5):
+    return (mask_tensor > threshold).to(mask_tensor.dtype)
+
+
 def normalize_score_map(score_map, eps=1e-6):
     score_map = score_map.clamp(min=0.0)
     flat = score_map.flatten(1)
@@ -517,7 +521,7 @@ def main(args, cfg):
             (
                 img_u_w,
                 img_u_s1,
-                img_u_s2,
+                img_u_rvs,
                 ignore_mask,
                 cutmix_box1,
                 cutmix_box2,
@@ -527,10 +531,10 @@ def main(args, cfg):
         ) in enumerate(loader):
 
             img_x, mask_x = img_x.cuda(), mask_x.cuda()
-            img_u_w, img_u_s1, img_u_s2 = (
+            img_u_w, img_u_s1, img_u_rvs = (
                 img_u_w.cuda(),
                 img_u_s1.cuda(),
-                img_u_s2.cuda(),
+                img_u_rvs.cuda(),
             )
             ignore_mask = ignore_mask.cuda()
             cutmix_box1, cutmix_box2 = cutmix_box1.cuda(), cutmix_box2.cuda()
@@ -578,26 +582,19 @@ def main(args, cfg):
             img_u_s1[cutmix_box1.unsqueeze(1).expand(img_u_s1.shape) == 1] = (
                 img_u_s1.flip(0)[cutmix_box1.unsqueeze(1).expand(img_u_s1.shape) == 1]
             )
-            img_u_s2[cutmix_box2.unsqueeze(1).expand(img_u_s2.shape) == 1] = (
-                img_u_s2.flip(0)[cutmix_box2.unsqueeze(1).expand(img_u_s2.shape) == 1]
-            )
 
             mask_u_w_cutmixed1 = apply_cutmix_to_map(mask_u_w, cutmix_box1)
             conf_u_w_cutmixed1 = apply_cutmix_to_map(conf_u_w, cutmix_box1)
             ignore_mask_cutmixed1 = apply_cutmix_to_map(ignore_mask, cutmix_box1)
 
-            mask_u_w_cutmixed2 = apply_cutmix_to_map(mask_u_rvs_view, cutmix_box2)
-            conf_u_w_cutmixed2 = apply_cutmix_to_map(conf_u_rvs_view, cutmix_box2)
-            ignore_mask_cutmixed2 = apply_cutmix_to_map(
-                ignore_mask_rvs_view, cutmix_box2
-            )
-
             with torch.no_grad():
-                pred_u_s2_seed = model_ema(img_u_s2).detach()
+                pred_u_rvs_seed = model_ema(img_u_rvs).detach()
                 pred_seed_recovered, valid_masks_seed = scale_back(
-                    pred_u_s2_seed, mask_c, cfg["crop_size"], box
+                    pred_u_rvs_seed, mask_c, cfg["crop_size"], box
                 )
-                valid_masks_seed_sq = valid_masks_seed.squeeze(1).float()
+                valid_masks_seed_sq = binarize_valid_mask(
+                    valid_masks_seed.squeeze(1).float()
+                )
                 seed_recovered_conf = pred_seed_recovered.softmax(dim=1).max(dim=1)[0]
                 seed_recovered_label = pred_seed_recovered.argmax(dim=1)
                 seed_recovered_disagreement = (
@@ -618,26 +615,26 @@ def main(args, cfg):
             perturb_score_s1 = RGCRV6_PERTURB["s1_uncertainty_weight"] * (
                 1.0 - conf_u_w_cutmixed1
             )
-            perturb_score_s2 = (
+            perturb_score_rvs = (
                 RGCRV6_PERTURB["s2_uncertainty_weight"]
-                * (1.0 - conf_u_w_cutmixed2)
+                * (1.0 - conf_u_rvs_view)
                 + RGCRV6_PERTURB["s2_recovery_weight"]
-                * apply_cutmix_to_map(seed_recovered_instability_rvs, cutmix_box2)
+                * seed_recovered_instability_rvs
                 + RGCRV6_PERTURB["s2_geometry_weight"]
-                * apply_cutmix_to_map(1.0 - mask_c.squeeze(1).float(), cutmix_box2)
+                * (1.0 - mask_c.squeeze(1).float())
             )
 
             feature_perturb = build_feature_perturbation(
-                torch.cat((perturb_score_s1, perturb_score_s2), dim=0)
+                torch.cat((perturb_score_s1, perturb_score_rvs), dim=0)
             )
-            pred_u_s1, pred_u_s2 = model(
-                torch.cat((img_u_s1, img_u_s2)), feature_perturb=feature_perturb
+            pred_u_s1, pred_u_rvs = model(
+                torch.cat((img_u_s1, img_u_rvs)), feature_perturb=feature_perturb
             ).chunk(2)
 
             # =====================
             # 4. Student forward: RVS (rotated-varied-scaled) augmentation
             # =====================
-            pred_u_rvs = pred_u_s2
+            # pred_u_rvs is predicted from the pure RVS view (without CutMix)
 
             # =====================
             # 5. Scale-back: recover RVS predictions and features to original space
@@ -649,7 +646,9 @@ def main(args, cfg):
             # =====================
             # 6. Prepare masks for RVS pseudo-label loss
             # =====================
-            valid_masks_pred_sq = valid_masks_pred.squeeze(1)  # [B, H, W]
+            valid_masks_pred_sq = binarize_valid_mask(
+                valid_masks_pred.squeeze(1).float()
+            )  # [B, H, W]
 
             # mask_u_w_rvs: pseudo-labels for RVS branch
             # In valid regions: use EMA teacher pseudo-labels (mask_u_w)
@@ -734,7 +733,7 @@ def main(args, cfg):
                         "mask_x": (mask_x[0], Visualizer.SEGMENTATION),
                         "pred_x": (pred_x.argmax(dim=1)[0], Visualizer.SEGMENTATION),
                         # RVS / strong2: transformed context image and predictions
-                        "img_u_s2": (img_u_s2[0], Visualizer.TENSOR),
+                        "img_u_rvs": (img_u_rvs[0], Visualizer.TENSOR),
                         "pred_u_rvs": (
                             pred_u_rvs.argmax(dim=1)[0],
                             Visualizer.SEGMENTATION,
@@ -763,13 +762,9 @@ def main(args, cfg):
                             perturb_score_s1[0].unsqueeze(0),
                             Visualizer.TENSOR,
                         ),
-                        "perturb_score_s2": (
-                            perturb_score_s2[0].unsqueeze(0),
+                        "perturb_score_rvs": (
+                            perturb_score_rvs[0].unsqueeze(0),
                             Visualizer.TENSOR,
-                        ),
-                        "pred_u_s2": (
-                            pred_u_s2.argmax(dim=1)[0],
-                            Visualizer.SEGMENTATION,
                         ),
                         # RVS pseudo-label target (ignore_index in invalid regions)
                         "mask_u_w_rvs": (mask_u_w_rvs[0], Visualizer.SEGMENTATION),
@@ -813,7 +808,7 @@ def main(args, cfg):
                         f"high_conf_valid={high_conf_ratio:.3f}, "
                         f"seed_disagree={seed_disagree_ratio:.3f}, "
                         f"perturb_s1={perturb_score_s1.mean().item():.3f}, "
-                        f"perturb_s2={perturb_score_s2.mean().item():.3f}, "
+                        f"perturb_rvs={perturb_score_rvs.mean().item():.3f}, "
                         f"student-teacher agree={agree_ratio:.3f}"
                     )
 
