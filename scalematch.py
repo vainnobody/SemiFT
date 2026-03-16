@@ -41,11 +41,30 @@ NATURAL_IMAGE_DATASETS = {"pascal", "cityscapes"}
 REMOTE_SENSING_DATASETS = {"iSAID", "vaihingen", "potsdam", "loveda"}
 
 
+class ScaleMatchRemoteSemiDataset(RemoteSemiDataset):
+    """Remote-sensing dataset wrapper with configurable epoch repeat factor.
+
+    The base remote dataset samples randomly in ``__getitem__`` and multiplies
+    ``__len__`` by 50, which makes ScaleMatch epochs prohibitively long because
+    this trainer already performs several heavy forward passes per iteration.
+    We keep the random sampling behavior but use a much smaller configurable
+    repeat factor for the effective epoch length.
+    """
+
+    def __init__(self, *args, epoch_repeat_factor=1, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.epoch_repeat_factor = max(int(epoch_repeat_factor), 1)
+
+    def __len__(self):
+        return len(self.ids) * self.epoch_repeat_factor
+
+
+
 def get_scalematch_dataset_cls(dataset_name):
     if dataset_name in NATURAL_IMAGE_DATASETS:
         return NaturalSemiDataset, "semi"
     if dataset_name in REMOTE_SENSING_DATASETS:
-        return RemoteSemiDataset, "semi_rs"
+        return ScaleMatchRemoteSemiDataset, "semi_rs"
     raise ValueError(
         f"Unsupported dataset for scalematch: {dataset_name}. "
         f"Please register it in NATURAL_IMAGE_DATASETS or REMOTE_SENSING_DATASETS."
@@ -179,7 +198,7 @@ def main(args, cfg):
         device_ids=[local_rank],
         broadcast_buffers=False,
         output_device=local_rank,
-        find_unused_parameters=True,
+        find_unused_parameters=False,
     )
 
     if cfg["criterion"]["name"] == "CELoss":
@@ -201,11 +220,17 @@ def main(args, cfg):
     ).cuda(local_rank)
 
     SemiDataset, dataset_loader_name = get_scalematch_dataset_cls(cfg["dataset"])
+    epoch_repeat_factor = cfg.get("epoch_repeat_factor", 1)
     if rank == 0:
         logger.info(
             f"ScaleMatch dataset loader: {dataset_loader_name} for {cfg['dataset']}"
         )
+        if cfg["dataset"] in REMOTE_SENSING_DATASETS:
+            logger.info(f"ScaleMatch epoch_repeat_factor={epoch_repeat_factor}")
 
+    dataset_kwargs = {}
+    if SemiDataset is ScaleMatchRemoteSemiDataset:
+        dataset_kwargs["epoch_repeat_factor"] = epoch_repeat_factor
     trainset_u = SemiDataset(
         cfg["dataset"],
         cfg["data_root"],
@@ -213,6 +238,7 @@ def main(args, cfg):
         cfg["crop_size"],
         args.unlabeled_id_path,
         ignore_index=ignore_index,
+        **dataset_kwargs,
     )
     trainset_l = SemiDataset(
         cfg["dataset"],
@@ -222,6 +248,7 @@ def main(args, cfg):
         args.labeled_id_path,
         nsample=len(trainset_u.ids),
         ignore_index=ignore_index,
+        **dataset_kwargs,
     )
     val_cfg = dict(cfg)
     val_cfg.setdefault("eval_mode", get_eval_mode(cfg))
@@ -238,7 +265,7 @@ def main(args, cfg):
         trainset_l,
         batch_size=cfg["batch_size"],
         pin_memory=True,
-        num_workers=4,
+        num_workers=cfg.get("workers", 4),
         drop_last=True,
         sampler=trainsampler_l,
     )
@@ -248,7 +275,7 @@ def main(args, cfg):
         trainset_u,
         batch_size=cfg["batch_size"],
         pin_memory=True,
-        num_workers=4,
+        num_workers=cfg.get("workers", 4),
         drop_last=True,
         sampler=trainsampler_u,
     )
@@ -258,7 +285,7 @@ def main(args, cfg):
         valset,
         batch_size=1,
         pin_memory=True,
-        num_workers=1,
+        num_workers=cfg.get("val_workers", 1),
         drop_last=False,
         sampler=valsampler,
     )
@@ -339,7 +366,7 @@ def main(args, cfg):
             cutmix_img_(img_u_s1, img_u_s1_mix, cutmix_box1)
 
             model.eval()
-            with torch.no_grad():
+            with torch.inference_mode():
                 with torch.cuda.amp.autocast(enabled=amp):
                     pred_u_w_mix = model.module(img_u_w_mix, scale_factor=None)
                     if isinstance(pred_u_w_mix, dict):
@@ -451,15 +478,13 @@ def main(args, cfg):
             optimizer.param_groups[0]["lr"] = lr
             optimizer.param_groups[1]["lr"] = lr * cfg["lr_multi"]
 
-            if rank == 0:
+            if (i % log_interval == 0) and (rank == 0):
                 for k, v in log_avg.avgs.items():
                     writer.add_scalar(
                         "train/" + k,
                         v.item() if torch.is_tensor(v) else v,
                         iters,
                     )
-
-            if (i % log_interval == 0) and (rank == 0):
                 logger.info(f"Iters: {i}, " + str(log_avg))
                 log_avg.reset()
 

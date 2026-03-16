@@ -71,6 +71,13 @@ def test_get_scalematch_dataset_cls_rejects_unknown_dataset():
         raise AssertionError("expected ValueError for unknown dataset")
 
 
+def test_scalematch_remote_dataset_wrapper_shortens_epoch_length():
+    ds = scalematch.ScaleMatchRemoteSemiDataset.__new__(scalematch.ScaleMatchRemoteSemiDataset)
+    ds.ids = list(range(7))
+    ds.epoch_repeat_factor = 3
+    assert len(ds) == 21
+
+
 def test_resize_x_keeps_patch_alignment():
     x = torch.randn(2, 3, 65, 97)
     y = scalematch_model.resize_x(x, 1.5, patch_size=16)
@@ -118,7 +125,7 @@ def test_lock_backbone_freezes_parameters(monkeypatch):
 
 def test_scalematch_trainer_uses_safe_ddp_settings():
     source = open("scalematch.py", "r", encoding="utf-8").read()
-    assert "find_unused_parameters=True" in source
+    assert "find_unused_parameters=False" in source
     assert "static_graph=True" not in source
     assert "model.no_sync()" not in source
 
