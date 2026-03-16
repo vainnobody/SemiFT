@@ -130,3 +130,19 @@ def test_scalematch_teacher_pseudo_labels_run_in_eval_block():
     block = source[start:end]
     assert "pred_u_w_mix = model.module" in block
     assert "pred_teacher_for_strong = model.module" in block
+
+
+def test_scalematch_uses_adamw_optimizer():
+    source = open("scalematch.py", "r", encoding="utf-8").read()
+    assert "from torch.optim import AdamW" in source
+    assert "optimizer = AdamW(" in source
+    assert "from torch.optim import SGD" not in source
+
+
+def test_scalematch_logs_backbone_load_result():
+    source = open("scalematch.py", "r", encoding="utf-8").read()
+    assert "backbone_ckpt_path" in source
+    assert 'map_location="cpu"' in source
+    assert "load_result = model.backbone.load_state_dict(state_dict)" in source
+    assert "missing_keys" in source
+    assert "unexpected_keys" in source

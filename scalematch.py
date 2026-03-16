@@ -14,7 +14,7 @@ import time
 import torch
 from torch import nn
 import torch.backends.cudnn as cudnn
-from torch.optim import SGD
+from torch.optim import AdamW
 from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
 import yaml
@@ -120,13 +120,27 @@ def main(args, cfg):
         backbone_version=backbone_version,
     )
 
-    state_dict = torch.load(f'./pretrained/{cfg["backbone"]}.pth')
-    model.backbone.load_state_dict(state_dict)
+    backbone_ckpt_path = f'./pretrained/{cfg["backbone"]}.pth'
+    if rank == 0:
+        logger.info(f"Backbone version: {backbone_version}")
+        logger.info(f"Backbone checkpoint: {backbone_ckpt_path}")
+    state_dict = torch.load(backbone_ckpt_path, map_location="cpu")
+    load_result = model.backbone.load_state_dict(state_dict)
+    if rank == 0:
+        logger.info(
+            "Backbone load result | missing_keys=%d unexpected_keys=%d"
+            % (len(load_result.missing_keys), len(load_result.unexpected_keys))
+        )
+        if load_result.missing_keys:
+            logger.info(f"Missing keys: {load_result.missing_keys}")
+        if load_result.unexpected_keys:
+            logger.info(f"Unexpected keys: {load_result.unexpected_keys}")
+        logger.info(f"Loaded {backbone_version} backbone weights successfully")
 
     if cfg.get("lock_backbone", False):
         model.lock_backbone()
 
-    optimizer = SGD(
+    optimizer = AdamW(
         [
             {
                 "params": [p for p in model.backbone.parameters() if p.requires_grad],
@@ -142,14 +156,18 @@ def main(args, cfg):
             },
         ],
         lr=cfg["lr"],
-        momentum=0.9,
-        weight_decay=1e-4,
+        betas=(0.9, 0.999),
+        weight_decay=0.01,
     )
 
     if rank == 0:
         logger.info("Total params: {:.1f}M".format(count_params(model)))
         logger.info("Encoder params: {:.1f}M".format(count_params(model.backbone)))
         logger.info("Decoder params: {:.1f}M\n".format(count_params(model.head)))
+        logger.info(
+            "Optimizer: AdamW | lr_backbone=%.8f lr_head=%.8f"
+            % (cfg["lr"], cfg["lr"] * cfg["lr_multi"])
+        )
 
     local_rank = int(os.environ["LOCAL_RANK"])
 
@@ -424,6 +442,8 @@ def main(args, cfg):
                     "Loss_u_scale": loss_u_size,
                     "Loss_u_fp": loss_u_w_fp,
                     "Mask_ratio": mask_ratio,
+                    "LR_backbone": optimizer.param_groups[0]["lr"],
+                    "LR_head": optimizer.param_groups[1]["lr"],
                 }
             )
 
