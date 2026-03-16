@@ -336,35 +336,60 @@ def main(args, cfg):
             num_lb = img_x.shape[0]
 
             optimizer.zero_grad()
+            with model.no_sync():
+                with torch.cuda.amp.autocast(enabled=amp):
+                    pred = model(
+                        torch.cat((img_x, img_u_w)),
+                        scale_factor=random_scale,
+                        feature_scale=feature_scale,
+                    )
+
+                    if epoch < warm_up:
+                        pred_u_w = pred["pred_ori"][num_lb:]
+                    else:
+                        pred_u_w = pred["pred_joint"][num_lb:]
+
+                    pred_u_w = pred_u_w.detach()
+                    conf_u_w, mask_u_w = pred_u_w.softmax(dim=1).max(dim=1)
+
+                    mask_u_w_cutmixed1 = cutmix_mask(mask_u_w, mask_u_w_mix, cutmix_box1)
+                    conf_u_w_cutmixed1 = cutmix_mask(conf_u_w, conf_u_w_mix, cutmix_box1)
+                    ignore_mask_cutmixed1 = cutmix_mask(
+                        ignore_mask, ignore_mask_mix, cutmix_box1
+                    )
+
+                    pred_x_joint = pred["pred_joint"][:num_lb]
+                    pred_u_w_scale = pred["pred_size"][num_lb:]
+                    pred_u_w_fp = pred["pred_fp"][num_lb:]
+
+                    loss_x = criterion_l(pred_x_joint, mask_x)
+
+                    loss_u_size = criterion_u(pred_u_w_scale, mask_u_w)
+                    loss_u_size = confidence_weighted_loss(
+                        loss_u_size,
+                        conf_u_w,
+                        ignore_mask,
+                        ignore_index,
+                        conf_thresh=conf_thresh,
+                    )
+
+                    loss_u_w_fp = criterion_u(pred_u_w_fp, mask_u_w)
+                    loss_u_w_fp = confidence_weighted_loss(
+                        loss_u_w_fp,
+                        conf_u_w,
+                        ignore_mask,
+                        ignore_index,
+                        conf_thresh=conf_thresh,
+                    )
+
+                    loss_part1 = (loss_x + 0.25 * loss_u_size + 0.5 * loss_u_w_fp) / 2.0
+
+                scaler.scale(loss_part1).backward()
+
             with torch.cuda.amp.autocast(enabled=amp):
-                pred = model(
-                    torch.cat((img_x, img_u_w)),
-                    scale_factor=random_scale,
-                    feature_scale=feature_scale,
-                )
                 pred_u_s = model(img_u_s1, scale_factor=None)
                 if isinstance(pred_u_s, dict):
                     pred_u_s = pred_u_s["pred_ori"]
-
-                if epoch < warm_up:
-                    pred_u_w = pred["pred_ori"][num_lb:]
-                else:
-                    pred_u_w = pred["pred_joint"][num_lb:]
-
-                pred_u_w = pred_u_w.detach()
-                conf_u_w, mask_u_w = pred_u_w.softmax(dim=1).max(dim=1)
-
-                mask_u_w_cutmixed1 = cutmix_mask(mask_u_w, mask_u_w_mix, cutmix_box1)
-                conf_u_w_cutmixed1 = cutmix_mask(conf_u_w, conf_u_w_mix, cutmix_box1)
-                ignore_mask_cutmixed1 = cutmix_mask(
-                    ignore_mask, ignore_mask_mix, cutmix_box1
-                )
-
-                pred_x_joint = pred["pred_joint"][:num_lb]
-                pred_u_w_scale = pred["pred_size"][num_lb:]
-                pred_u_w_fp = pred["pred_fp"][num_lb:]
-
-                loss_x = criterion_l(pred_x_joint, mask_x)
 
                 loss_u_s1 = criterion_u(pred_u_s, mask_u_w_cutmixed1)
                 loss_u_s1 = confidence_weighted_loss(
@@ -375,24 +400,7 @@ def main(args, cfg):
                     conf_thresh=conf_thresh,
                 )
 
-                loss_u_size = criterion_u(pred_u_w_scale, mask_u_w)
-                loss_u_size = confidence_weighted_loss(
-                    loss_u_size,
-                    conf_u_w,
-                    ignore_mask,
-                    ignore_index,
-                    conf_thresh=conf_thresh,
-                )
-
-                loss_u_w_fp = criterion_u(pred_u_w_fp, mask_u_w)
-                loss_u_w_fp = confidence_weighted_loss(
-                    loss_u_w_fp,
-                    conf_u_w,
-                    ignore_mask,
-                    ignore_index,
-                    conf_thresh=conf_thresh,
-                )
-
+                loss_part2 = (0.25 * loss_u_s1) / 2.0
                 total_loss = (
                     loss_x
                     + 0.25 * loss_u_s1
@@ -400,7 +408,7 @@ def main(args, cfg):
                     + 0.5 * loss_u_w_fp
                 ) / 2.0
 
-            scaler.scale(total_loss).backward()
+            scaler.scale(loss_part2).backward()
             scaler.step(optimizer)
             scaler.update()
 
