@@ -395,8 +395,18 @@ class DPT_ScaleMatch(nn.Module):
         )
 
         if need_fp:
-            # Feature perturbation output
-            feats_fp = self.feature_dropout(feats)
+            feats_fp = feats
+            if feature_scale is not None and feature_scale != 1.0:
+                target_h = max(int(round(feats_fp.shape[-2] * feature_scale)), 1)
+                target_w = max(int(round(feats_fp.shape[-1] * feature_scale)), 1)
+                feats_fp = F.interpolate(
+                    feats_fp,
+                    size=(target_h, target_w),
+                    mode="bilinear",
+                    align_corners=True,
+                )
+
+            feats_fp = self.feature_dropout(feats_fp)
             logits_fp = F.interpolate(
                 self.head.scratch.output_conv(feats_fp),
                 size=x.shape[-2:],
@@ -414,7 +424,7 @@ class DPT_ScaleMatch(nn.Module):
         Args:
             inputs: Input tensor (B, 3, H, W)
             scale_factor: Scale factor for the second scale
-            feature_scale: Feature scale factor (unused in current implementation)
+            feature_scale: Feature scale factor for the feature-perturbation branch
 
         Returns:
             dict with keys: pred_joint, pred_ori, pred_fp, pred_size

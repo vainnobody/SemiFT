@@ -1,8 +1,7 @@
 """
 ScaleMatch: Multi-scale semi-supervised semantic segmentation.
 
-Based on fixmatch.py with ScaleMatch multi-scale training mechanism.
-Combines DPT/UperNet decoder with multi-scale forward pass.
+Ported from the official ScaleMatch training logic onto the SemiFT DPT backbone.
 """
 
 import argparse
@@ -15,7 +14,7 @@ import time
 import torch
 from torch import nn
 import torch.backends.cudnn as cudnn
-from torch.optim import AdamW
+from torch.optim import SGD
 from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
 import yaml
@@ -23,7 +22,7 @@ import yaml
 from dataset.semi_rs import SemiDataset
 from dataset.val import ValDataset
 from model.semseg.dpt_scalematch import DPT_ScaleMatch
-from supervised import evaluate, validation_cpu
+from supervised import validation_cpu
 from util.classes import CLASSES
 from util.ohem import ProbOhemCrossEntropy2d
 from util.focal import FocalLoss
@@ -34,7 +33,6 @@ from util.train_utils import (
     confidence_weighted_loss,
     cutmix_img_,
     cutmix_mask,
-    generate_lambda_schedule,
 )
 
 
@@ -56,8 +54,7 @@ def main(args, cfg):
     logger.propagate = 0
 
     rank, world_size = setup_distributed(port=args.port)
-    # ddp = True if world_size > 1 else False
-    # amp = cfg.get("amp", False)
+    amp = cfg.get("amp", False)
 
     if rank == 0:
         all_args = {**cfg, **vars(args), "ngpus": world_size}
@@ -94,8 +91,6 @@ def main(args, cfg):
 
     backbone_size = cfg["backbone"].split("_")[-1]
     backbone_version = cfg["backbone"].split("_")[0]
-    patch_size = 14 if backbone_version == "dinov2" else 16
-
     # Initialize model
     model = DPT_ScaleMatch(
         **{**model_configs[backbone_size], "nclass": cfg["nclass"]},
@@ -109,8 +104,7 @@ def main(args, cfg):
     if cfg["lock_backbone"]:
         model.lock_backbone()
 
-    # Optimizer - use SGD like original ScaleMatch
-    optimizer = AdamW(
+    optimizer = SGD(
         [
             {
                 "params": [p for p in model.backbone.parameters() if p.requires_grad],
@@ -126,8 +120,8 @@ def main(args, cfg):
             },
         ],
         lr=cfg["lr"],
-        betas=(0.9, 0.999),
-        weight_decay=0.01,
+        momentum=0.9,
+        weight_decay=1e-4,
     )
 
     if rank == 0:
@@ -162,7 +156,9 @@ def main(args, cfg):
             "%s criterion is not implemented" % cfg["criterion"]["name"]
         )
 
-    criterion_u = nn.CrossEntropyLoss(reduction="none").cuda(local_rank)
+    criterion_u = nn.CrossEntropyLoss(
+        reduction="none", ignore_index=cfg.get("ignore_index", 255)
+    ).cuda(local_rank)
 
     # Datasets
     trainset_u = SemiDataset(
@@ -243,7 +239,7 @@ def main(args, cfg):
     epoch = -1
     ETA = 0.0
 
-    # scaler = torch.cuda.amp.GradScaler() if amp else None
+    scaler = torch.cuda.amp.GradScaler(enabled=amp)
 
     # Resume from checkpoint
     if os.path.exists(os.path.join(args.save_path, "latest.pth")):
@@ -260,6 +256,8 @@ def main(args, cfg):
             logger.info("************ Load from checkpoint at epoch %i\n" % epoch)
 
     is_best = False
+    ignore_index = cfg.get("ignore_index", 255)
+
     for epoch in range(epoch + 1, total_epochs):
         start_time = time.time()
 
@@ -279,9 +277,7 @@ def main(args, cfg):
         trainloader_l.sampler.set_epoch(epoch)
         trainloader_u.sampler.set_epoch(epoch)
 
-        # ScaleMatch uses double trainloader_u for mix samples
         loader = zip(trainloader_l, trainloader_u, trainloader_u)
-        current_lambda = generate_lambda_schedule(epoch, total_epochs, warm_up)
 
         model.train()
 
@@ -290,16 +286,13 @@ def main(args, cfg):
             (img_u_w, img_u_s1, _, ignore_mask, cutmix_box1, _),
             (img_u_w_mix, img_u_s1_mix, _, ignore_mask_mix, _, _),
         ) in enumerate(loader):
-
             t0 = time.time()
 
-            # Random scale selection
             random_scale = random.choice(img_scales)
             feature_scale = random.choice(
                 feat_s_scales if random_scale > 1 else feat_l_scales
             )
 
-            # Move to GPU
             img_x, mask_x = img_x.cuda(), mask_x.cuda()
             img_u_w = img_u_w.cuda()
             img_u_s1, ignore_mask = img_u_s1.cuda(), ignore_mask.cuda()
@@ -309,35 +302,30 @@ def main(args, cfg):
             ignore_mask_mix = ignore_mask_mix.cuda()
 
             iters = epoch * len(trainloader_u) + i
-
-            # CutMix images
             cutmix_img_(img_u_s1, img_u_s1_mix, cutmix_box1)
 
-            # Generate pseudo-labels (teacher mode - no gradients)
             model.eval()
             with torch.no_grad():
-                pred_u_w_mix = model(img_u_w_mix, scale_factor=None)
-                if isinstance(pred_u_w_mix, dict):
-                    pred_u_w_mix = pred_u_w_mix["pred_ori"]
-                conf_u_w_mix, mask_u_w_mix = pred_u_w_mix.softmax(dim=1).max(dim=1)
-
+                with torch.cuda.amp.autocast(enabled=amp):
+                    pred_u_w_mix = model(img_u_w_mix, scale_factor=None)
+                    if isinstance(pred_u_w_mix, dict):
+                        pred_u_w_mix = pred_u_w_mix["pred_ori"]
+                    conf_u_w_mix, mask_u_w_mix = pred_u_w_mix.softmax(dim=1).max(dim=1)
             model.train()
 
-            num_lb, num_ulb = img_x.shape[0], img_u_w.shape[0]
+            num_lb = img_x.shape[0]
 
             optimizer.zero_grad()
-
-            # Part 1: Labeled + Weak Unlabeled (No Sync)
-            # Use no_sync to accumulate gradients without communication for the first forward pass
-            with model.no_sync():
-                # Multi-scale forward
+            with torch.cuda.amp.autocast(enabled=amp):
                 pred = model(
                     torch.cat((img_x, img_u_w)),
                     scale_factor=random_scale,
                     feature_scale=feature_scale,
                 )
+                pred_u_s = model(img_u_s1, scale_factor=None)
+                if isinstance(pred_u_s, dict):
+                    pred_u_s = pred_u_s["pred_ori"]
 
-                # Select prediction based on warmup
                 if epoch < warm_up:
                     pred_u_w = pred["pred_ori"][num_lb:]
                 else:
@@ -346,68 +334,62 @@ def main(args, cfg):
                 pred_u_w = pred_u_w.detach()
                 conf_u_w, mask_u_w = pred_u_w.softmax(dim=1).max(dim=1)
 
-                # Supervised loss
-                pred_x_joint = pred["pred_joint"][:num_lb]
-                loss_x = criterion_l(pred_x_joint, mask_x)
+                mask_u_w_cutmixed1 = cutmix_mask(mask_u_w, mask_u_w_mix, cutmix_box1)
+                conf_u_w_cutmixed1 = cutmix_mask(conf_u_w, conf_u_w_mix, cutmix_box1)
+                ignore_mask_cutmixed1 = cutmix_mask(
+                    ignore_mask, ignore_mask_mix, cutmix_box1
+                )
 
-                # Unsupervised losses parts (feature perturbation coverage)
+                pred_x_joint = pred["pred_joint"][:num_lb]
                 pred_u_w_scale = pred["pred_size"][num_lb:]
                 pred_u_w_fp = pred["pred_fp"][num_lb:]
 
-                # Scale loss
+                loss_x = criterion_l(pred_x_joint, mask_x)
+
+                loss_u_s1 = criterion_u(pred_u_s, mask_u_w_cutmixed1)
+                loss_u_s1 = confidence_weighted_loss(
+                    loss_u_s1,
+                    conf_u_w_cutmixed1,
+                    ignore_mask_cutmixed1,
+                    ignore_index,
+                    conf_thresh=conf_thresh,
+                )
+
                 loss_u_size = criterion_u(pred_u_w_scale, mask_u_w)
                 loss_u_size = confidence_weighted_loss(
-                    loss_u_size, conf_u_w, ignore_mask, conf_thresh=conf_thresh
+                    loss_u_size,
+                    conf_u_w,
+                    ignore_mask,
+                    ignore_index,
+                    conf_thresh=conf_thresh,
                 )
 
-                # Feature perturbation loss
                 loss_u_w_fp = criterion_u(pred_u_w_fp, mask_u_w)
                 loss_u_w_fp = confidence_weighted_loss(
-                    loss_u_w_fp, conf_u_w, ignore_mask, conf_thresh=conf_thresh
+                    loss_u_w_fp,
+                    conf_u_w,
+                    ignore_mask,
+                    ignore_index,
+                    conf_thresh=conf_thresh,
                 )
 
-                # Part 1 Loss: (loss_x + 0.25*loss_u_size + 0.5*loss_u_w_fp) / 2.0
-                loss_part1 = (loss_x + 0.25 * loss_u_size + 0.5 * loss_u_w_fp) / 2.0
-                loss_part1.backward()
+                total_loss = (
+                    loss_x
+                    + 0.25 * loss_u_s1
+                    + 0.25 * loss_u_size
+                    + 0.5 * loss_u_w_fp
+                ) / 2.0
 
-            # Part 2: Strong Unlabeled (Sync)
-            # Second forward pass triggers gradient synchronization in its backward
-            pred_u_s = model(img_u_s1, scale_factor=None)
-            if isinstance(pred_u_s, dict):
-                pred_u_s = pred_u_s["pred_ori"]
+            scaler.scale(total_loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
 
-            # CutMix labels
-            mask_u_w_cutmixed1 = cutmix_mask(mask_u_w, mask_u_w_mix, cutmix_box1)
-            conf_u_w_cutmixed1 = cutmix_mask(conf_u_w, conf_u_w_mix, cutmix_box1)
-            ignore_mask_cutmixed1 = cutmix_mask(
-                ignore_mask, ignore_mask_mix, cutmix_box1
-            )
-
-            # Strong augmentation loss
-            loss_u_s1 = criterion_u(pred_u_s, mask_u_w_cutmixed1)
-            loss_u_s1 = confidence_weighted_loss(
-                loss_u_s1,
-                conf_u_w_cutmixed1,
-                ignore_mask_cutmixed1,
-                conf_thresh=conf_thresh,
-            )
-
-            # Part 2 Loss: (0.25 * loss_u_s1) / 2.0
-            # Note: total_loss calculation for logging is reconstructed below
-            loss_part2 = (0.25 * loss_u_s1) / 2.0
-            loss_part2.backward()
-
-            optimizer.step()
-
-            # Reconstruct total loss for logging
-            loss_standard = loss_u_s1 * 0.25 + loss_u_size * 0.25 + loss_u_w_fp * 0.5
-            total_loss = (loss_x + loss_standard) / 2.0
-
+            valid_mask = ignore_mask != ignore_index
             mask_ratio = (
-                (conf_u_w >= conf_thresh) & (ignore_mask != 255)
-            ).sum().item() / (ignore_mask != 255).sum().clamp(min=1.0)
+                ((conf_u_w >= conf_thresh) & valid_mask).sum().float()
+                / valid_mask.sum().clamp(min=1.0)
+            )
 
-            # Logging
             log_avg.update(
                 {
                     "iter_time": time.time() - t0,
@@ -420,22 +402,18 @@ def main(args, cfg):
                 }
             )
 
-            # Learning rate schedule
             lr = cfg["lr"] * (1 - iters / total_iters) ** 0.9
             optimizer.param_groups[0]["lr"] = lr
             optimizer.param_groups[1]["lr"] = lr * cfg["lr_multi"]
 
             if rank == 0:
                 for k, v in log_avg.avgs.items():
-                    if torch.is_tensor(v):
-                        v = v.item()
-                    writer.add_scalar("train/" + k, v, iters)
+                    writer.add_scalar("train/" + k, v.item() if torch.is_tensor(v) else v, iters)
 
             if (i % (len(trainloader_u) // 8) == 0) and (rank == 0):
                 logger.info(f"Iters: {i}, " + str(log_avg))
                 log_avg.reset()
 
-        # Evaluation
         eval_mode = "sliding_window" if cfg["dataset"] == "cityscapes" else "original"
         mIoU, iou_class = validation_cpu(cfg, model, valloader)
 
