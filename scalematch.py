@@ -19,7 +19,8 @@ from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
 import yaml
 
-from dataset.semi_rs import SemiDataset
+from dataset.semi import SemiDataset as NaturalSemiDataset
+from dataset.semi_rs import SemiDataset as RemoteSemiDataset
 from dataset.val import ValDataset
 from model.semseg.dpt_scalematch import DPT_ScaleMatch
 from supervised import validation_cpu
@@ -34,6 +35,21 @@ from util.train_utils import (
     cutmix_img_,
     cutmix_mask,
 )
+
+
+NATURAL_IMAGE_DATASETS = {"pascal", "cityscapes"}
+REMOTE_SENSING_DATASETS = {"iSAID", "vaihingen", "potsdam", "loveda"}
+
+
+def get_scalematch_dataset_cls(dataset_name):
+    if dataset_name in NATURAL_IMAGE_DATASETS:
+        return NaturalSemiDataset, "semi"
+    if dataset_name in REMOTE_SENSING_DATASETS:
+        return RemoteSemiDataset, "semi_rs"
+    raise ValueError(
+        f"Unsupported dataset for scalematch: {dataset_name}. "
+        f"Please register it in NATURAL_IMAGE_DATASETS or REMOTE_SENSING_DATASETS."
+    )
 
 
 def get_parser():
@@ -161,6 +177,10 @@ def main(args, cfg):
     ).cuda(local_rank)
 
     # Datasets
+    SemiDataset, dataset_loader_name = get_scalematch_dataset_cls(cfg["dataset"])
+    if rank == 0:
+        logger.info(f"ScaleMatch dataset loader: {dataset_loader_name} for {cfg['dataset']}")
+
     trainset_u = SemiDataset(
         cfg["dataset"],
         cfg["data_root"],
