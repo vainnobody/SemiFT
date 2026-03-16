@@ -438,6 +438,12 @@ class WarpBlock(nn.Module):
     def forward(self, x, *args, **kwargs):
         return self.base_layer(x, *args, **kwargs) + self.adapter(x)
 
+    def __getattr__(self, name: str):
+        try:
+            return super().__getattr__(name)
+        except AttributeError:
+            return getattr(self.base_layer, name)
+
 
 class AdapterFormer(nn.Module):
     def __init__(

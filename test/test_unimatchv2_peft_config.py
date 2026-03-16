@@ -262,3 +262,15 @@ def test_adaptmodel_skips_non_linear_proj_suffix_matches():
 
     assert isinstance(adapted.model.attn.proj, semift.WarpBlock)
     assert adapted.model.decoder.proj is decoder_proj
+
+
+def test_warpblock_exposes_base_layer_linear_attributes():
+    semift = load_semift_module()
+    import torch.nn as nn
+
+    base = nn.Linear(8, 16)
+    wrapped = semift.WarpBlock(base, semift.Lora(8, 16, r=4, lora_alpha=8))
+
+    assert wrapped.in_features == 8
+    assert wrapped.out_features == 16
+    assert wrapped.weight is base.weight
