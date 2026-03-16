@@ -289,7 +289,7 @@ def main(args, cfg):
         sampler=valsampler,
     )
 
-    img_scales = cfg.get("img_scales", [0.5, 0.75, 1.0, 1.25, 1.5, 2.0])
+    img_scales = cfg.get("img_scales", [0.5, 0.75, 1.0, 1.25])
     feat_s_scales = cfg.get("feat_s_scales", [0.5, 0.75, 1.0])
     feat_l_scales = cfg.get("feat_l_scales", [1.0, 1.25, 1.5])
     conf_thresh = cfg.get("conf_thresh", 0.95)

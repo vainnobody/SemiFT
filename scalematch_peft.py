@@ -106,7 +106,9 @@ def resolve_peft_cfg(cfg, args):
         args.peft_target_modules is not None or "target_modules" in raw_yaml_peft
     )
     if target_modules_from_user:
-        peft_cfg["target_modules"] = _normalize_target_modules(peft_cfg.get("target_modules"))
+        peft_cfg["target_modules"] = _normalize_target_modules(
+            peft_cfg.get("target_modules")
+        )
     else:
         peft_cfg["target_modules"] = list(METHOD_DEFAULT_TARGETS[peft_cfg["method"]])
 
@@ -122,10 +124,26 @@ def apply_peft(model, peft_cfg, cfg):
 
 def build_model(cfg, peft_cfg):
     model_configs = {
-        "small": {"encoder_size": "small", "features": 64, "out_channels": [48, 96, 192, 384]},
-        "base": {"encoder_size": "base", "features": 128, "out_channels": [96, 192, 384, 768]},
-        "large": {"encoder_size": "large", "features": 256, "out_channels": [256, 512, 1024, 1024]},
-        "giant": {"encoder_size": "giant", "features": 384, "out_channels": [1536, 1536, 1536, 1536]},
+        "small": {
+            "encoder_size": "small",
+            "features": 64,
+            "out_channels": [48, 96, 192, 384],
+        },
+        "base": {
+            "encoder_size": "base",
+            "features": 128,
+            "out_channels": [96, 192, 384, 768],
+        },
+        "large": {
+            "encoder_size": "large",
+            "features": 256,
+            "out_channels": [256, 512, 1024, 1024],
+        },
+        "giant": {
+            "encoder_size": "giant",
+            "features": 384,
+            "out_channels": [1536, 1536, 1536, 1536],
+        },
     }
 
     backbone_size = cfg["backbone"].split("_")[-1]
@@ -217,13 +235,15 @@ def main(args, cfg):
         device_ids=[local_rank],
         broadcast_buffers=False,
         output_device=local_rank,
-        find_unused_parameters=False,
+        find_unused_parameters=True,
     )
 
     if cfg["criterion"]["name"] == "CELoss":
         criterion_l = nn.CrossEntropyLoss(**cfg["criterion"]["kwargs"]).cuda(local_rank)
     elif cfg["criterion"]["name"] == "OHEM":
-        criterion_l = ProbOhemCrossEntropy2d(**cfg["criterion"]["kwargs"]).cuda(local_rank)
+        criterion_l = ProbOhemCrossEntropy2d(**cfg["criterion"]["kwargs"]).cuda(
+            local_rank
+        )
     elif cfg["criterion"]["name"] == "FocalLoss":
         criterion_l = FocalLoss(**cfg["criterion"]["kwargs"]).cuda(local_rank)
     else:
@@ -232,12 +252,16 @@ def main(args, cfg):
         )
 
     ignore_index = cfg.get("ignore_index", 255)
-    criterion_u = nn.CrossEntropyLoss(reduction="none", ignore_index=ignore_index).cuda(local_rank)
+    criterion_u = nn.CrossEntropyLoss(reduction="none", ignore_index=ignore_index).cuda(
+        local_rank
+    )
 
     SemiDataset, dataset_loader_name = get_scalematch_dataset_cls(cfg["dataset"])
     epoch_repeat_factor = cfg.get("epoch_repeat_factor", 1)
     if rank == 0:
-        logger.info(f"ScaleMatch dataset loader: {dataset_loader_name} for {cfg['dataset']}")
+        logger.info(
+            f"ScaleMatch dataset loader: {dataset_loader_name} for {cfg['dataset']}"
+        )
         if cfg["dataset"] in REMOTE_SENSING_DATASETS:
             logger.info(f"ScaleMatch epoch_repeat_factor={epoch_repeat_factor}")
 
@@ -245,24 +269,58 @@ def main(args, cfg):
     if SemiDataset is ScaleMatchRemoteSemiDataset:
         dataset_kwargs["epoch_repeat_factor"] = epoch_repeat_factor
     trainset_u = SemiDataset(
-        cfg["dataset"], cfg["data_root"], "train_u", cfg["crop_size"],
-        args.unlabeled_id_path, ignore_index=ignore_index, **dataset_kwargs,
+        cfg["dataset"],
+        cfg["data_root"],
+        "train_u",
+        cfg["crop_size"],
+        args.unlabeled_id_path,
+        ignore_index=ignore_index,
+        **dataset_kwargs,
     )
     trainset_l = SemiDataset(
-        cfg["dataset"], cfg["data_root"], "train_l", cfg["crop_size"],
-        args.labeled_id_path, nsample=len(trainset_u.ids), ignore_index=ignore_index, **dataset_kwargs,
+        cfg["dataset"],
+        cfg["data_root"],
+        "train_l",
+        cfg["crop_size"],
+        args.labeled_id_path,
+        nsample=len(trainset_u.ids),
+        ignore_index=ignore_index,
+        **dataset_kwargs,
     )
     val_cfg = dict(cfg)
     val_cfg.setdefault("eval_mode", get_eval_mode(cfg))
     val_cfg.setdefault("ignore_index", ignore_index)
-    valset = ValDataset(cfg["dataset"], cfg["data_root"], "val", ignore_value=ignore_index)
+    valset = ValDataset(
+        cfg["dataset"], cfg["data_root"], "val", ignore_value=ignore_index
+    )
 
     trainsampler_l = torch.utils.data.distributed.DistributedSampler(trainset_l)
-    trainloader_l = DataLoader(trainset_l, batch_size=cfg["batch_size"], pin_memory=True, num_workers=cfg.get("workers", 4), drop_last=True, sampler=trainsampler_l)
+    trainloader_l = DataLoader(
+        trainset_l,
+        batch_size=cfg["batch_size"],
+        pin_memory=True,
+        num_workers=cfg.get("workers", 4),
+        drop_last=True,
+        sampler=trainsampler_l,
+    )
     trainsampler_u = torch.utils.data.distributed.DistributedSampler(trainset_u)
-    trainloader_u = DataLoader(trainset_u, batch_size=cfg["batch_size"], pin_memory=True, num_workers=cfg.get("workers", 4), drop_last=True, sampler=trainsampler_u)
+    trainloader_u = DataLoader(
+        trainset_u,
+        batch_size=cfg["batch_size"],
+        pin_memory=True,
+        num_workers=cfg.get("workers", 4),
+        drop_last=True,
+        sampler=trainsampler_u,
+    )
     valsampler = torch.utils.data.distributed.DistributedSampler(valset)
-    valloader = DataLoader(valset, batch_size=1, pin_memory=True, num_workers=cfg.get("val_workers", 1), drop_last=False, sampler=valsampler)
+    valloader = DataLoader(
+        valset,
+        batch_size=1,
+        pin_memory=True,
+        num_workers=cfg.get("val_workers", 1),
+        drop_last=False,
+        sampler=valsampler,
+    )
 
     img_scales = cfg.get("img_scales", [0.5, 0.75, 1.0, 1.25, 1.5, 2.0])
     feat_s_scales = cfg.get("feat_s_scales", [0.5, 0.75, 1.0])
@@ -279,7 +337,9 @@ def main(args, cfg):
     scaler = torch.cuda.amp.GradScaler(enabled=amp)
 
     if os.path.exists(os.path.join(args.save_path, "latest.pth")):
-        checkpoint = torch.load(os.path.join(args.save_path, "latest.pth"), map_location="cpu")
+        checkpoint = torch.load(
+            os.path.join(args.save_path, "latest.pth"), map_location="cpu"
+        )
         model.load_state_dict(checkpoint["model"])
         optimizer.load_state_dict(checkpoint["optimizer"])
         epoch = checkpoint["epoch"]
@@ -293,7 +353,11 @@ def main(args, cfg):
         if rank == 0:
             logger.info(
                 "===========> Epoch: {:}, LR: {:.5f}, Previous best: {:.2f} @epoch-{:}, ETA: {:.2f}M".format(
-                    epoch, optimizer.param_groups[0]["lr"], previous_best, best_epoch, eta_seconds / 60
+                    epoch,
+                    optimizer.param_groups[0]["lr"],
+                    previous_best,
+                    best_epoch,
+                    eta_seconds / 60,
                 )
             )
 
@@ -304,10 +368,16 @@ def main(args, cfg):
         model.train()
         log_interval = max(len(trainloader_u) // 8, 1)
 
-        for i, ((img_x, mask_x), (img_u_w, img_u_s1, _, ignore_mask, cutmix_box1, _), (img_u_w_mix, img_u_s1_mix, _, ignore_mask_mix, _, _)) in enumerate(loader):
+        for i, (
+            (img_x, mask_x),
+            (img_u_w, img_u_s1, _, ignore_mask, cutmix_box1, _),
+            (img_u_w_mix, img_u_s1_mix, _, ignore_mask_mix, _, _),
+        ) in enumerate(loader):
             iter_start = time.time()
             random_scale = random.choice(img_scales)
-            feature_scale = random.choice(feat_s_scales if random_scale > 1 else feat_l_scales)
+            feature_scale = random.choice(
+                feat_s_scales if random_scale > 1 else feat_l_scales
+            )
 
             img_x, mask_x = img_x.cuda(), mask_x.cuda()
             img_u_w = img_u_w.cuda()
@@ -328,8 +398,14 @@ def main(args, cfg):
                         pred_u_w_mix = pred_u_w_mix["pred_ori"]
                     conf_u_w_mix, mask_u_w_mix = pred_u_w_mix.softmax(dim=1).max(dim=1)
 
-                    pred_teacher_for_strong = model.module(img_u_w, scale_factor=random_scale, feature_scale=feature_scale)
-                    pred_u_w = pred_teacher_for_strong["pred_ori"] if epoch < warm_up else pred_teacher_for_strong["pred_joint"]
+                    pred_teacher_for_strong = model.module(
+                        img_u_w, scale_factor=random_scale, feature_scale=feature_scale
+                    )
+                    pred_u_w = (
+                        pred_teacher_for_strong["pred_ori"]
+                        if epoch < warm_up
+                        else pred_teacher_for_strong["pred_joint"]
+                    )
                     conf_u_w, mask_u_w = pred_u_w.detach().softmax(dim=1).max(dim=1)
             model.train()
 
@@ -338,7 +414,9 @@ def main(args, cfg):
 
             mask_u_w_cutmixed1 = cutmix_mask(mask_u_w, mask_u_w_mix, cutmix_box1)
             conf_u_w_cutmixed1 = cutmix_mask(conf_u_w, conf_u_w_mix, cutmix_box1)
-            ignore_mask_cutmixed1 = cutmix_mask(ignore_mask, ignore_mask_mix, cutmix_box1)
+            ignore_mask_cutmixed1 = cutmix_mask(
+                ignore_mask, ignore_mask_mix, cutmix_box1
+            )
 
             with torch.cuda.amp.autocast(enabled=amp):
                 pred_u_s = model(img_u_s1, scale_factor=None)
@@ -346,14 +424,26 @@ def main(args, cfg):
                     pred_u_s = pred_u_s["pred_ori"]
                 loss_u_s1 = criterion_u(pred_u_s, mask_u_w_cutmixed1)
                 loss_u_s1 = confidence_weighted_loss(
-                    loss_u_s1, conf_u_w_cutmixed1, ignore_mask_cutmixed1, ignore_index, conf_thresh=conf_thresh
+                    loss_u_s1,
+                    conf_u_w_cutmixed1,
+                    ignore_mask_cutmixed1,
+                    ignore_index,
+                    conf_thresh=conf_thresh,
                 )
                 loss_strong = (0.25 * loss_u_s1) / 2.0
             scaler.scale(loss_strong).backward()
 
             with torch.cuda.amp.autocast(enabled=amp):
-                pred = model(torch.cat((img_x, img_u_w)), scale_factor=random_scale, feature_scale=feature_scale)
-                pred_u_w = pred["pred_ori"][num_lb:] if epoch < warm_up else pred["pred_joint"][num_lb:]
+                pred = model(
+                    torch.cat((img_x, img_u_w)),
+                    scale_factor=random_scale,
+                    feature_scale=feature_scale,
+                )
+                pred_u_w = (
+                    pred["pred_ori"][num_lb:]
+                    if epoch < warm_up
+                    else pred["pred_joint"][num_lb:]
+                )
                 pred_u_w = pred_u_w.detach()
                 conf_u_w, mask_u_w = pred_u_w.softmax(dim=1).max(dim=1)
 
@@ -363,30 +453,48 @@ def main(args, cfg):
 
                 loss_x = criterion_l(pred_x_joint, mask_x)
                 loss_u_size = criterion_u(pred_u_w_scale, mask_u_w)
-                loss_u_size = confidence_weighted_loss(loss_u_size, conf_u_w, ignore_mask, ignore_index, conf_thresh=conf_thresh)
+                loss_u_size = confidence_weighted_loss(
+                    loss_u_size,
+                    conf_u_w,
+                    ignore_mask,
+                    ignore_index,
+                    conf_thresh=conf_thresh,
+                )
                 loss_u_w_fp = criterion_u(pred_u_w_fp, mask_u_w)
-                loss_u_w_fp = confidence_weighted_loss(loss_u_w_fp, conf_u_w, ignore_mask, ignore_index, conf_thresh=conf_thresh)
+                loss_u_w_fp = confidence_weighted_loss(
+                    loss_u_w_fp,
+                    conf_u_w,
+                    ignore_mask,
+                    ignore_index,
+                    conf_thresh=conf_thresh,
+                )
 
                 loss_main = (loss_x + 0.25 * loss_u_size + 0.5 * loss_u_w_fp) / 2.0
-                total_loss = (loss_x + 0.25 * loss_u_s1 + 0.25 * loss_u_size + 0.5 * loss_u_w_fp) / 2.0
+                total_loss = (
+                    loss_x + 0.25 * loss_u_s1 + 0.25 * loss_u_size + 0.5 * loss_u_w_fp
+                ) / 2.0
 
             scaler.scale(loss_main).backward()
             scaler.step(optimizer)
             scaler.update()
 
             valid_mask = ignore_mask != ignore_index
-            mask_ratio = (((conf_u_w >= conf_thresh) & valid_mask).sum().float() / valid_mask.sum().clamp(min=1.0))
-            log_avg.update({
-                "iter_time": time.time() - iter_start,
-                "Total_loss": total_loss,
-                "Loss_x": loss_x,
-                "Loss_u_s": loss_u_s1,
-                "Loss_u_scale": loss_u_size,
-                "Loss_u_fp": loss_u_w_fp,
-                "Mask_ratio": mask_ratio,
-                "LR_backbone": optimizer.param_groups[0]["lr"],
-                "LR_head": optimizer.param_groups[1]["lr"],
-            })
+            mask_ratio = (
+                (conf_u_w >= conf_thresh) & valid_mask
+            ).sum().float() / valid_mask.sum().clamp(min=1.0)
+            log_avg.update(
+                {
+                    "iter_time": time.time() - iter_start,
+                    "Total_loss": total_loss,
+                    "Loss_x": loss_x,
+                    "Loss_u_s": loss_u_s1,
+                    "Loss_u_scale": loss_u_size,
+                    "Loss_u_fp": loss_u_w_fp,
+                    "Mask_ratio": mask_ratio,
+                    "LR_backbone": optimizer.param_groups[0]["lr"],
+                    "LR_head": optimizer.param_groups[1]["lr"],
+                }
+            )
 
             lr = cfg["lr"] * (1 - iters / total_iters) ** 0.9
             optimizer.param_groups[0]["lr"] = lr
@@ -394,7 +502,9 @@ def main(args, cfg):
 
             if (i % log_interval == 0) and (rank == 0):
                 for k, v in log_avg.avgs.items():
-                    writer.add_scalar("train/" + k, v.item() if torch.is_tensor(v) else v, iters)
+                    writer.add_scalar(
+                        "train/" + k, v.item() if torch.is_tensor(v) else v, iters
+                    )
                 logger.info(f"Iters: {i}, " + str(log_avg))
                 log_avg.reset()
 
@@ -404,12 +514,20 @@ def main(args, cfg):
         if rank == 0:
             for cls_idx, iou in enumerate(iou_class):
                 logger.info(
-                    "***** Evaluation ***** >>>> Class [{:} {:}] IoU: {:.2f}".format(cls_idx, CLASSES[cfg["dataset"]][cls_idx], iou)
+                    "***** Evaluation ***** >>>> Class [{:} {:}] IoU: {:.2f}".format(
+                        cls_idx, CLASSES[cfg["dataset"]][cls_idx], iou
+                    )
                 )
-            logger.info("***** Evaluation {} ***** >>>> MeanIoU: {:.2f}\n".format(eval_mode, mIoU))
+            logger.info(
+                "***** Evaluation {} ***** >>>> MeanIoU: {:.2f}\n".format(
+                    eval_mode, mIoU
+                )
+            )
             writer.add_scalar("eval/mIoU", mIoU, epoch)
             for i, iou in enumerate(iou_class):
-                writer.add_scalar("eval/%s_IoU" % CLASSES[cfg["dataset"]][i], iou, epoch)
+                writer.add_scalar(
+                    "eval/%s_IoU" % CLASSES[cfg["dataset"]][i], iou, epoch
+                )
 
         is_best = mIoU > previous_best
         previous_best = max(mIoU, previous_best)
