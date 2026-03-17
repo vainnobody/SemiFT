@@ -134,6 +134,17 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         default=None,
         help="Stop watch mode after this many consecutive polls with no new jobs.",
     )
+    parser.add_argument(
+        "--wait-for-gpu",
+        action="store_true",
+        help="Before launching each job, wait until all specified GPUs are idle.",
+    )
+    parser.add_argument(
+        "--gpu-poll-seconds",
+        type=float,
+        default=30.0,
+        help="Polling interval in seconds while waiting for GPUs to become idle.",
+    )
     return parser.parse_args(argv)
 
 
@@ -467,6 +478,142 @@ def merged_env(global_env: Dict[str, str], job_env: Dict[str, str]) -> Dict[str,
     return env
 
 
+def append_runner_log(log_path: Path, message: str) -> None:
+    with log_path.open("a", encoding="utf-8") as handle:
+        handle.write(message.rstrip() + "\n")
+
+
+def parse_target_gpu_tokens(env: Dict[str, str], nproc_per_node: int) -> List[str]:
+    raw = env.get("CUDA_VISIBLE_DEVICES", "").strip()
+    if raw:
+        return [token.strip() for token in raw.split(",") if token.strip()]
+    return [str(index) for index in range(nproc_per_node)]
+
+
+def run_capture(command: Sequence[str]) -> str:
+    completed = subprocess.run(
+        list(command),
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    return completed.stdout
+
+
+def query_gpu_inventory() -> List[Dict[str, Any]]:
+    gpu_output = run_capture(
+        [
+            "nvidia-smi",
+            "--query-gpu=index,uuid,memory.used,utilization.gpu",
+            "--format=csv,noheader,nounits",
+        ]
+    )
+    process_output = run_capture(
+        [
+            "nvidia-smi",
+            "--query-compute-apps=gpu_uuid,pid",
+            "--format=csv,noheader,nounits",
+        ]
+    )
+
+    active_uuids: Set[str] = set()
+    for line in process_output.splitlines():
+        if not line.strip():
+            continue
+        parts = [part.strip() for part in line.split(",")]
+        if parts and parts[0]:
+            active_uuids.add(parts[0])
+
+    inventory: List[Dict[str, Any]] = []
+    for line in gpu_output.splitlines():
+        if not line.strip():
+            continue
+        parts = [part.strip() for part in line.split(",")]
+        if len(parts) != 4:
+            raise ManifestError(f"Unexpected nvidia-smi GPU row: {line}")
+        inventory.append(
+            {
+                "index": int(parts[0]),
+                "uuid": parts[1],
+                "memory_used_mb": int(parts[2]),
+                "utilization_gpu": int(parts[3]),
+                "has_compute_process": parts[1] in active_uuids,
+            }
+        )
+    return inventory
+
+
+def resolve_target_gpus(env: Dict[str, str], nproc_per_node: int) -> List[Dict[str, Any]]:
+    inventory = query_gpu_inventory()
+    by_index = {str(gpu["index"]): gpu for gpu in inventory}
+    by_uuid = {gpu["uuid"]: gpu for gpu in inventory}
+
+    targets: List[Dict[str, Any]] = []
+    for token in parse_target_gpu_tokens(env, nproc_per_node):
+        gpu = by_index.get(token) or by_uuid.get(token)
+        if gpu is None:
+            known = ", ".join(sorted(by_index))
+            raise ManifestError(
+                f"Requested GPU '{token}' was not found in nvidia-smi inventory. Known GPU indices: {known}"
+            )
+        targets.append(gpu)
+    return targets
+
+
+def gpu_is_idle(gpu: Dict[str, Any]) -> bool:
+    return (
+        not gpu["has_compute_process"]
+        and gpu["memory_used_mb"] == 0
+        and gpu["utilization_gpu"] == 0
+    )
+
+
+def wait_for_job_gpus(
+    *,
+    manifest: BatchManifest,
+    job: BatchJob,
+    env: Dict[str, str],
+    log_path: Path,
+    poll_seconds: float,
+) -> None:
+    if poll_seconds < 0:
+        raise ManifestError("--gpu-poll-seconds must be >= 0.")
+
+    target_tokens = parse_target_gpu_tokens(env, manifest.global_config.nproc_per_node)
+    announced = False
+    while True:
+        try:
+            target_gpus = resolve_target_gpus(env, manifest.global_config.nproc_per_node)
+        except subprocess.CalledProcessError as exc:
+            raise ManifestError(
+                f"Failed to query GPU state with nvidia-smi before launching job '{job.name}': {exc}"
+            ) from exc
+        except FileNotFoundError as exc:
+            raise ManifestError(
+                "nvidia-smi was not found, so --wait-for-gpu cannot be used on this machine."
+            ) from exc
+
+        busy_gpus = [gpu for gpu in target_gpus if not gpu_is_idle(gpu)]
+        if not busy_gpus:
+            if announced:
+                append_runner_log(
+                    log_path,
+                    f"[batch_runner] GPUs ready for {job.name}: {', '.join(target_tokens)}",
+                )
+            return
+
+        busy_desc = ", ".join(
+            f"{gpu['index']}(mem={gpu['memory_used_mb']}MB,util={gpu['utilization_gpu']}%,proc={int(gpu['has_compute_process'])})"
+            for gpu in busy_gpus
+        )
+        append_runner_log(
+            log_path,
+            f"[batch_runner] waiting for GPUs before {job.name}: {busy_desc}; sleep {poll_seconds}s",
+        )
+        announced = True
+        time.sleep(poll_seconds)
+
+
 def run_subprocess(
     command: Sequence[str],
     *,
@@ -522,9 +669,13 @@ def print_job_banner(log_path: Path, *, job: BatchJob, command: Sequence[str], a
     ]
     with log_path.open("a", encoding="utf-8") as handle:
         handle.write("\n".join(lines))
-
-
-def execute_job(manifest: BatchManifest, job: BatchJob) -> Dict[str, Any]:
+def execute_job(
+    manifest: BatchManifest,
+    job: BatchJob,
+    *,
+    wait_for_gpu: bool = False,
+    gpu_poll_seconds: float = 30.0,
+) -> Dict[str, Any]:
     materialize_job_config(job)
     command = build_job_command(manifest, job)
     log_path = prepare_log_file(job)
@@ -551,6 +702,14 @@ def execute_job(manifest: BatchManifest, job: BatchJob) -> Dict[str, Any]:
         }
 
     env = merged_env(manifest.global_config.env, job.env)
+    if wait_for_gpu:
+        wait_for_job_gpus(
+            manifest=manifest,
+            job=job,
+            env=env,
+            log_path=log_path,
+            poll_seconds=gpu_poll_seconds,
+        )
     started_at = utc_now_iso()
     attempts = 0
     exit_code = 1
@@ -689,7 +848,13 @@ def reload_manifest_for_watch(
     )
 
 
-def run_batch(manifest: BatchManifest, *, dry_run: bool = False) -> Dict[str, Any]:
+def run_batch(
+    manifest: BatchManifest,
+    *,
+    dry_run: bool = False,
+    wait_for_gpu: bool = False,
+    gpu_poll_seconds: float = 30.0,
+) -> Dict[str, Any]:
     if dry_run:
         print_dry_run(manifest)
         return {
@@ -701,7 +866,12 @@ def run_batch(manifest: BatchManifest, *, dry_run: bool = False) -> Dict[str, An
 
     results: List[Dict[str, Any]] = []
     for job in manifest.jobs:
-        result = execute_job(manifest, job)
+        result = execute_job(
+            manifest,
+            job,
+            wait_for_gpu=wait_for_gpu,
+            gpu_poll_seconds=gpu_poll_seconds,
+        )
         results.append(result)
         if result["status"] == "failed" and not manifest.global_config.continue_on_error:
             break
@@ -719,11 +889,15 @@ def run_batch_watch(
     only_names: Optional[Set[str]] = None,
     poll_seconds: float = 30.0,
     max_idle_polls: Optional[int] = None,
+    wait_for_gpu: bool = False,
+    gpu_poll_seconds: float = 30.0,
 ) -> Dict[str, Any]:
     if poll_seconds < 0:
         raise ManifestError("--poll-seconds must be >= 0.")
     if max_idle_polls is not None and max_idle_polls < 0:
         raise ManifestError("--max-idle-polls must be >= 0.")
+    if gpu_poll_seconds < 0:
+        raise ManifestError("--gpu-poll-seconds must be >= 0.")
 
     manifest = reload_manifest_for_watch(
         manifest_path,
@@ -752,7 +926,12 @@ def run_batch_watch(
                 jobs=pending_jobs,
             )
             for job in pending_jobs:
-                result = execute_job(pending_manifest, job)
+                result = execute_job(
+                    pending_manifest,
+                    job,
+                    wait_for_gpu=wait_for_gpu,
+                    gpu_poll_seconds=gpu_poll_seconds,
+                )
                 results.append(result)
                 processed_names.add(job.name)
                 summary = build_summary_payload(
@@ -802,6 +981,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 only_names=only_names,
                 poll_seconds=args.poll_seconds,
                 max_idle_polls=args.max_idle_polls,
+                wait_for_gpu=args.wait_for_gpu,
+                gpu_poll_seconds=args.gpu_poll_seconds,
             )
         else:
             manifest = load_manifest(
@@ -809,7 +990,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 save_root_override=save_root_override,
                 only_names=only_names,
             )
-            summary = run_batch(manifest, dry_run=args.dry_run)
+            summary = run_batch(
+                manifest,
+                dry_run=args.dry_run,
+                wait_for_gpu=args.wait_for_gpu,
+                gpu_poll_seconds=args.gpu_poll_seconds,
+            )
     except ManifestError as exc:
         print(f"Manifest error: {exc}", file=sys.stderr)
         return 2

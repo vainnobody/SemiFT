@@ -11,7 +11,9 @@ from util.batch_runner import (
     ManifestError,
     build_job_command,
     effective_config_path,
+    gpu_is_idle,
     load_manifest,
+    parse_target_gpu_tokens,
     run_batch,
     run_batch_watch,
 )
@@ -88,6 +90,97 @@ class BatchTrainRunnerTest(unittest.TestCase):
 
         with self.assertRaises(ManifestError):
             load_manifest(bad_manifest)
+
+    def test_parse_target_gpu_tokens_prefers_cuda_visible_devices(self):
+        env = {"CUDA_VISIBLE_DEVICES": "3, 5"}
+        self.assertEqual(parse_target_gpu_tokens(env, 2), ["3", "5"])
+        self.assertEqual(parse_target_gpu_tokens({}, 2), ["0", "1"])
+
+    def test_gpu_idle_requires_zero_mem_zero_util_and_no_process(self):
+        self.assertTrue(
+            gpu_is_idle(
+                {
+                    "has_compute_process": False,
+                    "memory_used_mb": 0,
+                    "utilization_gpu": 0,
+                }
+            )
+        )
+        self.assertFalse(
+            gpu_is_idle(
+                {
+                    "has_compute_process": True,
+                    "memory_used_mb": 0,
+                    "utilization_gpu": 0,
+                }
+            )
+        )
+        self.assertFalse(
+            gpu_is_idle(
+                {
+                    "has_compute_process": False,
+                    "memory_used_mb": 1,
+                    "utilization_gpu": 0,
+                }
+            )
+        )
+
+    def test_run_batch_waits_until_specified_gpus_are_idle(self):
+        manifest_payload = yaml.safe_load(self.manifest_path.read_text(encoding="utf-8"))
+        manifest_payload["global"]["env"] = {"CUDA_VISIBLE_DEVICES": "4"}
+        manifest_payload["jobs"] = [manifest_payload["jobs"][0]]
+        self.manifest_path.write_text(yaml.safe_dump(manifest_payload), encoding="utf-8")
+        manifest = load_manifest(self.manifest_path)
+
+        gpu_snapshots = [
+            [
+                {
+                    "index": 4,
+                    "uuid": "GPU-4",
+                    "memory_used_mb": 128,
+                    "utilization_gpu": 75,
+                    "has_compute_process": True,
+                }
+            ],
+            [
+                {
+                    "index": 4,
+                    "uuid": "GPU-4",
+                    "memory_used_mb": 0,
+                    "utilization_gpu": 0,
+                    "has_compute_process": False,
+                }
+            ],
+        ]
+        sleeps = []
+        launches = []
+
+        def fake_resolve(_env, _nproc):
+            return gpu_snapshots.pop(0)
+
+        def fake_sleep(seconds):
+            sleeps.append(seconds)
+
+        def fake_run(command, *, cwd, env, log_path):
+            launches.append((command, env.get("CUDA_VISIBLE_DEVICES"), Path(log_path)))
+            return 0
+
+        with mock.patch("util.batch_runner.resolve_target_gpus", side_effect=fake_resolve):
+            with mock.patch("util.batch_runner.time.sleep", side_effect=fake_sleep):
+                with mock.patch("util.batch_runner.run_subprocess", side_effect=fake_run):
+                    summary = run_batch(
+                        manifest,
+                        wait_for_gpu=True,
+                        gpu_poll_seconds=7,
+                    )
+
+        self.assertEqual(sleeps, [7])
+        self.assertEqual(len(launches), 1)
+        self.assertEqual(launches[0][1], "4")
+        self.assertEqual(summary["results"][0]["status"], "succeeded")
+        log_text = launches[0][2].read_text(encoding="utf-8")
+        self.assertIn("waiting for GPUs before job_a", log_text)
+        self.assertIn("GPUs ready for job_a", log_text)
 
     def test_run_batch_materializes_overridden_config_and_marks_done(self):
         manifest = load_manifest(self.manifest_path, only_names={"job_a"})
