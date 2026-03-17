@@ -334,6 +334,35 @@ jobs:
 
 完整示例见：`manifests/batch_jobs.example.yaml`。
 
+GPU 分配支持两种模式：
+
+- **固定 GPU 模式**：在 `global.env` 或 `job.env` 中显式设置 `CUDA_VISIBLE_DEVICES`
+- **动态 GPU 模式**：不设置 `CUDA_VISIBLE_DEVICES`，并在启动时加 `--wait-for-gpu`
+  - 此时 `nproc_per_node` 会被视为该任务需要的 GPU 数量
+  - runner 会持续轮询 `nvidia-smi`
+  - 一旦检测到至少 `nproc_per_node` 张空闲卡，就自动挑选这些空闲卡启动训练
+
+例如，如果你想“谁空闲就用谁”，并且一次需要 6 张卡，可以这样写：
+
+```yaml
+global:
+  nproc_per_node: 6
+  save_root: experiments/batch_runs
+  port_base: 29500
+  continue_on_error: true
+  max_retries: 1
+```
+
+然后运行：
+
+```bash
+python scripts/batch_train.py \
+  --manifest manifests/batch_jobs.example.yaml \
+  --wait-for-gpu
+```
+
+这时 runner 会等到任意 6 张 GPU 同时空闲，再把它们写入该 job 的 `CUDA_VISIBLE_DEVICES` 后启动。
+
 如果你不想为每个实验复制一份 YAML，可以直接在 job 里写 `config_overrides`。runner 会在运行前基于原始 `config` 递归合并这些字段，并自动生成一个临时 config，例如：
 
 ```yaml
@@ -376,6 +405,17 @@ python scripts/batch_train.py \
   --manifest manifests/batch_jobs.example.yaml \
   --save-root /tmp/semift_batch_runs
 ```
+
+等待指定 GPU 或自动选择空闲 GPU：
+
+```bash
+python scripts/batch_train.py \
+  --manifest manifests/batch_jobs.example.yaml \
+  --wait-for-gpu
+```
+
+- 如果 manifest 中设置了 `CUDA_VISIBLE_DEVICES`，则等待这些指定 GPU 全部空闲
+- 如果没有设置 `CUDA_VISIBLE_DEVICES`，则动态挑选 `nproc_per_node` 张空闲 GPU
 
 ---
 

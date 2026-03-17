@@ -179,8 +179,69 @@ class BatchTrainRunnerTest(unittest.TestCase):
         self.assertEqual(launches[0][1], "4")
         self.assertEqual(summary["results"][0]["status"], "succeeded")
         log_text = launches[0][2].read_text(encoding="utf-8")
+        self.assertIn("GPU mode for job_a: fixed (4)", log_text)
         self.assertIn("waiting for GPUs before job_a", log_text)
         self.assertIn("GPUs ready for job_a", log_text)
+
+    def test_run_batch_waits_for_dynamic_idle_gpu_pool_and_sets_cuda_visible_devices(self):
+        manifest_payload = yaml.safe_load(self.manifest_path.read_text(encoding="utf-8"))
+        manifest_payload["global"]["nproc_per_node"] = 6
+        manifest_payload["jobs"] = [manifest_payload["jobs"][0]]
+        self.manifest_path.write_text(yaml.safe_dump(manifest_payload), encoding="utf-8")
+        manifest = load_manifest(self.manifest_path)
+
+        gpu_snapshots = [
+            [
+                {"index": 7, "uuid": "GPU-7", "memory_used_mb": 0, "utilization_gpu": 0, "has_compute_process": False},
+                {"index": 2, "uuid": "GPU-2", "memory_used_mb": 0, "utilization_gpu": 0, "has_compute_process": False},
+                {"index": 6, "uuid": "GPU-6", "memory_used_mb": 0, "utilization_gpu": 0, "has_compute_process": False},
+                {"index": 5, "uuid": "GPU-5", "memory_used_mb": 0, "utilization_gpu": 0, "has_compute_process": False},
+                {"index": 1, "uuid": "GPU-1", "memory_used_mb": 32, "utilization_gpu": 55, "has_compute_process": True},
+                {"index": 3, "uuid": "GPU-3", "memory_used_mb": 64, "utilization_gpu": 70, "has_compute_process": True},
+                {"index": 4, "uuid": "GPU-4", "memory_used_mb": 8, "utilization_gpu": 10, "has_compute_process": True},
+                {"index": 0, "uuid": "GPU-0", "memory_used_mb": 0, "utilization_gpu": 90, "has_compute_process": True},
+            ],
+            [
+                {"index": 7, "uuid": "GPU-7", "memory_used_mb": 0, "utilization_gpu": 0, "has_compute_process": False},
+                {"index": 2, "uuid": "GPU-2", "memory_used_mb": 0, "utilization_gpu": 0, "has_compute_process": False},
+                {"index": 6, "uuid": "GPU-6", "memory_used_mb": 0, "utilization_gpu": 0, "has_compute_process": False},
+                {"index": 5, "uuid": "GPU-5", "memory_used_mb": 0, "utilization_gpu": 0, "has_compute_process": False},
+                {"index": 1, "uuid": "GPU-1", "memory_used_mb": 0, "utilization_gpu": 0, "has_compute_process": False},
+                {"index": 3, "uuid": "GPU-3", "memory_used_mb": 0, "utilization_gpu": 0, "has_compute_process": False},
+                {"index": 4, "uuid": "GPU-4", "memory_used_mb": 16, "utilization_gpu": 5, "has_compute_process": True},
+                {"index": 0, "uuid": "GPU-0", "memory_used_mb": 12, "utilization_gpu": 8, "has_compute_process": True},
+            ],
+        ]
+        sleeps = []
+        launches = []
+
+        def fake_query():
+            return gpu_snapshots.pop(0)
+
+        def fake_sleep(seconds):
+            sleeps.append(seconds)
+
+        def fake_run(command, *, cwd, env, log_path):
+            launches.append((command, env.get("CUDA_VISIBLE_DEVICES"), Path(log_path)))
+            return 0
+
+        with mock.patch("util.batch_runner.query_gpu_inventory", side_effect=fake_query):
+            with mock.patch("util.batch_runner.time.sleep", side_effect=fake_sleep):
+                with mock.patch("util.batch_runner.run_subprocess", side_effect=fake_run):
+                    summary = run_batch(
+                        manifest,
+                        wait_for_gpu=True,
+                        gpu_poll_seconds=5,
+                    )
+
+        self.assertEqual(sleeps, [5])
+        self.assertEqual(len(launches), 1)
+        self.assertEqual(launches[0][1], "1,2,3,5,6,7")
+        self.assertEqual(summary["results"][0]["status"], "succeeded")
+        log_text = launches[0][2].read_text(encoding="utf-8")
+        self.assertIn("GPU mode for job_a: dynamic (need 6 idle GPUs)", log_text)
+        self.assertIn("waiting for 6 idle GPUs before job_a: idle=4 (2, 5, 6, 7); sleep 5s", log_text)
+        self.assertIn("selected GPUs for job_a: 1, 2, 3, 5, 6, 7", log_text)
 
     def test_run_batch_materializes_overridden_config_and_marks_done(self):
         manifest = load_manifest(self.manifest_path, only_names={"job_a"})
@@ -317,6 +378,40 @@ class BatchTrainRunnerTest(unittest.TestCase):
         self.assertEqual(calls, ["job_a"])
         self.assertEqual(len(summary["results"]), 1)
         self.assertEqual(summary["results"][0]["name"], "job_a")
+
+    def test_run_batch_watch_uses_dynamic_gpu_selection_for_new_jobs(self):
+        manifest_payload = yaml.safe_load(self.manifest_path.read_text(encoding="utf-8"))
+        manifest_payload["global"]["nproc_per_node"] = 2
+        manifest_payload["jobs"] = [manifest_payload["jobs"][0]]
+        self.manifest_path.write_text(
+            yaml.safe_dump(manifest_payload), encoding="utf-8"
+        )
+
+        launches = []
+
+        def fake_query():
+            return [
+                {"index": 5, "uuid": "GPU-5", "memory_used_mb": 0, "utilization_gpu": 0, "has_compute_process": False},
+                {"index": 3, "uuid": "GPU-3", "memory_used_mb": 0, "utilization_gpu": 0, "has_compute_process": False},
+                {"index": 0, "uuid": "GPU-0", "memory_used_mb": 32, "utilization_gpu": 60, "has_compute_process": True},
+            ]
+
+        def fake_run(command, *, cwd, env, log_path):
+            launches.append((Path(log_path).parent.name, env.get("CUDA_VISIBLE_DEVICES")))
+            return 0
+
+        with mock.patch("util.batch_runner.query_gpu_inventory", side_effect=fake_query):
+            with mock.patch("util.batch_runner.run_subprocess", side_effect=fake_run):
+                summary = run_batch_watch(
+                    manifest_path=self.manifest_path,
+                    poll_seconds=0,
+                    max_idle_polls=1,
+                    wait_for_gpu=True,
+                    gpu_poll_seconds=0,
+                )
+
+        self.assertEqual(launches, [("job_a", "3,5")])
+        self.assertEqual(summary["results"][0]["status"], "succeeded")
 
 
 if __name__ == "__main__":

@@ -483,6 +483,10 @@ def append_runner_log(log_path: Path, message: str) -> None:
         handle.write(message.rstrip() + "\n")
 
 
+def has_explicit_cuda_visible_devices(env: Dict[str, str]) -> bool:
+    return bool(env.get("CUDA_VISIBLE_DEVICES", "").strip())
+
+
 def parse_target_gpu_tokens(env: Dict[str, str], nproc_per_node: int) -> List[str]:
     raw = env.get("CUDA_VISIBLE_DEVICES", "").strip()
     if raw:
@@ -568,19 +572,82 @@ def gpu_is_idle(gpu: Dict[str, Any]) -> bool:
     )
 
 
-def wait_for_job_gpus(
+def format_gpu_state(gpu: Dict[str, Any]) -> str:
+    return (
+        f"{gpu['index']}(mem={gpu['memory_used_mb']}MB,"
+        f"util={gpu['utilization_gpu']}%,proc={int(gpu['has_compute_process'])})"
+    )
+
+
+def select_idle_gpus(inventory: Sequence[Dict[str, Any]], required_count: int) -> List[Dict[str, Any]]:
+    idle_gpus = sorted(
+        [gpu for gpu in inventory if gpu_is_idle(gpu)],
+        key=lambda gpu: gpu["index"],
+    )
+    return idle_gpus[:required_count]
+
+
+def prepare_job_gpu_env(
     *,
     manifest: BatchManifest,
     job: BatchJob,
     env: Dict[str, str],
     log_path: Path,
     poll_seconds: float,
-) -> None:
+) -> Dict[str, str]:
     if poll_seconds < 0:
         raise ManifestError("--gpu-poll-seconds must be >= 0.")
 
+    if not has_explicit_cuda_visible_devices(env):
+        required_count = manifest.global_config.nproc_per_node
+        append_runner_log(
+            log_path,
+            f"[batch_runner] GPU mode for {job.name}: dynamic (need {required_count} idle GPUs)",
+        )
+        while True:
+            try:
+                inventory = query_gpu_inventory()
+            except subprocess.CalledProcessError as exc:
+                raise ManifestError(
+                    f"Failed to query GPU state with nvidia-smi before launching job '{job.name}': {exc}"
+                ) from exc
+            except FileNotFoundError as exc:
+                raise ManifestError(
+                    "nvidia-smi was not found, so --wait-for-gpu cannot be used on this machine."
+                ) from exc
+
+            idle_gpus = select_idle_gpus(inventory, required_count)
+            if len(idle_gpus) >= required_count:
+                selected_tokens = [str(gpu["index"]) for gpu in idle_gpus]
+                selected_env = dict(env)
+                selected_env["CUDA_VISIBLE_DEVICES"] = ",".join(selected_tokens)
+                append_runner_log(
+                    log_path,
+                    f"[batch_runner] selected GPUs for {job.name}: {', '.join(selected_tokens)}",
+                )
+                return selected_env
+
+            idle_tokens = [
+                str(gpu["index"])
+                for gpu in sorted(
+                    [gpu for gpu in inventory if gpu_is_idle(gpu)],
+                    key=lambda gpu: gpu["index"],
+                )
+            ]
+            append_runner_log(
+                log_path,
+                f"[batch_runner] waiting for {required_count} idle GPUs before {job.name}: "
+                f"idle={len(idle_tokens)}"
+                + (f" ({', '.join(idle_tokens)})" if idle_tokens else "")
+                + f"; sleep {poll_seconds}s",
+            )
+            time.sleep(poll_seconds)
+
     target_tokens = parse_target_gpu_tokens(env, manifest.global_config.nproc_per_node)
-    announced = False
+    append_runner_log(
+        log_path,
+        f"[batch_runner] GPU mode for {job.name}: fixed ({', '.join(target_tokens)})",
+    )
     while True:
         try:
             target_gpus = resolve_target_gpus(env, manifest.global_config.nproc_per_node)
@@ -595,22 +662,23 @@ def wait_for_job_gpus(
 
         busy_gpus = [gpu for gpu in target_gpus if not gpu_is_idle(gpu)]
         if not busy_gpus:
-            if announced:
-                append_runner_log(
-                    log_path,
-                    f"[batch_runner] GPUs ready for {job.name}: {', '.join(target_tokens)}",
-                )
-            return
+            append_runner_log(
+                log_path,
+                f"[batch_runner] GPUs ready for {job.name}: {', '.join(target_tokens)}",
+            )
+            return env
 
-        busy_desc = ", ".join(
-            f"{gpu['index']}(mem={gpu['memory_used_mb']}MB,util={gpu['utilization_gpu']}%,proc={int(gpu['has_compute_process'])})"
-            for gpu in busy_gpus
+        busy_desc = ", ".join(format_gpu_state(gpu) for gpu in busy_gpus)
+        idle_desc = ", ".join(
+            str(gpu["index"]) for gpu in target_gpus if gpu_is_idle(gpu)
         )
         append_runner_log(
             log_path,
-            f"[batch_runner] waiting for GPUs before {job.name}: {busy_desc}; sleep {poll_seconds}s",
+            f"[batch_runner] waiting for GPUs before {job.name}: "
+            f"busy={busy_desc}"
+            + (f"; idle={idle_desc}" if idle_desc else "")
+            + f"; sleep {poll_seconds}s",
         )
-        announced = True
         time.sleep(poll_seconds)
 
 
@@ -669,6 +737,8 @@ def print_job_banner(log_path: Path, *, job: BatchJob, command: Sequence[str], a
     ]
     with log_path.open("a", encoding="utf-8") as handle:
         handle.write("\n".join(lines))
+
+
 def execute_job(
     manifest: BatchManifest,
     job: BatchJob,
@@ -701,12 +771,13 @@ def execute_job(
             "ended_at": utc_now_iso(),
         }
 
-    env = merged_env(manifest.global_config.env, job.env)
+    base_env = merged_env(manifest.global_config.env, job.env)
+    env = base_env
     if wait_for_gpu:
-        wait_for_job_gpus(
+        env = prepare_job_gpu_env(
             manifest=manifest,
             job=job,
-            env=env,
+            env=base_env,
             log_path=log_path,
             poll_seconds=gpu_poll_seconds,
         )
@@ -756,6 +827,7 @@ def print_dry_run(manifest: BatchManifest) -> None:
     print(f"Save root: {manifest.global_config.save_root}")
     for index, job in enumerate(manifest.jobs, start=1):
         command = build_job_command(manifest, job)
+        env = merged_env(manifest.global_config.env, job.env)
         print(f"[{index}/{len(manifest.jobs)}] {job.name}")
         print(f"  base_config: {job.config}")
         print(f"  effective_config: {effective_config_path(job)}")
@@ -764,6 +836,16 @@ def print_dry_run(manifest: BatchManifest) -> None:
             print(f"  config_overrides: {rendered}")
         print(f"  save_path: {job.save_path}")
         print(f"  port: {job.port}")
+        if has_explicit_cuda_visible_devices(env):
+            gpu_tokens = ", ".join(
+                parse_target_gpu_tokens(env, manifest.global_config.nproc_per_node)
+            )
+            print(f"  gpu_mode: fixed ({gpu_tokens})")
+        else:
+            print(
+                "  gpu_mode: dynamic at runtime when --wait-for-gpu is enabled "
+                f"(need {manifest.global_config.nproc_per_node} GPUs)"
+            )
         print(f"  command: {shell_join(command)}")
 
 
