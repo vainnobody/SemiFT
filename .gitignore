@@ -20,6 +20,9 @@ viz/
 
 # scripts
 scripts/
+!scripts/
+scripts/*
+!scripts/batch_train.py
 
 # logs
 logs/
@@ -31,11 +34,10 @@ train.py
 AGENTS.md
 # local experiments
 notebook/
-test/test_moe_adapter.py
-
-# local experiments
-notebook/
-test/test_moe_adapter.py
+test/
+!test/
+test/*
+!test/test_batch_train.py
 
 # local-only artifacts
 .DS_Store
@@ -43,4 +45,3 @@ docs/
 fig1_reference_beautified.png
 paper/
 skills/
-test/

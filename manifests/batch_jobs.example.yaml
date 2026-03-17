@@ -1,0 +1,40 @@
+global:
+  nproc_per_node: 4
+  save_root: experiments/batch_runs
+  port_base: 29500
+  continue_on_error: true
+  max_retries: 1
+  env:
+    CUDA_VISIBLE_DEVICES: "0,1,2,3"
+
+jobs:
+  - name: semift_pascal_1_16
+    script: unimatchv2_peft.py
+    config: configs/pascal.yaml
+    config_overrides:
+      backbone: dinov2_small
+    labeled_id_path: splits/pascal/92/labeled.txt
+    unlabeled_id_path: splits/pascal/92/unlabeled.txt
+    save_subdir: pascal/unimatchv2_peft/semift_92
+    extra_args:
+      - --peft-method
+      - semift
+      - --peft-target-modules
+      - mlp
+      - --freeze-backbone
+
+  - name: scalematch_pascal_1_16
+    script: scalematch_peft.py
+    config: configs/pascal.yaml
+    config_overrides:
+      backbone: dinov2_base
+      conf_thresh: 0.9
+    labeled_id_path: splits/pascal/92/labeled.txt
+    unlabeled_id_path: splits/pascal/92/unlabeled.txt
+    save_subdir: pascal/scalematch_peft/semift_92
+    extra_args:
+      - --peft-method
+      - semift
+      - --peft-target-modules
+      - mlp
+      - --freeze-backbone

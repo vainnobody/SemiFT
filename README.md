@@ -284,7 +284,102 @@ tensorboard --logdir experiments
 
 ---
 
-## 10. 测试与调试
+## 10. 无人值守批处理
+
+如果你希望在**无人监管**的情况下顺序跑完一批实验，可以使用新的 YAML 清单式批处理入口：
+
+### 10.1 先做 dry-run 校验
+
+```bash
+python scripts/batch_train.py \
+  --manifest manifests/batch_jobs.example.yaml \
+  --dry-run
+```
+
+它会校验以下内容：
+- 训练脚本是否存在且属于仓库支持的入口
+- `config` / `labeled_id_path` / `unlabeled_id_path` 是否存在
+- `name` 与 `save_subdir` 是否唯一
+- 每个任务最终分配到的 `save_path` 与 `port`
+
+### 10.2 正式执行
+
+```bash
+python scripts/batch_train.py \
+  --manifest manifests/batch_jobs.example.yaml
+```
+
+manifest 采用 `global + jobs` 结构，例如：
+
+```yaml
+global:
+  nproc_per_node: 4
+  save_root: experiments/batch_runs
+  port_base: 29500
+  continue_on_error: true
+  max_retries: 1
+
+jobs:
+  - name: semift_pascal_1_16
+    script: unimatchv2_peft.py
+    config: configs/pascal.yaml
+    config_overrides:
+      backbone: dinov2_small
+      conf_thresh: 0.9
+    labeled_id_path: splits/pascal/92/labeled.txt
+    unlabeled_id_path: splits/pascal/92/unlabeled.txt
+    save_subdir: pascal/unimatchv2_peft/semift_92
+    extra_args: ["--peft-method", "semift", "--peft-target-modules", "mlp", "--freeze-backbone"]
+```
+
+完整示例见：`manifests/batch_jobs.example.yaml`。
+
+如果你不想为每个实验复制一份 YAML，可以直接在 job 里写 `config_overrides`。runner 会在运行前基于原始 `config` 递归合并这些字段，并自动生成一个临时 config，例如：
+
+```yaml
+  - name: fixmatch_rgcrv6_vaihingen_split4_dinov3_small
+    script: fixmatch_rgcrv6.py
+    config: configs/vaihingen.yaml
+    config_overrides:
+      backbone: dinov3_small
+    labeled_id_path: splits/vaihingen/4/labeled.txt
+    unlabeled_id_path: splits/vaihingen/4/unlabeled.txt
+    save_subdir: vaihingen/fixmatch_rgcrv6/dinov3_small/split4
+```
+
+生成后的 config 会写到 `<save_root>/_batch/generated_configs/<manifest_name>/<job_name>.yaml`，命令实际传入的是这个生成后的文件。
+
+### 10.3 批处理行为
+
+- 默认使用 `torchrun` 启动每个任务
+- 按 `port_base + job_index` 自动分配端口
+- 每个任务日志写入 `<save_path>/out.log`
+- 成功任务会写入 `<save_path>/.batch_done.json`，下次批处理会自动跳过
+- 若 `<save_path>/latest.pth` 已存在且没有完成标记，runner 会按同一路径重新启动，让训练脚本自动 resume
+- 单个任务失败后默认**继续后续任务**，并按 `max_retries` 自动重试
+- 批次级汇总会写到 `<save_root>/_batch/`
+
+### 10.4 常用筛选与覆盖
+
+只执行部分任务：
+
+```bash
+python scripts/batch_train.py \
+  --manifest manifests/batch_jobs.example.yaml \
+  --only semift_pascal_1_16,scalematch_pascal_1_16
+```
+
+临时覆盖输出根目录：
+
+```bash
+python scripts/batch_train.py \
+  --manifest manifests/batch_jobs.example.yaml \
+  --save-root /tmp/semift_batch_runs
+```
+
+---
+
+## 11. 测试与调试
 
 仓库中有一部分轻量测试，建议在修改后至少做语法或定向测试。
 
@@ -299,11 +394,18 @@ python -m py_compile unimatchv2_peft.py scalematch_peft.py peft/tuners/semift.py
 ```bash
 python -m pytest test/test_unimatchv2_peft_config.py
 python -m pytest test/test_scalematch_peft.py
+python -m pytest test/test_batch_train.py
+```
+
+如果当前环境没有安装 `pytest`，也可以直接用标准库执行批处理测试：
+
+```bash
+python -m unittest discover -s test -p 'test_batch_train.py' -v
 ```
 
 ---
 
-## 11. 实用建议
+## 12. 实用建议
 
 1. **优先从 `unimatchv2_peft.py` 跑通 SemiFT**，再迁移到 ScaleMatch。  
 2. 如果显存紧张：
@@ -322,7 +424,7 @@ python -m pytest test/test_scalematch_peft.py
 
 ---
 
-## 12. 总结
+## 13. 总结
 
 如果你只关心本仓库的主方法，可以直接记住下面这条：
 
