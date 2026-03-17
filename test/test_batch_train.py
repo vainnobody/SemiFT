@@ -1,3 +1,5 @@
+import contextlib
+import io
 import json
 import tempfile
 import unittest
@@ -302,6 +304,24 @@ class BatchTrainRunnerTest(unittest.TestCase):
         self.assertEqual(statuses["job_b"]["status"], "succeeded")
         self.assertEqual(call_order, ["job_a", "job_a", "job_b"])
 
+    def test_run_batch_prints_progress_to_stdout(self):
+        manifest = load_manifest(self.manifest_path)
+
+        def fake_run(command, *, cwd, env, log_path):
+            return 0
+
+        output = io.StringIO()
+        with mock.patch("util.batch_runner.run_subprocess", side_effect=fake_run):
+            with contextlib.redirect_stdout(output):
+                run_batch(manifest)
+
+        stdout = output.getvalue()
+        self.assertIn("Running 2 batch job(s)", stdout)
+        self.assertIn("[1/2] START job_a", stdout)
+        self.assertIn("[1/2] SUCCEEDED job_a", stdout)
+        self.assertIn("[2/2] START job_b", stdout)
+        self.assertIn("[2/2] SUCCEEDED job_b", stdout)
+
     def test_run_batch_watch_picks_up_jobs_appended_later(self):
         original_payload = yaml.safe_load(self.manifest_path.read_text(encoding="utf-8"))
         manifest_payload = json.loads(json.dumps(original_payload))
@@ -412,6 +432,31 @@ class BatchTrainRunnerTest(unittest.TestCase):
 
         self.assertEqual(launches, [("job_a", "3,5")])
         self.assertEqual(summary["results"][0]["status"], "succeeded")
+
+    def test_run_batch_watch_prints_progress_to_stdout(self):
+        manifest_payload = yaml.safe_load(self.manifest_path.read_text(encoding="utf-8"))
+        manifest_payload["jobs"] = [manifest_payload["jobs"][0]]
+        self.manifest_path.write_text(
+            yaml.safe_dump(manifest_payload), encoding="utf-8"
+        )
+
+        def fake_run(command, *, cwd, env, log_path):
+            return 0
+
+        output = io.StringIO()
+        with mock.patch("util.batch_runner.run_subprocess", side_effect=fake_run):
+            with contextlib.redirect_stdout(output):
+                run_batch_watch(
+                    manifest_path=self.manifest_path,
+                    poll_seconds=0,
+                    max_idle_polls=1,
+                )
+
+        stdout = output.getvalue()
+        self.assertIn("[watch] found 1 new job(s)", stdout)
+        self.assertIn("[watch 1/1] START job_a", stdout)
+        self.assertIn("[watch 1/1] SUCCEEDED job_a", stdout)
+        self.assertIn("[watch] no new jobs", stdout)
 
 
 if __name__ == "__main__":

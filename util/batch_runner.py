@@ -860,6 +860,57 @@ def print_run_summary(summary: Dict[str, Any]) -> None:
     print(f"Summary JSON: {summary['summary_path']}")
 
 
+def print_batch_start(manifest: BatchManifest) -> None:
+    print(
+        f"Running {len(manifest.jobs)} batch job(s) from {manifest.manifest_path}"
+    )
+
+
+def print_job_progress(
+    *,
+    stage: str,
+    job: BatchJob,
+    index: int,
+    total: int,
+    result: Optional[Dict[str, Any]] = None,
+    watch_mode: bool = False,
+) -> None:
+    prefix = f"[watch {index}/{total}]" if watch_mode else f"[{index}/{total}]"
+    if stage == "start":
+        print(
+            f"{prefix} START {job.name} | port={job.port} | save_path={job.save_path}"
+        )
+        return
+
+    if result is None:
+        raise ValueError("result is required for non-start progress messages")
+
+    print(
+        f"{prefix} {result['status'].upper()} {job.name} | attempts={result['attempts']} "
+        f"| exit_code={result['exit_code']} | log={result['out_log']}"
+    )
+
+
+def print_watch_poll_status(
+    *,
+    manifest: BatchManifest,
+    pending_jobs: Sequence[BatchJob],
+    processed_count: int,
+    idle_polls: int,
+) -> None:
+    if pending_jobs:
+        names = ", ".join(job.name for job in pending_jobs)
+        print(
+            f"[watch] found {len(pending_jobs)} new job(s) "
+            f"(processed={processed_count}, manifest_total={len(manifest.jobs)}): {names}"
+        )
+    else:
+        print(
+            f"[watch] no new jobs "
+            f"(processed={processed_count}, manifest_total={len(manifest.jobs)}, idle_polls={idle_polls})"
+        )
+
+
 def build_summary_payload(
     manifest: BatchManifest,
     *,
@@ -947,7 +998,9 @@ def run_batch(
         }
 
     results: List[Dict[str, Any]] = []
-    for job in manifest.jobs:
+    print_batch_start(manifest)
+    for index, job in enumerate(manifest.jobs, start=1):
+        print_job_progress(stage="start", job=job, index=index, total=len(manifest.jobs))
         result = execute_job(
             manifest,
             job,
@@ -955,7 +1008,17 @@ def run_batch(
             gpu_poll_seconds=gpu_poll_seconds,
         )
         results.append(result)
+        print_job_progress(
+            stage="finish",
+            job=job,
+            index=index,
+            total=len(manifest.jobs),
+            result=result,
+        )
         if result["status"] == "failed" and not manifest.global_config.continue_on_error:
+            print(
+                f"Stopping batch early after failure in {job.name} because continue_on_error=false"
+            )
             break
 
     summary = build_summary_payload(manifest, results=results, dry_run=False)
@@ -999,6 +1062,12 @@ def run_batch_watch(
         )
         ensure_watch_compatible(reference=reference_manifest, candidate=manifest)
         pending_jobs = [job for job in manifest.jobs if job.name not in processed_names]
+        print_watch_poll_status(
+            manifest=manifest,
+            pending_jobs=pending_jobs,
+            processed_count=len(processed_names),
+            idle_polls=idle_polls,
+        )
 
         if pending_jobs:
             idle_polls = 0
@@ -1008,6 +1077,18 @@ def run_batch_watch(
                 jobs=pending_jobs,
             )
             for job in pending_jobs:
+                job_index = next(
+                    index
+                    for index, candidate in enumerate(manifest.jobs, start=1)
+                    if candidate.name == job.name
+                )
+                print_job_progress(
+                    stage="start",
+                    job=job,
+                    index=job_index,
+                    total=len(manifest.jobs),
+                    watch_mode=True,
+                )
                 result = execute_job(
                     pending_manifest,
                     job,
@@ -1016,6 +1097,14 @@ def run_batch_watch(
                 )
                 results.append(result)
                 processed_names.add(job.name)
+                print_job_progress(
+                    stage="finish",
+                    job=job,
+                    index=job_index,
+                    total=len(manifest.jobs),
+                    result=result,
+                    watch_mode=True,
+                )
                 summary = build_summary_payload(
                     manifest,
                     results=results,
@@ -1027,6 +1116,9 @@ def run_batch_watch(
                 )
                 summary = persist_summary(manifest, summary)
                 if result["status"] == "failed" and not manifest.global_config.continue_on_error:
+                    print(
+                        f"[watch] stopping after failure in {job.name} because continue_on_error=false"
+                    )
                     print_run_summary(summary)
                     return summary
         else:
