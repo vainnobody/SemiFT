@@ -13,6 +13,7 @@ from util.batch_runner import (
     effective_config_path,
     load_manifest,
     run_batch,
+    run_batch_watch,
 )
 
 
@@ -146,6 +147,83 @@ class BatchTrainRunnerTest(unittest.TestCase):
         self.assertEqual(statuses["job_a"]["config_overrides"]["backbone"], "dinov3_small")
         self.assertEqual(statuses["job_b"]["status"], "succeeded")
         self.assertEqual(call_order, ["job_a", "job_a", "job_b"])
+
+    def test_run_batch_watch_picks_up_jobs_appended_later(self):
+        original_payload = yaml.safe_load(self.manifest_path.read_text(encoding="utf-8"))
+        manifest_payload = json.loads(json.dumps(original_payload))
+        manifest_payload["jobs"] = [manifest_payload["jobs"][0]]
+        self.manifest_path.write_text(
+            yaml.safe_dump(manifest_payload), encoding="utf-8"
+        )
+
+        calls = []
+
+        def fake_run(command, *, cwd, env, log_path):
+            calls.append(Path(log_path).parent.name)
+            return 0
+
+        sleep_calls = {"count": 0}
+
+        def fake_sleep(_seconds):
+            sleep_calls["count"] += 1
+            if sleep_calls["count"] == 1:
+                updated = yaml.safe_load(self.manifest_path.read_text(encoding="utf-8"))
+                updated["jobs"].append(original_payload["jobs"][1])
+                self.manifest_path.write_text(
+                    yaml.safe_dump(updated), encoding="utf-8"
+                )
+
+        with mock.patch("util.batch_runner.run_subprocess", side_effect=fake_run):
+            with mock.patch("util.batch_runner.time.sleep", side_effect=fake_sleep):
+                summary = run_batch_watch(
+                    manifest_path=self.manifest_path,
+                    poll_seconds=0,
+                    max_idle_polls=2,
+                )
+
+        self.assertEqual(calls, ["job_a", "job_b"])
+        self.assertEqual(
+            [(result["name"], result["status"]) for result in summary["results"]],
+            [("job_a", "succeeded"), ("job_b", "succeeded")],
+        )
+        self.assertTrue(summary["queue_mode"])
+        self.assertEqual(summary["max_idle_polls"], 2)
+
+    def test_run_batch_watch_allows_empty_queue_until_job_arrives(self):
+        original_payload = yaml.safe_load(self.manifest_path.read_text(encoding="utf-8"))
+        manifest_payload = json.loads(json.dumps(original_payload))
+        manifest_payload["jobs"] = []
+        self.manifest_path.write_text(
+            yaml.safe_dump(manifest_payload), encoding="utf-8"
+        )
+
+        calls = []
+
+        def fake_run(command, *, cwd, env, log_path):
+            calls.append(Path(log_path).parent.name)
+            return 0
+
+        sleep_calls = {"count": 0}
+
+        def fake_sleep(_seconds):
+            sleep_calls["count"] += 1
+            if sleep_calls["count"] == 1:
+                manifest_payload["jobs"] = [original_payload["jobs"][0]]
+                self.manifest_path.write_text(
+                    yaml.safe_dump(manifest_payload), encoding="utf-8"
+                )
+
+        with mock.patch("util.batch_runner.run_subprocess", side_effect=fake_run):
+            with mock.patch("util.batch_runner.time.sleep", side_effect=fake_sleep):
+                summary = run_batch_watch(
+                    manifest_path=self.manifest_path,
+                    poll_seconds=0,
+                    max_idle_polls=2,
+                )
+
+        self.assertEqual(calls, ["job_a"])
+        self.assertEqual(len(summary["results"]), 1)
+        self.assertEqual(summary["results"][0]["name"], "job_a")
 
 
 if __name__ == "__main__":

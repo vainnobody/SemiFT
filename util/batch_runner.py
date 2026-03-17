@@ -7,6 +7,7 @@ import re
 import shlex
 import subprocess
 import sys
+import time
 from copy import deepcopy
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -115,6 +116,23 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         type=str,
         default=None,
         help="Override global.save_root from the manifest.",
+    )
+    parser.add_argument(
+        "--watch",
+        action="store_true",
+        help="Keep polling the manifest and execute newly appended jobs incrementally.",
+    )
+    parser.add_argument(
+        "--poll-seconds",
+        type=float,
+        default=30.0,
+        help="Polling interval in seconds when --watch is enabled.",
+    )
+    parser.add_argument(
+        "--max-idle-polls",
+        type=int,
+        default=None,
+        help="Stop watch mode after this many consecutive polls with no new jobs.",
     )
     return parser.parse_args(argv)
 
@@ -254,6 +272,8 @@ def load_manifest(
     *,
     save_root_override: Optional[Path] = None,
     only_names: Optional[Set[str]] = None,
+    allow_no_jobs: bool = False,
+    allow_missing_only_names: bool = False,
 ) -> BatchManifest:
     manifest_path = manifest_path.resolve()
     data = load_yaml_mapping(manifest_path, description="Manifest")
@@ -261,7 +281,9 @@ def load_manifest(
 
     global_data = require_mapping(data.get("global"), "global")
     jobs_data = data.get("jobs")
-    if not isinstance(jobs_data, list) or not jobs_data:
+    if not isinstance(jobs_data, list):
+        raise ManifestError("'jobs' must be a list.")
+    if not jobs_data and not allow_no_jobs:
         raise ManifestError("'jobs' must be a non-empty list.")
 
     missing_global = [
@@ -382,11 +404,11 @@ def load_manifest(
 
     if only_names is not None:
         missing_names = sorted(only_names - seen_names)
-        if missing_names:
+        if missing_names and not allow_missing_only_names:
             raise ManifestError(
                 f"Requested job(s) not found in manifest: {', '.join(missing_names)}"
             )
-    if not jobs:
+    if not jobs and not allow_no_jobs:
         raise ManifestError("No jobs remain after applying filters.")
 
     return BatchManifest(
@@ -597,6 +619,76 @@ def print_run_summary(summary: Dict[str, Any]) -> None:
     print(f"Summary JSON: {summary['summary_path']}")
 
 
+def build_summary_payload(
+    manifest: BatchManifest,
+    *,
+    results: List[Dict[str, Any]],
+    dry_run: bool,
+    queue_mode: bool = False,
+    poll_seconds: Optional[float] = None,
+    max_idle_polls: Optional[int] = None,
+    idle_polls: Optional[int] = None,
+) -> Dict[str, Any]:
+    payload = {
+        "manifest": str(manifest.manifest_path),
+        "save_root": str(manifest.global_config.save_root),
+        "generated_at": utc_now_iso(),
+        "dry_run": dry_run,
+        "continue_on_error": manifest.global_config.continue_on_error,
+        "max_retries": manifest.global_config.max_retries,
+        "results": results,
+    }
+    if queue_mode:
+        payload.update(
+            {
+                "queue_mode": True,
+                "poll_seconds": poll_seconds,
+                "max_idle_polls": max_idle_polls,
+                "idle_polls": idle_polls,
+            }
+        )
+    return payload
+
+
+def persist_summary(manifest: BatchManifest, payload: Dict[str, Any]) -> Dict[str, Any]:
+    run_path, latest_path = write_summary_files(manifest, payload)
+    payload["summary_path"] = str(run_path)
+    payload["latest_summary_path"] = str(latest_path)
+    return payload
+
+
+def ensure_watch_compatible(reference: BatchManifest, candidate: BatchManifest) -> None:
+    ref = reference.global_config
+    cur = candidate.global_config
+    incompatible_fields: List[str] = []
+    if cur.save_root != ref.save_root:
+        incompatible_fields.append("global.save_root")
+    if cur.port_base != ref.port_base:
+        incompatible_fields.append("global.port_base")
+    if cur.nproc_per_node != ref.nproc_per_node:
+        incompatible_fields.append("global.nproc_per_node")
+    if incompatible_fields:
+        raise ManifestError(
+            "Watch mode requires stable queue identity; incompatible changes detected in "
+            + ", ".join(incompatible_fields)
+        )
+
+
+def reload_manifest_for_watch(
+    manifest_path: Path,
+    *,
+    save_root_override: Optional[Path],
+    only_names: Optional[Set[str]],
+) -> BatchManifest:
+    return load_manifest(
+        manifest_path,
+        save_root_override=save_root_override,
+        only_names=only_names,
+        allow_no_jobs=True,
+        allow_missing_only_names=True,
+    )
+
+
 def run_batch(manifest: BatchManifest, *, dry_run: bool = False) -> Dict[str, Any]:
     if dry_run:
         print_dry_run(manifest)
@@ -614,31 +706,110 @@ def run_batch(manifest: BatchManifest, *, dry_run: bool = False) -> Dict[str, An
         if result["status"] == "failed" and not manifest.global_config.continue_on_error:
             break
 
-    summary = {
-        "manifest": str(manifest.manifest_path),
-        "save_root": str(manifest.global_config.save_root),
-        "generated_at": utc_now_iso(),
-        "dry_run": False,
-        "continue_on_error": manifest.global_config.continue_on_error,
-        "max_retries": manifest.global_config.max_retries,
-        "results": results,
-    }
-    run_path, latest_path = write_summary_files(manifest, summary)
-    summary["summary_path"] = str(run_path)
-    summary["latest_summary_path"] = str(latest_path)
+    summary = build_summary_payload(manifest, results=results, dry_run=False)
+    summary = persist_summary(manifest, summary)
     print_run_summary(summary)
     return summary
+
+
+def run_batch_watch(
+    *,
+    manifest_path: Path,
+    save_root_override: Optional[Path] = None,
+    only_names: Optional[Set[str]] = None,
+    poll_seconds: float = 30.0,
+    max_idle_polls: Optional[int] = None,
+) -> Dict[str, Any]:
+    if poll_seconds < 0:
+        raise ManifestError("--poll-seconds must be >= 0.")
+    if max_idle_polls is not None and max_idle_polls < 0:
+        raise ManifestError("--max-idle-polls must be >= 0.")
+
+    manifest = reload_manifest_for_watch(
+        manifest_path,
+        save_root_override=save_root_override,
+        only_names=only_names,
+    )
+    reference_manifest = manifest
+    processed_names: Set[str] = set()
+    results: List[Dict[str, Any]] = []
+    idle_polls = 0
+
+    while True:
+        manifest = reload_manifest_for_watch(
+            manifest_path,
+            save_root_override=save_root_override,
+            only_names=only_names,
+        )
+        ensure_watch_compatible(reference=reference_manifest, candidate=manifest)
+        pending_jobs = [job for job in manifest.jobs if job.name not in processed_names]
+
+        if pending_jobs:
+            idle_polls = 0
+            pending_manifest = BatchManifest(
+                manifest_path=manifest.manifest_path,
+                global_config=manifest.global_config,
+                jobs=pending_jobs,
+            )
+            for job in pending_jobs:
+                result = execute_job(pending_manifest, job)
+                results.append(result)
+                processed_names.add(job.name)
+                summary = build_summary_payload(
+                    manifest,
+                    results=results,
+                    dry_run=False,
+                    queue_mode=True,
+                    poll_seconds=poll_seconds,
+                    max_idle_polls=max_idle_polls,
+                    idle_polls=idle_polls,
+                )
+                summary = persist_summary(manifest, summary)
+                if result["status"] == "failed" and not manifest.global_config.continue_on_error:
+                    print_run_summary(summary)
+                    return summary
+        else:
+            idle_polls += 1
+            summary = build_summary_payload(
+                manifest,
+                results=results,
+                dry_run=False,
+                queue_mode=True,
+                poll_seconds=poll_seconds,
+                max_idle_polls=max_idle_polls,
+                idle_polls=idle_polls,
+            )
+            summary = persist_summary(manifest, summary)
+            if max_idle_polls is not None and idle_polls >= max_idle_polls:
+                print_run_summary(summary)
+                return summary
+            time.sleep(poll_seconds)
+
+
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
     args = parse_args(argv)
     try:
-        manifest = load_manifest(
-            Path(args.manifest),
-            save_root_override=Path(args.save_root) if args.save_root else None,
-            only_names=parse_only_names(args.only),
-        )
-        summary = run_batch(manifest, dry_run=args.dry_run)
+        only_names = parse_only_names(args.only)
+        save_root_override = Path(args.save_root) if args.save_root else None
+        if args.watch:
+            if args.dry_run:
+                raise ManifestError("--dry-run cannot be combined with --watch.")
+            summary = run_batch_watch(
+                manifest_path=Path(args.manifest),
+                save_root_override=save_root_override,
+                only_names=only_names,
+                poll_seconds=args.poll_seconds,
+                max_idle_polls=args.max_idle_polls,
+            )
+        else:
+            manifest = load_manifest(
+                Path(args.manifest),
+                save_root_override=save_root_override,
+                only_names=only_names,
+            )
+            summary = run_batch(manifest, dry_run=args.dry_run)
     except ManifestError as exc:
         print(f"Manifest error: {exc}", file=sys.stderr)
         return 2
