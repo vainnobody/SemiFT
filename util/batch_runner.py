@@ -21,6 +21,8 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 DONE_MARKER_NAME = ".batch_done.json"
 SUMMARY_DIR_NAME = "_batch"
 GENERATED_CONFIGS_DIR_NAME = "generated_configs"
+DEFAULT_GPU_IDLE_MAX_MEMORY_MB = 1024
+DEFAULT_GPU_IDLE_MAX_UTILIZATION = 10
 
 TRAINING_ENTRYPOINTS = {
     "corrmatch.py",
@@ -563,15 +565,6 @@ def resolve_target_gpus(env: Dict[str, str], nproc_per_node: int) -> List[Dict[s
         targets.append(gpu)
     return targets
 
-
-def gpu_is_idle(gpu: Dict[str, Any]) -> bool:
-    return (
-        not gpu["has_compute_process"]
-        and gpu["memory_used_mb"] == 0
-        and gpu["utilization_gpu"] == 0
-    )
-
-
 def format_gpu_state(gpu: Dict[str, Any]) -> str:
     return (
         f"{gpu['index']}(mem={gpu['memory_used_mb']}MB,"
@@ -579,9 +572,59 @@ def format_gpu_state(gpu: Dict[str, Any]) -> str:
     )
 
 
-def select_idle_gpus(inventory: Sequence[Dict[str, Any]], required_count: int) -> List[Dict[str, Any]]:
+def parse_gpu_idle_thresholds(env: Dict[str, str]) -> tuple[int, int]:
+    try:
+        max_memory_mb = int(
+            env.get("BATCH_GPU_IDLE_MAX_MEMORY_MB", DEFAULT_GPU_IDLE_MAX_MEMORY_MB)
+        )
+        max_utilization = int(
+            env.get(
+                "BATCH_GPU_IDLE_MAX_UTILIZATION",
+                DEFAULT_GPU_IDLE_MAX_UTILIZATION,
+            )
+        )
+    except ValueError as exc:
+        raise ManifestError(
+            "BATCH_GPU_IDLE_MAX_MEMORY_MB and BATCH_GPU_IDLE_MAX_UTILIZATION must be integers."
+        ) from exc
+
+    if max_memory_mb < 0 or max_utilization < 0:
+        raise ManifestError(
+            "BATCH_GPU_IDLE_MAX_MEMORY_MB and BATCH_GPU_IDLE_MAX_UTILIZATION must be >= 0."
+        )
+    return max_memory_mb, max_utilization
+
+
+def gpu_is_idle(
+    gpu: Dict[str, Any],
+    *,
+    max_memory_mb: int = DEFAULT_GPU_IDLE_MAX_MEMORY_MB,
+    max_utilization: int = DEFAULT_GPU_IDLE_MAX_UTILIZATION,
+) -> bool:
+    return (
+        not gpu["has_compute_process"]
+        and gpu["memory_used_mb"] <= max_memory_mb
+        and gpu["utilization_gpu"] <= max_utilization
+    )
+
+
+def select_idle_gpus(
+    inventory: Sequence[Dict[str, Any]],
+    required_count: int,
+    *,
+    max_memory_mb: int,
+    max_utilization: int,
+) -> List[Dict[str, Any]]:
     idle_gpus = sorted(
-        [gpu for gpu in inventory if gpu_is_idle(gpu)],
+        [
+            gpu
+            for gpu in inventory
+            if gpu_is_idle(
+                gpu,
+                max_memory_mb=max_memory_mb,
+                max_utilization=max_utilization,
+            )
+        ],
         key=lambda gpu: gpu["index"],
     )
     return idle_gpus[:required_count]
@@ -598,11 +641,13 @@ def prepare_job_gpu_env(
     if poll_seconds < 0:
         raise ManifestError("--gpu-poll-seconds must be >= 0.")
 
+    max_memory_mb, max_utilization = parse_gpu_idle_thresholds(env)
     if not has_explicit_cuda_visible_devices(env):
         required_count = manifest.global_config.nproc_per_node
         append_runner_log(
             log_path,
-            f"[batch_runner] GPU mode for {job.name}: dynamic (need {required_count} idle GPUs)",
+            f"[batch_runner] GPU mode for {job.name}: dynamic "
+            f"(need {required_count} idle GPUs; mem<={max_memory_mb}MB, util<={max_utilization}%)",
         )
         while True:
             try:
@@ -616,7 +661,12 @@ def prepare_job_gpu_env(
                     "nvidia-smi was not found, so --wait-for-gpu cannot be used on this machine."
                 ) from exc
 
-            idle_gpus = select_idle_gpus(inventory, required_count)
+            idle_gpus = select_idle_gpus(
+                inventory,
+                required_count,
+                max_memory_mb=max_memory_mb,
+                max_utilization=max_utilization,
+            )
             if len(idle_gpus) >= required_count:
                 selected_tokens = [str(gpu["index"]) for gpu in idle_gpus]
                 selected_env = dict(env)
@@ -630,7 +680,15 @@ def prepare_job_gpu_env(
             idle_tokens = [
                 str(gpu["index"])
                 for gpu in sorted(
-                    [gpu for gpu in inventory if gpu_is_idle(gpu)],
+                    [
+                        gpu
+                        for gpu in inventory
+                        if gpu_is_idle(
+                            gpu,
+                            max_memory_mb=max_memory_mb,
+                            max_utilization=max_utilization,
+                        )
+                    ],
                     key=lambda gpu: gpu["index"],
                 )
             ]
@@ -639,6 +697,7 @@ def prepare_job_gpu_env(
                 f"[batch_runner] waiting for {required_count} idle GPUs before {job.name}: "
                 f"idle={len(idle_tokens)}"
                 + (f" ({', '.join(idle_tokens)})" if idle_tokens else "")
+                + f"; thresholds=mem<={max_memory_mb}MB,util<={max_utilization}%"
                 + f"; sleep {poll_seconds}s",
             )
             time.sleep(poll_seconds)
@@ -646,7 +705,8 @@ def prepare_job_gpu_env(
     target_tokens = parse_target_gpu_tokens(env, manifest.global_config.nproc_per_node)
     append_runner_log(
         log_path,
-        f"[batch_runner] GPU mode for {job.name}: fixed ({', '.join(target_tokens)})",
+        f"[batch_runner] GPU mode for {job.name}: fixed ({', '.join(target_tokens)}; "
+        f"mem<={max_memory_mb}MB, util<={max_utilization}%)",
     )
     while True:
         try:
@@ -660,7 +720,15 @@ def prepare_job_gpu_env(
                 "nvidia-smi was not found, so --wait-for-gpu cannot be used on this machine."
             ) from exc
 
-        busy_gpus = [gpu for gpu in target_gpus if not gpu_is_idle(gpu)]
+        busy_gpus = [
+            gpu
+            for gpu in target_gpus
+            if not gpu_is_idle(
+                gpu,
+                max_memory_mb=max_memory_mb,
+                max_utilization=max_utilization,
+            )
+        ]
         if not busy_gpus:
             append_runner_log(
                 log_path,
@@ -670,13 +738,20 @@ def prepare_job_gpu_env(
 
         busy_desc = ", ".join(format_gpu_state(gpu) for gpu in busy_gpus)
         idle_desc = ", ".join(
-            str(gpu["index"]) for gpu in target_gpus if gpu_is_idle(gpu)
+            str(gpu["index"])
+            for gpu in target_gpus
+            if gpu_is_idle(
+                gpu,
+                max_memory_mb=max_memory_mb,
+                max_utilization=max_utilization,
+            )
         )
         append_runner_log(
             log_path,
             f"[batch_runner] waiting for GPUs before {job.name}: "
             f"busy={busy_desc}"
             + (f"; idle={idle_desc}" if idle_desc else "")
+            + f"; thresholds=mem<={max_memory_mb}MB,util<={max_utilization}%"
             + f"; sleep {poll_seconds}s",
         )
         time.sleep(poll_seconds)

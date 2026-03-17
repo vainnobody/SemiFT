@@ -98,13 +98,13 @@ class BatchTrainRunnerTest(unittest.TestCase):
         self.assertEqual(parse_target_gpu_tokens(env, 2), ["3", "5"])
         self.assertEqual(parse_target_gpu_tokens({}, 2), ["0", "1"])
 
-    def test_gpu_idle_requires_zero_mem_zero_util_and_no_process(self):
+    def test_gpu_idle_allows_small_background_usage_without_compute_process(self):
         self.assertTrue(
             gpu_is_idle(
                 {
                     "has_compute_process": False,
-                    "memory_used_mb": 0,
-                    "utilization_gpu": 0,
+                    "memory_used_mb": 64,
+                    "utilization_gpu": 5,
                 }
             )
         )
@@ -112,7 +112,7 @@ class BatchTrainRunnerTest(unittest.TestCase):
             gpu_is_idle(
                 {
                     "has_compute_process": True,
-                    "memory_used_mb": 0,
+                    "memory_used_mb": 64,
                     "utilization_gpu": 0,
                 }
             )
@@ -121,8 +121,17 @@ class BatchTrainRunnerTest(unittest.TestCase):
             gpu_is_idle(
                 {
                     "has_compute_process": False,
-                    "memory_used_mb": 1,
+                    "memory_used_mb": 2048,
                     "utilization_gpu": 0,
+                }
+            )
+        )
+        self.assertFalse(
+            gpu_is_idle(
+                {
+                    "has_compute_process": False,
+                    "memory_used_mb": 64,
+                    "utilization_gpu": 25,
                 }
             )
         )
@@ -181,7 +190,7 @@ class BatchTrainRunnerTest(unittest.TestCase):
         self.assertEqual(launches[0][1], "4")
         self.assertEqual(summary["results"][0]["status"], "succeeded")
         log_text = launches[0][2].read_text(encoding="utf-8")
-        self.assertIn("GPU mode for job_a: fixed (4)", log_text)
+        self.assertIn("GPU mode for job_a: fixed (4; mem<=1024MB, util<=10%)", log_text)
         self.assertIn("waiting for GPUs before job_a", log_text)
         self.assertIn("GPUs ready for job_a", log_text)
 
@@ -194,22 +203,22 @@ class BatchTrainRunnerTest(unittest.TestCase):
 
         gpu_snapshots = [
             [
-                {"index": 7, "uuid": "GPU-7", "memory_used_mb": 0, "utilization_gpu": 0, "has_compute_process": False},
-                {"index": 2, "uuid": "GPU-2", "memory_used_mb": 0, "utilization_gpu": 0, "has_compute_process": False},
-                {"index": 6, "uuid": "GPU-6", "memory_used_mb": 0, "utilization_gpu": 0, "has_compute_process": False},
-                {"index": 5, "uuid": "GPU-5", "memory_used_mb": 0, "utilization_gpu": 0, "has_compute_process": False},
+                {"index": 7, "uuid": "GPU-7", "memory_used_mb": 128, "utilization_gpu": 0, "has_compute_process": False},
+                {"index": 2, "uuid": "GPU-2", "memory_used_mb": 256, "utilization_gpu": 3, "has_compute_process": False},
+                {"index": 6, "uuid": "GPU-6", "memory_used_mb": 0, "utilization_gpu": 2, "has_compute_process": False},
+                {"index": 5, "uuid": "GPU-5", "memory_used_mb": 96, "utilization_gpu": 1, "has_compute_process": False},
                 {"index": 1, "uuid": "GPU-1", "memory_used_mb": 32, "utilization_gpu": 55, "has_compute_process": True},
                 {"index": 3, "uuid": "GPU-3", "memory_used_mb": 64, "utilization_gpu": 70, "has_compute_process": True},
                 {"index": 4, "uuid": "GPU-4", "memory_used_mb": 8, "utilization_gpu": 10, "has_compute_process": True},
                 {"index": 0, "uuid": "GPU-0", "memory_used_mb": 0, "utilization_gpu": 90, "has_compute_process": True},
             ],
             [
-                {"index": 7, "uuid": "GPU-7", "memory_used_mb": 0, "utilization_gpu": 0, "has_compute_process": False},
-                {"index": 2, "uuid": "GPU-2", "memory_used_mb": 0, "utilization_gpu": 0, "has_compute_process": False},
-                {"index": 6, "uuid": "GPU-6", "memory_used_mb": 0, "utilization_gpu": 0, "has_compute_process": False},
-                {"index": 5, "uuid": "GPU-5", "memory_used_mb": 0, "utilization_gpu": 0, "has_compute_process": False},
-                {"index": 1, "uuid": "GPU-1", "memory_used_mb": 0, "utilization_gpu": 0, "has_compute_process": False},
-                {"index": 3, "uuid": "GPU-3", "memory_used_mb": 0, "utilization_gpu": 0, "has_compute_process": False},
+                {"index": 7, "uuid": "GPU-7", "memory_used_mb": 128, "utilization_gpu": 0, "has_compute_process": False},
+                {"index": 2, "uuid": "GPU-2", "memory_used_mb": 256, "utilization_gpu": 3, "has_compute_process": False},
+                {"index": 6, "uuid": "GPU-6", "memory_used_mb": 0, "utilization_gpu": 2, "has_compute_process": False},
+                {"index": 5, "uuid": "GPU-5", "memory_used_mb": 96, "utilization_gpu": 1, "has_compute_process": False},
+                {"index": 1, "uuid": "GPU-1", "memory_used_mb": 512, "utilization_gpu": 6, "has_compute_process": False},
+                {"index": 3, "uuid": "GPU-3", "memory_used_mb": 1024, "utilization_gpu": 10, "has_compute_process": False},
                 {"index": 4, "uuid": "GPU-4", "memory_used_mb": 16, "utilization_gpu": 5, "has_compute_process": True},
                 {"index": 0, "uuid": "GPU-0", "memory_used_mb": 12, "utilization_gpu": 8, "has_compute_process": True},
             ],
@@ -241,8 +250,8 @@ class BatchTrainRunnerTest(unittest.TestCase):
         self.assertEqual(launches[0][1], "1,2,3,5,6,7")
         self.assertEqual(summary["results"][0]["status"], "succeeded")
         log_text = launches[0][2].read_text(encoding="utf-8")
-        self.assertIn("GPU mode for job_a: dynamic (need 6 idle GPUs)", log_text)
-        self.assertIn("waiting for 6 idle GPUs before job_a: idle=4 (2, 5, 6, 7); sleep 5s", log_text)
+        self.assertIn("GPU mode for job_a: dynamic (need 6 idle GPUs; mem<=1024MB, util<=10%)", log_text)
+        self.assertIn("waiting for 6 idle GPUs before job_a: idle=4 (2, 5, 6, 7); thresholds=mem<=1024MB,util<=10%; sleep 5s", log_text)
         self.assertIn("selected GPUs for job_a: 1, 2, 3, 5, 6, 7", log_text)
 
     def test_run_batch_materializes_overridden_config_and_marks_done(self):
