@@ -229,6 +229,7 @@ def main(args, cfg):
         show_trainable_parameters(model, logger)
 
     local_rank = int(os.environ["LOCAL_RANK"])
+    model_no_ddp = model
     model = torch.nn.SyncBatchNorm.convert_sync_batchnorm(model)
     model.cuda()
     model = torch.nn.parallel.DistributedDataParallel(
@@ -238,6 +239,7 @@ def main(args, cfg):
         output_device=local_rank,
         find_unused_parameters=False,
     )
+    model_no_ddp = model.module
 
     if cfg["criterion"]["name"] == "CELoss":
         criterion_l = nn.CrossEntropyLoss(**cfg["criterion"]["kwargs"]).cuda(local_rank)
@@ -393,7 +395,9 @@ def main(args, cfg):
             with torch.cuda.amp.autocast(enabled=amp):
                 model.eval()
                 with torch.no_grad():
-                    pred_u_w_mix = model(img_u_w_mix, scale_factor=None, scales=None)
+                    pred_u_w_mix = model_no_ddp(
+                        img_u_w_mix, scale_factor=None, scales=None
+                    )
                     if isinstance(pred_u_w_mix, dict):
                         pred_u_w_mix = pred_u_w_mix["pred_ori"]
                     conf_u_w_mix, mask_u_w_mix = pred_u_w_mix.softmax(dim=1).max(dim=1)
@@ -458,9 +462,6 @@ def main(args, cfg):
                     0.25 * loss_u_s1 + 0.25 * loss_u_size + 0.5 * loss_u_w_fp
                 )
                 total_loss = (loss_x + loss_standard) / 2.0
-
-            if world_size > 1:
-                torch.distributed.barrier()
 
             optimizer.zero_grad()
             scaler.scale(total_loss).backward()
