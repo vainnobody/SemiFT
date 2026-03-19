@@ -143,6 +143,10 @@ class UperNet_ScaleMatch(nn.Module):
         _, out_fp = fp_logits.chunk(2)
         return logits, feats_fp, out_fp
 
+    def _strong_forward(self, x):
+        logits, _ = self._base_forward(x, need_fp=False)
+        return logits.contiguous()
+
     def two_scale_forward(self, inputs, scale_factor, feature_scale):
         if scale_factor is None:
             base_forward_out = self._base_forward(
@@ -231,6 +235,23 @@ class UperNet_ScaleMatch(nn.Module):
         feature_scale=1.0,
         scales=None,
         comp_drop=False,
+        strong_inputs=None,
+        pseudo_mode=None,
     ):
         del scales, comp_drop
+        if strong_inputs is not None:
+            multi_scale = self.two_scale_forward(x, scale_factor, feature_scale)
+            outputs = {
+                "pred_joint": multi_scale["pred_joint"],
+                "pred_size": multi_scale["pred_size"],
+                "pred_fp": multi_scale["pred_fp"],
+                "pred_strong": self._strong_forward(strong_inputs),
+            }
+            if pseudo_mode == "ori":
+                outputs["pseudo_logits"] = multi_scale["pred_ori"].detach()
+            elif pseudo_mode == "joint":
+                outputs["pseudo_logits"] = multi_scale["pred_joint"].detach()
+            else:
+                raise ValueError(f"Unsupported pseudo_mode: {pseudo_mode}")
+            return outputs
         return self.two_scale_forward(x, scale_factor, feature_scale)
