@@ -40,6 +40,8 @@ TRAINING_ENTRYPOINTS = {
     "fixmatch_rvsc_moe.py",
     "rankmatch.py",
     "ranpaste.py",
+    "scalematch.py",
+    "scalematch_peft.py",
     "segmind.py",
     "supervised.py",
     "unimatch.py",
@@ -232,6 +234,25 @@ def sanitize_name(value: str) -> str:
     return sanitized or "job"
 
 
+def make_unique_save_subdir(candidate: Path, job_name: str, seen: Set[Path]) -> Path:
+    if candidate not in seen:
+        return candidate
+
+    parent = candidate.parent
+    stem = candidate.name
+    job_suffix = sanitize_name(job_name)
+    dedup = parent / f"{stem}__{job_suffix}"
+    if dedup not in seen:
+        return dedup
+
+    index = 2
+    while True:
+        dedup = parent / f"{stem}__{job_suffix}_{index}"
+        if dedup not in seen:
+            return dedup
+        index += 1
+
+
 def generated_config_dir(manifest: BatchManifest) -> Path:
     manifest_name = sanitize_name(manifest.manifest_path.stem)
     return (
@@ -357,9 +378,8 @@ def load_manifest(
             raise ManifestError(f"Duplicate job name: {name}")
         seen_names.add(name)
 
-        save_subdir = Path(str(raw_job["save_subdir"]))
-        if save_subdir in seen_save_subdirs:
-            raise ManifestError(f"Duplicate save_subdir: {save_subdir}")
+        requested_save_subdir = Path(str(raw_job["save_subdir"]))
+        save_subdir = make_unique_save_subdir(requested_save_subdir, name, seen_save_subdirs)
         seen_save_subdirs.add(save_subdir)
 
         script_path = ensure_training_entrypoint(

@@ -467,6 +467,53 @@ class BatchTrainRunnerTest(unittest.TestCase):
         self.assertIn("[watch 1/1] SUCCEEDED job_a", stdout)
         self.assertIn("[watch] no new jobs", stdout)
 
+    def test_load_manifest_accepts_scalematch_peft_entrypoint(self):
+        repo_root = Path(__file__).resolve().parents[1]
+        manifest_payload = yaml.safe_load(self.manifest_path.read_text(encoding="utf-8"))
+        manifest_payload["jobs"] = [
+            {
+                "name": "scalematch_peft_job",
+                "script": str(repo_root / "scalematch_peft.py"),
+                "config": str(repo_root / "configs" / "pascal.yaml"),
+                "labeled_id_path": str(repo_root / "splits" / "pascal" / "92" / "labeled.txt"),
+                "unlabeled_id_path": str(repo_root / "splits" / "pascal" / "92" / "unlabeled.txt"),
+                "save_subdir": "pascal/scalematch_peft/92",
+            }
+        ]
+        self.manifest_path.write_text(yaml.safe_dump(manifest_payload), encoding="utf-8")
+
+        manifest = load_manifest(self.manifest_path)
+
+        self.assertEqual(manifest.jobs[0].script.name, "scalematch_peft.py")
+
+    def test_load_manifest_deduplicates_save_subdir(self):
+        manifest_payload = yaml.safe_load(self.manifest_path.read_text(encoding="utf-8"))
+        shared = "cityscapes/scalematch_peft/1_2"
+        manifest_payload["jobs"] = [
+            {
+                "name": "job_a",
+                "script": manifest_payload["jobs"][0]["script"],
+                "config": manifest_payload["jobs"][0]["config"],
+                "labeled_id_path": manifest_payload["jobs"][0]["labeled_id_path"],
+                "unlabeled_id_path": manifest_payload["jobs"][0]["unlabeled_id_path"],
+                "save_subdir": shared,
+            },
+            {
+                "name": "job_b",
+                "script": manifest_payload["jobs"][0]["script"],
+                "config": manifest_payload["jobs"][0]["config"],
+                "labeled_id_path": manifest_payload["jobs"][0]["labeled_id_path"],
+                "unlabeled_id_path": manifest_payload["jobs"][0]["unlabeled_id_path"],
+                "save_subdir": shared,
+            },
+        ]
+        self.manifest_path.write_text(yaml.safe_dump(manifest_payload), encoding="utf-8")
+
+        manifest = load_manifest(self.manifest_path)
+
+        self.assertEqual(str(manifest.jobs[0].save_subdir), shared)
+        self.assertEqual(str(manifest.jobs[1].save_subdir), shared + "__job_b")
+
 
 if __name__ == "__main__":
     unittest.main()
