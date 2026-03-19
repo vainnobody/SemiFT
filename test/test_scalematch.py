@@ -36,6 +36,7 @@ if str(REPO_ROOT) not in sys.path:
 
 import scalematch
 from model.semseg import dpt_scalematch
+from model.semseg import upernet_scalematch
 
 
 class FakeBackbone(torch.nn.Module):
@@ -64,6 +65,8 @@ class FakeBackbone(torch.nn.Module):
 def patch_fake_backbones(monkeypatch):
     monkeypatch.setattr(dpt_scalematch, "DINOv2", FakeBackbone)
     monkeypatch.setattr(dpt_scalematch, "DINOv3", FakeBackbone)
+    monkeypatch.setattr(upernet_scalematch, "DINOv2", FakeBackbone)
+    monkeypatch.setattr(upernet_scalematch, "DINOv3", FakeBackbone)
 
 
 def build_test_model():
@@ -72,6 +75,15 @@ def build_test_model():
         nclass=3,
         features=16,
         out_channels=[8, 8, 8, 8],
+        backbone_version="dinov2",
+    )
+
+
+def build_test_upernet_model():
+    return upernet_scalematch.UperNet_ScaleMatch(
+        encoder_size="small",
+        nclass=3,
+        fpn_channels=16,
         backbone_version="dinov2",
     )
 
@@ -95,7 +107,14 @@ def test_scalematch_remote_dataset_repeat_factor_len():
 
 def test_build_scalematch_model_rejects_non_dpt():
     cfg = {"backbone": "dinov2_small", "nclass": 3, "model": "upernet"}
-    with pytest.raises(ValueError, match="supports only 'dpt'"):
+    model, backbone_version = scalematch.build_scalematch_model(cfg)
+    assert isinstance(model, upernet_scalematch.UperNet_ScaleMatch)
+    assert backbone_version == "dinov2"
+
+
+def test_build_scalematch_model_rejects_unknown_model():
+    cfg = {"backbone": "dinov2_small", "nclass": 3, "model": "unknown"}
+    with pytest.raises(ValueError, match="supports only 'dpt' and 'upernet'"):
         scalematch.build_scalematch_model(cfg)
 
 
@@ -117,6 +136,59 @@ def test_dpt_scalematch_forward_outputs_expected_shapes():
 
 def test_dpt_scalematch_training_outputs_include_pseudo_logits():
     model = build_test_model()
+    model.train()
+    x = torch.randn(4, 3, 56, 56)
+    strong = torch.randn(2, 3, 56, 56)
+
+    out_ori = model(
+        x,
+        scale_factor=1.5,
+        feature_scale=0.75,
+        strong_inputs=strong,
+        pseudo_mode="ori",
+    )
+    out_joint = model(
+        x,
+        scale_factor=0.5,
+        feature_scale=1.25,
+        strong_inputs=strong,
+        pseudo_mode="joint",
+    )
+
+    expected_keys = {
+        "pred_joint",
+        "pred_ori",
+        "pred_size",
+        "pred_fp",
+        "pred_strong",
+        "pseudo_logits",
+    }
+    assert set(out_ori) == expected_keys
+    assert set(out_joint) == expected_keys
+    assert out_ori["pred_strong"].shape == (2, 3, 56, 56)
+    assert out_joint["pred_strong"].shape == (2, 3, 56, 56)
+    assert torch.equal(out_ori["pseudo_logits"], out_ori["pred_ori"].detach())
+    assert torch.equal(out_joint["pseudo_logits"], out_joint["pred_joint"].detach())
+
+
+def test_upernet_scalematch_forward_outputs_expected_shapes():
+    model = build_test_upernet_model()
+    model.eval()
+    x = torch.randn(2, 3, 56, 56)
+
+    logits = model(x, scale_factor=None, feature_scale=1.25)
+    assert logits.shape == (2, 3, 56, 56)
+
+    hi = model(x, scale_factor=1.5, feature_scale=0.75)
+    lo = model(x, scale_factor=0.5, feature_scale=1.25)
+    for out in (hi, lo):
+        assert set(out) == {"pred_joint", "pred_ori", "pred_fp", "pred_size"}
+        for value in out.values():
+            assert value.shape == (2, 3, 56, 56)
+
+
+def test_upernet_scalematch_training_outputs_include_pseudo_logits():
+    model = build_test_upernet_model()
     model.train()
     x = torch.randn(4, 3, 56, 56)
     strong = torch.randn(2, 3, 56, 56)
