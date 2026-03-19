@@ -1,0 +1,29 @@
+# arguments for dataset
+dataset: pascal
+data_root: Your/PASCAL/Path
+nclass: 21
+crop_size: 518
+
+# arguments for training
+epochs: 60
+batch_size: 4 # per GPU
+lr: 0.000005
+lr_multi: 40.0
+criterion:
+  name: CELoss
+  kwargs:
+    ignore_index: 255
+amp: True
+conf_thresh: 0.95
+img_scales: [0.25, 0.5, 1.5, 2.0]
+feat_s_scales: [0.75]
+feat_l_scales: [1.25]
+warm_up: 10
+workers: 4
+val_workers: 1
+ignore_index: 255
+
+# arguments for model
+model: dpt
+backbone: dinov2_small
+lock_backbone: False
