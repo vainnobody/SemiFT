@@ -644,20 +644,12 @@ def main(args, cfg):
 
             log_avg.update(
                 {
-                    "iter_time": time.time() - iter_start,
                     "Total_loss": total_loss,
                     "Loss_x": loss_x,
-                    "Loss_x_joint": loss_x_joint.detach(),
-                    "Loss_x_ori": loss_x_ori.detach(),
                     "Loss_u_s": loss_u_s1,
                     "Loss_u_scale": loss_u_size,
-                    "Loss_u_fp": loss_u_w_fp,
-                    "Conf_x_joint": pred_x_joint.detach().softmax(dim=1).amax(dim=1).mean(),
-                    "Conf_x_ori": pred_x_ori.detach().softmax(dim=1).amax(dim=1).mean(),
-                    "Conf_u_w": conf_u_w.mean(),
+                    "Loss_w_fp_scale": loss_u_w_fp,
                     "Mask_ratio": mask_ratio,
-                    "LR_backbone": optimizer.param_groups[0]["lr"],
-                    "LR_head": optimizer.param_groups[1]["lr"],
                 }
             )
 
