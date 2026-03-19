@@ -6,9 +6,9 @@ SemiFT 是一个基于 PyTorch 的半监督语义分割研究仓库，核心目�
 - 以 `peft/tuners/semift.py` 中的 `semift` 适配器为核心；
 - 默认作用在 Transformer 的 `mlp` 模块；
 - 支持 Mixture-of-Experts / prefix / conv expert 等配置；
-- 已集成到 `unimatchv2_peft.py` 与 `scalematch_peft.py` 两个训练入口中。
+- 已集成到 `unimatchv2_peft.py` 训练入口中。
 
-除了 SemiFT，本仓库也保留了多种半监督分割方法与实验入口，例如 `fixmatch.py`、`fixmatch_rgcr.py`、`unimatch.py`、`unimatch_v2.py`、`rankmatch.py`、`corrmatch.py`、`scalematch.py` 等，方便做对比实验。
+除了 SemiFT，本仓库也保留了多种半监督分割方法与实验入口，例如 `fixmatch.py`、`fixmatch_rgcr.py`、`unimatch.py`、`unimatch_v2.py`、`rankmatch.py`、`corrmatch.py` 等，方便做对比实验。
 
 ---
 
@@ -20,12 +20,11 @@ SemiFT/
 ├── dataset/                 # 数据集与增强
 ├── model/
 │   ├── backbone/            # DINOv2 / DINOv3
-│   └── semseg/              # DPT / UperNet / ScaleMatch 等分割头
+│   └── semseg/              # DPT / UperNet 等分割头
 ├── peft/                    # PEFT 与 SemiFT 适配器实现
 ├── splits/                  # 半监督划分文件
 ├── test/                    # 轻量测试
 ├── unimatchv2_peft.py       # UniMatchV2 + PEFT（推荐 SemiFT 入口）
-├── scalematch_peft.py       # ScaleMatch + PEFT
 ├── fixmatch_rgcr.py         # FixMatch-RGCR 对比入口
 └── README.md
 ```
@@ -38,7 +37,6 @@ SemiFT/
 
 1. **半监督训练框架**
    - `unimatchv2_peft.py`
-   - `scalematch_peft.py`
 
 2. **PEFT / SemiFT 适配器**
    - `peft/tuners/semift.py`
@@ -157,26 +155,6 @@ torchrun --nproc_per_node=4 unimatchv2_peft.py \
 
 ---
 
-## 5.2 ScaleMatch + SemiFT
-
-如果你想把 SemiFT 放在 ScaleMatch 框架中训练，可以使用：
-
-```bash
-torchrun --nproc_per_node=4 scalematch_peft.py \
-  --config configs/pascal.yaml \
-  --labeled-id-path splits/pascal/1_16/labeled.txt \
-  --unlabeled-id-path splits/pascal/1_16/unlabeled.txt \
-  --save-path experiments/scalematch_semift_pascal \
-  --peft-method semift \
-  --peft-target-modules mlp \
-  --freeze-backbone \
-  --port 29501
-```
-
-当前代码中，ScaleMatch 默认图像尺度上限已经限制为 **1.25**，以减少过高分辨率带来的显存与时间开销。
-
----
-
 ## 6. PEFT 方法支持
 
 `peft/tuners/semift.py` 当前支持以下方法：
@@ -227,7 +205,6 @@ peft:
 - `unimatch_v2.py`
 - `rankmatch.py`
 - `corrmatch.py`
-- `scalematch.py`
 - `wscl.py`
 - `dwl.py`
 - `ranpaste.py`
@@ -399,7 +376,7 @@ python scripts/batch_train.py \
 ```bash
 python scripts/batch_train.py \
   --manifest manifests/batch_jobs.example.yaml \
-  --only semift_pascal_1_16,scalematch_pascal_1_16
+  --only semift_pascal_1_16
 ```
 
 临时覆盖输出根目录：
@@ -430,14 +407,13 @@ python scripts/batch_train.py \
 示例：
 
 ```bash
-python -m py_compile unimatchv2_peft.py scalematch_peft.py peft/tuners/semift.py
+python -m py_compile unimatchv2_peft.py peft/tuners/semift.py
 ```
 
 如果本地安装了 `pytest`：
 
 ```bash
 python -m pytest test/test_unimatchv2_peft_config.py
-python -m pytest test/test_scalematch_peft.py
 python -m pytest test/test_batch_train.py
 ```
 
@@ -451,7 +427,7 @@ python -m unittest discover -s test -p 'test_batch_train.py' -v
 
 ## 12. 实用建议
 
-1. **优先从 `unimatchv2_peft.py` 跑通 SemiFT**，再迁移到 ScaleMatch。  
+1. **优先从 `unimatchv2_peft.py` 跑通 SemiFT。**  
 2. 如果显存紧张：
    - 降低 `batch_size`
    - 使用 `dinov2_small`
@@ -472,7 +448,7 @@ python -m unittest discover -s test -p 'test_batch_train.py' -v
 
 如果你只关心本仓库的主方法，可以直接记住下面这条：
 
-> **SemiFT = `unimatchv2_peft.py` / `scalematch_peft.py` + `peft/tuners/semift.py` + `configs/*.yaml` 中的 `peft.method: semift` 配置。**
+> **SemiFT = `unimatchv2_peft.py` + `peft/tuners/semift.py` + `configs/*.yaml` 中的 `peft.method: semift` 配置。**
 
 推荐起步命令：
 

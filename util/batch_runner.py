@@ -40,8 +40,6 @@ TRAINING_ENTRYPOINTS = {
     "fixmatch_rvsc_moe.py",
     "rankmatch.py",
     "ranpaste.py",
-    "scalematch.py",
-    "scalematch_peft.py",
     "segmind.py",
     "supervised.py",
     "unimatch.py",
