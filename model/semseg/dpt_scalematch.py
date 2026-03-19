@@ -369,6 +369,7 @@ class DPT_ScaleMatch(nn.Module):
         scales=None,
         comp_drop=False,
         strong_inputs=None,
+        pseudo_mode=None,
     ):
         del scales
         if comp_drop:
@@ -391,9 +392,17 @@ class DPT_ScaleMatch(nn.Module):
             ).contiguous()
 
         if strong_inputs is not None:
-            return {
-                "multi_scale": self.two_scale_forward(x, scale_factor, feature_scale),
+            multi_scale = self.two_scale_forward(x, scale_factor, feature_scale)
+            outputs = {
+                "pred_joint": multi_scale["pred_joint"],
+                "pred_size": multi_scale["pred_size"],
+                "pred_fp": multi_scale["pred_fp"],
                 "pred_strong": self._strong_forward(strong_inputs),
             }
+            if pseudo_mode == "ori":
+                outputs["pseudo_logits"] = multi_scale["pred_ori"].detach()
+            elif pseudo_mode == "joint":
+                outputs["pseudo_logits"] = multi_scale["pred_joint"].detach()
+            return outputs
 
         return self.two_scale_forward(x, scale_factor, feature_scale)
