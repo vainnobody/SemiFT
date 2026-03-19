@@ -281,10 +281,11 @@ class DPT_ScaleMatch(nn.Module):
 
     def two_scale_forward(self, inputs, scale_factor, feature_scale):
         if scale_factor is None:
-            out, feats, out_fp = self._base_forward(
+            base_forward_out = self._base_forward(
                 inputs, need_fp=self.training, feature_scale=feature_scale
             )
             if self.training:
+                out, feats, out_fp = base_forward_out
                 cat_feats = torch.cat([feats, feats], 1).contiguous()
                 h_f, w_f = cat_feats.size(2), cat_feats.size(3)
 
@@ -301,6 +302,9 @@ class DPT_ScaleMatch(nn.Module):
                 logit_attn = self.scale_attn(channel_attn_feats)
                 dummy = 0.0 * (logit_attn.sum() + out_fp.sum())
                 out = (out + dummy).contiguous()
+                return out
+
+            out, _ = base_forward_out
             return out
 
         x_1x = inputs
