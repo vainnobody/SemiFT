@@ -280,29 +280,18 @@ class DPT_ScaleMatch(nn.Module):
         _, logits_fp = logits_fp.chunk(2)
         return logits, feats_fp, logits_fp
 
+    def _strong_forward(self, x):
+        logits, _ = self._base_forward(x, need_fp=False)
+        return logits.contiguous()
+
     def two_scale_forward(self, inputs, scale_factor, feature_scale):
         if scale_factor is None:
             base_forward_out = self._base_forward(
                 inputs, need_fp=self.training, feature_scale=feature_scale
             )
             if self.training:
-                out, feats, out_fp = base_forward_out
-                cat_feats = torch.cat([feats, feats], 1).contiguous()
-                h_f, w_f = cat_feats.size(2), cat_feats.size(3)
-
-                global_int_feats = self.rwkv_layers(cat_feats)
-                bsz, _, ch = global_int_feats.shape
-                global_int_feats = (
-                    global_int_feats.permute(0, 2, 1)
-                    .reshape(bsz, ch, h_f, w_f)
-                    .contiguous()
-                )
-                channel_attn_feats = self.se_block(
-                    torch.cat([cat_feats, global_int_feats], 1).contiguous()
-                )
-                logit_attn = self.scale_attn(channel_attn_feats)
-                dummy = 0.0 * (logit_attn.sum() + out_fp.sum())
-                return (out + dummy).contiguous()
+                out, _, _ = base_forward_out
+                return out.contiguous()
 
             out, _ = base_forward_out
             return out
@@ -372,7 +361,15 @@ class DPT_ScaleMatch(nn.Module):
             "pred_size": p_lo_ori,
         }
 
-    def forward(self, x, scale_factor=None, feature_scale=1.0, scales=None, comp_drop=False):
+    def forward(
+        self,
+        x,
+        scale_factor=None,
+        feature_scale=1.0,
+        scales=None,
+        comp_drop=False,
+        strong_inputs=None,
+    ):
         del scales
         if comp_drop:
             features, patch_h, patch_w = self._extract_features(x)
@@ -392,5 +389,11 @@ class DPT_ScaleMatch(nn.Module):
             return F.interpolate(
                 out, size=x.shape[-2:], mode="bilinear", align_corners=True
             ).contiguous()
+
+        if strong_inputs is not None:
+            return {
+                "multi_scale": self.two_scale_forward(x, scale_factor, feature_scale),
+                "pred_strong": self._strong_forward(strong_inputs),
+            }
 
         return self.two_scale_forward(x, scale_factor, feature_scale)

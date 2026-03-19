@@ -409,14 +409,14 @@ def main(args, cfg):
                 model.train()
 
                 num_lb = img_x.shape[0]
-                pred = model(
+                student_out = model(
                     torch.cat((img_x, img_u_w)),
                     scale_factor=random_scale,
                     feature_scale=feature_scale,
+                    strong_inputs=img_u_s1,
                 )
-                pred_u_s = model(img_u_s1, scale_factor=None, scales=None)
-                if isinstance(pred_u_s, dict):
-                    pred_u_s = pred_u_s["pred_ori"]
+                pred = student_out["multi_scale"]
+                pred_u_s = student_out["pred_strong"]
 
                 pred_u_w = (
                     pred["pred_ori"][num_lb:]
