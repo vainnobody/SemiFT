@@ -32,9 +32,6 @@ from scalematch import (
     grad_norm,
     write_class_ratios,
 )
-import numpy as np
-import torch.distributed as dist
-
 from supervised import validation_cpu
 from util.classes import CLASSES
 from util.dist_helper import setup_distributed
@@ -109,77 +106,6 @@ def build_model(cfg, peft_cfg, logger=None, rank=0):
 
     model = apply_peft(model, peft_cfg, cfg)
     return model, backbone_version
-
-
-def validation_scalematch_peft(cfg, model, valid_loader):
-    from util.utils import AverageMeter, intersectionAndUnion
-
-    intersection_meter = AverageMeter()
-    union_meter = AverageMeter()
-    target_meter = AverageMeter()
-
-    model.eval()
-
-    with torch.no_grad():
-        for x, y, _ in valid_loader:
-            x = x.cuda()
-            if cfg["eval_mode"] == "slide_window":
-                bsz, _, h, w = x.shape
-                final = torch.zeros(bsz, cfg["nclass"], h, w, device=x.device)
-                size = cfg["crop_size"]
-                step = 510
-                row = 0
-                while row <= int(h / step):
-                    col = 0
-                    while col <= int(w / step):
-                        row_start = min(row * step, h - size)
-                        row_end = min(row * step + size, h)
-                        col_start = min(col * step, w - size)
-                        col_end = min(col * step + size, w)
-                        sub_input = x[:, :, row_start:row_end, col_start:col_end]
-                        mask = model(sub_input)
-                        final[:, :, row_start:row_end, col_start:col_end] += mask
-                        col += 1
-                    row += 1
-                pred = final.argmax(dim=1)
-            elif cfg["eval_mode"] == "resize":
-                original_shape = x.shape[-2:]
-                resized_x = torch.nn.functional.interpolate(
-                    x, size=cfg["crop_size"], mode="bilinear", align_corners=True
-                )
-                resized_o = model(resized_x)
-                pred = torch.nn.functional.interpolate(
-                    resized_o, size=original_shape, mode="bilinear", align_corners=True
-                ).argmax(dim=1)
-            else:
-                pred = model(x).argmax(dim=1)
-
-            gray = np.uint8(pred.cpu().numpy())
-            target = np.array(y, dtype=np.int32)
-            intersection, union, target_area = intersectionAndUnion(
-                gray, target, cfg["nclass"], cfg["ignore_index"]
-            )
-
-            reduced_intersection = torch.from_numpy(intersection).cuda()
-            reduced_union = torch.from_numpy(union).cuda()
-            reduced_target = torch.from_numpy(target_area).cuda()
-
-            if dist.is_available() and dist.is_initialized():
-                dist.all_reduce(reduced_intersection)
-                dist.all_reduce(reduced_union)
-                dist.all_reduce(reduced_target)
-
-            intersection_meter.update(reduced_intersection.cpu().numpy())
-            union_meter.update(reduced_union.cpu().numpy())
-            target_meter.update(reduced_target.cpu().numpy())
-
-    iou_class = intersection_meter.sum / (union_meter.sum + 1e-10)
-    if cfg["dataset"] == "iSAID":
-        miou = np.mean(iou_class[1:]) * 100.0
-    else:
-        miou = np.nanmean(iou_class) * 100.0
-
-    return miou, iou_class
 
 
 def build_optimizer(model, cfg):
@@ -660,7 +586,7 @@ def main(args, cfg):
                 log_avg.reset()
 
         eval_mode = get_eval_mode(cfg)
-        mIoU, iou_class = validation_scalematch_peft(val_cfg, model, valloader)
+        mIoU, iou_class = validation_cpu(val_cfg, model, valloader)
 
         if rank == 0:
             for cls_idx, iou in enumerate(iou_class):
