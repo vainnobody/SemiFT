@@ -236,6 +236,7 @@ def main(args, cfg):
         output_device=local_rank,
         find_unused_parameters=False,
     )
+    model_noddp = model.module
     if cfg["criterion"]["name"] == "CELoss":
         criterion_l = nn.CrossEntropyLoss(**cfg["criterion"]["kwargs"]).cuda(local_rank)
     elif cfg["criterion"]["name"] == "OHEM":
@@ -402,26 +403,33 @@ def main(args, cfg):
             with torch.cuda.amp.autocast(enabled=amp):
                 model.eval()
                 with torch.no_grad():
-                    pred_u_w_mix = model(img_u_w_mix, scale_factor=None, scales=None)
+                    pred_u_w_mix = model_noddp(
+                        img_u_w_mix, scale_factor=None, scales=None
+                    )
                     if isinstance(pred_u_w_mix, dict):
                         pred_u_w_mix = pred_u_w_mix["pred_ori"]
                     conf_u_w_mix, mask_u_w_mix = pred_u_w_mix.softmax(dim=1).max(dim=1)
                 model.train()
 
                 num_lb = img_x.shape[0]
-                student_out = model(
+                pred = model(
                     torch.cat((img_x, img_u_w)),
                     scale_factor=random_scale,
                     feature_scale=feature_scale,
-                    strong_inputs=img_u_s1,
-                    pseudo_mode="ori" if epoch < warm_up else "joint",
                 )
-                pred_u_s = student_out["pred_strong"]
-                pred_x_joint = student_out["pred_joint"][:num_lb]
-                pred_u_w_scale = student_out["pred_size"][num_lb:]
-                pred_u_w_fp = student_out["pred_fp"][num_lb:]
+                pred_u_s = model(img_u_s1, scale_factor=None, scales=None)
+                if isinstance(pred_u_s, dict):
+                    pred_u_s = pred_u_s["pred_ori"]
+                pred_x_joint = pred["pred_joint"][:num_lb]
+                pred_u_w_scale = pred["pred_size"][num_lb:]
+                pred_u_w_fp = pred["pred_fp"][num_lb:]
 
-                pred_u_w = student_out["pseudo_logits"][num_lb:]
+                pred_u_w = (
+                    pred["pred_ori"][num_lb:]
+                    if epoch < warm_up
+                    else pred["pred_joint"][num_lb:]
+                )
+                pred_u_w = pred_u_w.detach()
                 conf_u_w, mask_u_w = pred_u_w.softmax(dim=1).max(dim=1)
 
                 mask_u_w_cutmixed1 = cutmix_mask(mask_u_w, mask_u_w_mix, cutmix_box1)
