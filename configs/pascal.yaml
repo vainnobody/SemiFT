@@ -60,6 +60,9 @@ peft:
   # SemiFT / MoE / ConvExpert parameters
   moe_num_experts: 4
   moe_topk: 2
+  moe_router_balance_mode: deepseek_v3
+  moe_router_bias_update_speed: 0.001
+  moe_router_bias_clip: 0.05
   moe_router_aux_loss_coef: 0.01
   moe_router_z_loss_coef: 0.001
   moe_router_jitter_noise: 0.01

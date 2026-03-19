@@ -39,6 +39,9 @@ DEFAULT_PEFT_CFG: Dict[str, Any] = {
     "hydra_router_dropout": 0.1,
     "moe_num_experts": 4,
     "moe_topk": 2,
+    "moe_router_balance_mode": "deepseek_v3",
+    "moe_router_bias_update_speed": 1e-3,
+    "moe_router_bias_clip": 0.05,
     "moe_router_aux_loss_coef": 1e-2,
     "moe_router_z_loss_coef": 1e-3,
     "moe_router_jitter_noise": 1e-2,
@@ -202,6 +205,16 @@ def build_peft_config(peft_cfg: Dict[str, Any], cfg: Dict[str, Any]):
         ),
         moe_num_experts=peft_cfg.get("moe_num_experts", DEFAULT_PEFT_CFG["moe_num_experts"]),
         moe_topk=peft_cfg.get("moe_topk", DEFAULT_PEFT_CFG["moe_topk"]),
+        moe_router_balance_mode=peft_cfg.get(
+            "moe_router_balance_mode", DEFAULT_PEFT_CFG["moe_router_balance_mode"]
+        ),
+        moe_router_bias_update_speed=peft_cfg.get(
+            "moe_router_bias_update_speed",
+            DEFAULT_PEFT_CFG["moe_router_bias_update_speed"],
+        ),
+        moe_router_bias_clip=peft_cfg.get(
+            "moe_router_bias_clip", DEFAULT_PEFT_CFG["moe_router_bias_clip"]
+        ),
         moe_router_aux_loss_coef=peft_cfg.get(
             "moe_router_aux_loss_coef", DEFAULT_PEFT_CFG["moe_router_aux_loss_coef"]
         ),

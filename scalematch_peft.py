@@ -20,6 +20,7 @@ from scalematch import (
     REMOTE_SENSING_DATASETS,
     ScaleMatchRemoteSemiDataset,
     get_eval_mode,
+    get_scalematch_recipe,
     get_scalematch_dataset_cls,
 )
 from supervised import validation_cpu
@@ -235,7 +236,7 @@ def main(args, cfg):
         device_ids=[local_rank],
         broadcast_buffers=False,
         output_device=local_rank,
-        find_unused_parameters=True,
+        find_unused_parameters=False,
     )
 
     if cfg["criterion"]["name"] == "CELoss":
@@ -252,9 +253,7 @@ def main(args, cfg):
         )
 
     ignore_index = cfg.get("ignore_index", 255)
-    criterion_u = nn.CrossEntropyLoss(reduction="none", ignore_index=ignore_index).cuda(
-        local_rank
-    )
+    criterion_u = nn.CrossEntropyLoss(reduction="none").cuda(local_rank)
 
     SemiDataset, dataset_loader_name = get_scalematch_dataset_cls(cfg["dataset"])
     epoch_repeat_factor = cfg.get("epoch_repeat_factor", 1)
@@ -322,11 +321,12 @@ def main(args, cfg):
         sampler=valsampler,
     )
 
-    img_scales = cfg.get("img_scales", [0.5, 0.75, 1.0, 1.25, 1.5, 2.0])
-    feat_s_scales = cfg.get("feat_s_scales", [0.5, 0.75, 1.0])
-    feat_l_scales = cfg.get("feat_l_scales", [1.0, 1.25, 1.5])
-    conf_thresh = cfg.get("conf_thresh", 0.95)
-    warm_up = cfg.get("warm_up", 5)
+    recipe = get_scalematch_recipe(cfg)
+    img_scales = recipe["img_scales"]
+    feat_s_scales = recipe["feat_s_scales"]
+    feat_l_scales = recipe["feat_l_scales"]
+    conf_thresh = recipe["conf_thresh"]
+    warm_up = recipe["warm_up"]
 
     total_epochs = cfg["epochs"]
     total_iters = len(trainloader_u) * total_epochs
@@ -390,38 +390,39 @@ def main(args, cfg):
             iters = epoch * len(trainloader_u) + i
             cutmix_img_(img_u_s1, img_u_s1_mix, cutmix_box1)
 
-            model.eval()
-            with torch.inference_mode():
-                with torch.cuda.amp.autocast(enabled=amp):
-                    pred_u_w_mix = model.module(img_u_w_mix, scale_factor=None)
+            with torch.cuda.amp.autocast(enabled=amp):
+                model.eval()
+                with torch.no_grad():
+                    pred_u_w_mix = model(img_u_w_mix, scale_factor=None, scales=None)
                     if isinstance(pred_u_w_mix, dict):
                         pred_u_w_mix = pred_u_w_mix["pred_ori"]
                     conf_u_w_mix, mask_u_w_mix = pred_u_w_mix.softmax(dim=1).max(dim=1)
+                model.train()
 
-                    pred_teacher_for_strong = model.module(
-                        img_u_w, scale_factor=random_scale, feature_scale=feature_scale
-                    )
-                    pred_u_w = (
-                        pred_teacher_for_strong["pred_ori"]
-                        if epoch < warm_up
-                        else pred_teacher_for_strong["pred_joint"]
-                    )
-                    conf_u_w, mask_u_w = pred_u_w.detach().softmax(dim=1).max(dim=1)
-            model.train()
-
-            num_lb = img_x.shape[0]
-            optimizer.zero_grad()
-
-            mask_u_w_cutmixed1 = cutmix_mask(mask_u_w, mask_u_w_mix, cutmix_box1)
-            conf_u_w_cutmixed1 = cutmix_mask(conf_u_w, conf_u_w_mix, cutmix_box1)
-            ignore_mask_cutmixed1 = cutmix_mask(
-                ignore_mask, ignore_mask_mix, cutmix_box1
-            )
-
-            with torch.cuda.amp.autocast(enabled=amp):
-                pred_u_s = model(img_u_s1, scale_factor=None)
+                num_lb = img_x.shape[0]
+                pred = model(
+                    torch.cat((img_x, img_u_w)),
+                    scale_factor=random_scale,
+                    feature_scale=feature_scale,
+                )
+                pred_u_s = model(img_u_s1, scale_factor=None, scales=None)
                 if isinstance(pred_u_s, dict):
                     pred_u_s = pred_u_s["pred_ori"]
+
+                pred_u_w = (
+                    pred["pred_ori"][num_lb:]
+                    if epoch < warm_up
+                    else pred["pred_joint"][num_lb:]
+                )
+                pred_u_w = pred_u_w.detach()
+                conf_u_w, mask_u_w = pred_u_w.softmax(dim=1).max(dim=1)
+
+                mask_u_w_cutmixed1 = cutmix_mask(mask_u_w, mask_u_w_mix, cutmix_box1)
+                conf_u_w_cutmixed1 = cutmix_mask(conf_u_w, conf_u_w_mix, cutmix_box1)
+                ignore_mask_cutmixed1 = cutmix_mask(
+                    ignore_mask, ignore_mask_mix, cutmix_box1
+                )
+
                 loss_u_s1 = criterion_u(pred_u_s, mask_u_w_cutmixed1)
                 loss_u_s1 = confidence_weighted_loss(
                     loss_u_s1,
@@ -430,22 +431,6 @@ def main(args, cfg):
                     ignore_index,
                     conf_thresh=conf_thresh,
                 )
-                loss_strong = (0.25 * loss_u_s1) / 2.0
-            scaler.scale(loss_strong).backward()
-
-            with torch.cuda.amp.autocast(enabled=amp):
-                pred = model(
-                    torch.cat((img_x, img_u_w)),
-                    scale_factor=random_scale,
-                    feature_scale=feature_scale,
-                )
-                pred_u_w = (
-                    pred["pred_ori"][num_lb:]
-                    if epoch < warm_up
-                    else pred["pred_joint"][num_lb:]
-                )
-                pred_u_w = pred_u_w.detach()
-                conf_u_w, mask_u_w = pred_u_w.softmax(dim=1).max(dim=1)
 
                 pred_x_joint = pred["pred_joint"][:num_lb]
                 pred_u_w_scale = pred["pred_size"][num_lb:]
@@ -469,12 +454,16 @@ def main(args, cfg):
                     conf_thresh=conf_thresh,
                 )
 
-                loss_main = (loss_x + 0.25 * loss_u_size + 0.5 * loss_u_w_fp) / 2.0
-                total_loss = (
-                    loss_x + 0.25 * loss_u_s1 + 0.25 * loss_u_size + 0.5 * loss_u_w_fp
-                ) / 2.0
+                loss_standard = (
+                    0.25 * loss_u_s1 + 0.25 * loss_u_size + 0.5 * loss_u_w_fp
+                )
+                total_loss = (loss_x + loss_standard) / 2.0
 
-            scaler.scale(loss_main).backward()
+            if world_size > 1:
+                torch.distributed.barrier()
+
+            optimizer.zero_grad()
+            scaler.scale(total_loss).backward()
             scaler.step(optimizer)
             scaler.update()
 

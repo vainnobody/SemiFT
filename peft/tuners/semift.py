@@ -51,6 +51,9 @@ class SemiFTConfig(PeftConfig):
     nclass: int = field(default=5)
     moe_num_experts: int = field(default=4)
     moe_topk: int = field(default=2)
+    moe_router_balance_mode: str = field(default="deepseek_v3")
+    moe_router_bias_update_speed: float = field(default=1e-3)
+    moe_router_bias_clip: float = field(default=0.05)
     moe_router_aux_loss_coef: float = field(default=1e-2)
     moe_router_z_loss_coef: float = field(default=1e-3)
     moe_router_jitter_noise: float = field(default=1e-2)
@@ -295,8 +298,9 @@ class AdaptModel(nn.Module):
             "r": self.peft_config.r,
             "num_experts": self.peft_config.moe_num_experts,
             "topk": self.peft_config.moe_topk,
-            "router_aux_loss_coef": self.peft_config.moe_router_aux_loss_coef,
-            "router_z_loss_coef": self.peft_config.moe_router_z_loss_coef,
+            "router_balance_mode": self.peft_config.moe_router_balance_mode,
+            "router_bias_update_speed": self.peft_config.moe_router_bias_update_speed,
+            "router_bias_clip": self.peft_config.moe_router_bias_clip,
             "router_jitter_noise": self.peft_config.moe_router_jitter_noise,
             "num_prefix_tokens": self.peft_config.moe_num_prefix_tokens,
             "use_shared_expert": self.peft_config.moe_use_shared_expert,

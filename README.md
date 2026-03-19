@@ -137,6 +137,9 @@ peft:
   bias: lora_only
   moe_num_experts: 4
   moe_topk: 2
+  moe_router_balance_mode: deepseek_v3
+  moe_router_bias_update_speed: 0.001
+  moe_router_bias_clip: 0.05
 ```
 
 ### 命令行覆盖示例

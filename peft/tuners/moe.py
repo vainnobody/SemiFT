@@ -1,6 +1,7 @@
 import math
 
 import torch
+import torch.distributed as dist
 import torch.nn as nn
 import torch.nn.functional as F
 
@@ -76,32 +77,45 @@ class GatingNetwork(nn.Module):
         r,
         num_experts,
         topk=2,
-        loss_coef=1e-2,
-        z_loss_coef=1e-3,
         jitter_noise=0.01,
+        balance_mode="deepseek_v3",
+        bias_update_speed=1e-3,
+        bias_clip=0.05,
     ):
         super().__init__()
         self.r = r
         self.num_experts = num_experts
         self.topk = max(1, min(topk, num_experts))
-        self.loss_coef = loss_coef
-        self.z_loss_coef = z_loss_coef
         self.jitter_noise = jitter_noise
+        self.balance_mode = balance_mode
+        self.bias_update_speed = bias_update_speed
+        self.bias_clip = bias_clip
 
         self.norm = nn.LayerNorm(r)
         self.gate_proj = nn.Linear(r, num_experts, bias=False)
+        self.register_buffer("expert_bias", torch.zeros(num_experts, dtype=torch.float32))
+        self.register_buffer("expert_load", torch.zeros(num_experts, dtype=torch.float32))
 
         nn.init.kaiming_uniform_(self.gate_proj.weight, a=math.sqrt(5))
 
-    def _load_balancing_loss(self, router_probs, topk_idx):
+    def _compute_expert_load(self, topk_idx):
         expert_mask = F.one_hot(topk_idx.reshape(-1), num_classes=self.num_experts).float()
-        tokens_per_expert = expert_mask.mean(dim=0)
-        router_prob_per_expert = router_probs.mean(dim=0)
-        return self.num_experts * torch.sum(tokens_per_expert * router_prob_per_expert)
+        selected_counts = expert_mask.sum(dim=0)
+        if dist.is_available() and dist.is_initialized():
+            dist.all_reduce(selected_counts, op=dist.ReduceOp.SUM)
+        total_selected = selected_counts.sum().clamp_min(1.0)
+        return selected_counts / total_selected
 
-    def _z_loss(self, router_logits):
-        log_z = torch.logsumexp(router_logits.float(), dim=-1)
-        return torch.mean(log_z.square())
+    @torch.no_grad()
+    def _update_expert_bias(self, expert_load):
+        if self.balance_mode != "deepseek_v3" or self.num_experts <= 1:
+            return
+        target = expert_load.new_full((self.num_experts,), 1.0 / self.num_experts)
+        direction = torch.sign(target - expert_load)
+        updated_bias = self.expert_bias + direction * self.bias_update_speed
+        updated_bias = updated_bias.clamp_(-self.bias_clip, self.bias_clip)
+        self.expert_bias.copy_(updated_bias)
+        self.expert_load.copy_(expert_load)
 
     def forward(self, x):
         bsz, n_tokens, dim = x.shape
@@ -114,23 +128,27 @@ class GatingNetwork(nn.Module):
 
         router_logits = self.gate_proj(flat_x)
         router_probs = torch.softmax(router_logits.float(), dim=-1).to(flat_x.dtype)
+        selection_scores = router_probs.float() + self.expert_bias.unsqueeze(0)
 
-        topk_weight, topk_idx = torch.topk(router_probs, k=self.topk, dim=-1, sorted=False)
+        _, topk_idx = torch.topk(selection_scores, k=self.topk, dim=-1, sorted=False)
+        topk_weight = torch.gather(router_probs, dim=-1, index=topk_idx)
         topk_weight = topk_weight / topk_weight.sum(dim=-1, keepdim=True).clamp_min(torch.finfo(topk_weight.dtype).eps)
 
         aux_loss = router_logits.new_zeros(())
         z_loss = router_logits.new_zeros(())
+        expert_load = self._compute_expert_load(topk_idx)
+        self.expert_load.copy_(expert_load)
         if self.training and self.num_experts > 1:
-            if self.loss_coef > 0:
-                aux_loss = self._load_balancing_loss(router_probs, topk_idx) * self.loss_coef
-            if self.z_loss_coef > 0:
-                z_loss = self._z_loss(router_logits) * self.z_loss_coef
+            self._update_expert_bias(expert_load)
 
         stats = {
             'aux_loss': aux_loss.to(x.dtype),
             'z_loss': z_loss.to(x.dtype),
             'router_logits': router_logits.view(bsz, n_tokens, self.num_experts),
             'router_probs': router_probs.view(bsz, n_tokens, self.num_experts),
+            'selection_scores': selection_scores.view(bsz, n_tokens, self.num_experts),
+            'expert_bias': self.expert_bias.detach().clone(),
+            'expert_load': self.expert_load.detach().clone(),
         }
         return (
             topk_idx.view(bsz, n_tokens, self.topk),
@@ -247,9 +265,10 @@ class SemiFt(nn.Module):
         num_experts=4,
         topk=2,
         num_prefix_tokens=5,
-        router_aux_loss_coef=1e-2,
-        router_z_loss_coef=1e-3,
         router_jitter_noise=0.01,
+        router_balance_mode="deepseek_v3",
+        router_bias_update_speed=1e-3,
+        router_bias_clip=0.05,
         use_shared_expert=True,
         expert_dropout=0.0,
         scales=None,
@@ -290,15 +309,19 @@ class SemiFt(nn.Module):
             r=r,
             num_experts=num_experts,
             topk=self.topk,
-            loss_coef=router_aux_loss_coef,
-            z_loss_coef=router_z_loss_coef,
             jitter_noise=router_jitter_noise,
+            balance_mode=router_balance_mode,
+            bias_update_speed=router_bias_update_speed,
+            bias_clip=router_bias_clip,
         )
         self.aux_loss = None
         self.router_aux_loss = None
         self.router_z_loss = None
         self.router_logits = None
         self.router_probs = None
+        self.selection_scores = None
+        self.expert_bias = None
+        self.expert_load = None
         self.last_hw = None
 
         self.reset_parameters()
@@ -354,6 +377,9 @@ class SemiFt(nn.Module):
             self.router_z_loss = zero
             self.router_logits = None
             self.router_probs = None
+            self.selection_scores = None
+            self.expert_bias = self.gating_network.expert_bias.detach().clone()
+            self.expert_load = self.gating_network.expert_load.detach().clone()
             self.last_hw = None
             return out
 
@@ -367,14 +393,16 @@ class SemiFt(nn.Module):
         shared_out = self.shared_expert(patch_tokens, hw=resolved_hw) if self.shared_expert is not None else 0.0
         combined = residual + shared_out + sparse_out
 
-        total_aux = router_stats['aux_loss'] + router_stats['z_loss']
-        combined = AddAuxiliaryLoss.apply(combined, total_aux)
+        zero = patch_tokens.new_zeros(())
 
-        self.router_aux_loss = router_stats['aux_loss']
-        self.router_z_loss = router_stats['z_loss']
+        self.router_aux_loss = zero
+        self.router_z_loss = zero
         self.router_logits = router_stats['router_logits']
         self.router_probs = router_stats['router_probs']
-        self.aux_loss = total_aux
+        self.selection_scores = router_stats['selection_scores']
+        self.expert_bias = router_stats['expert_bias']
+        self.expert_load = router_stats['expert_load']
+        self.aux_loss = zero
 
         x = torch.cat([prefix, combined], dim=1)
         x = self.ls(self.proj_up(x))
