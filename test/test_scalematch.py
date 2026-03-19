@@ -11,10 +11,10 @@ stub_tb = types.ModuleType("torch.utils.tensorboard")
 
 class StubSummaryWriter:
     def __init__(self, *args, **kwargs):
-        pass
+        self.scalars = []
 
     def add_scalar(self, *args, **kwargs):
-        pass
+        self.scalars.append((args, kwargs))
 
 
 stub_tb.SummaryWriter = StubSummaryWriter
@@ -150,3 +150,103 @@ def test_dpt_scalematch_training_outputs_include_pseudo_logits():
     assert out_joint["pred_strong"].shape == (2, 3, 56, 56)
     assert torch.equal(out_ori["pseudo_logits"], out_ori["pred_ori"].detach())
     assert torch.equal(out_joint["pseudo_logits"], out_joint["pred_joint"].detach())
+
+
+def test_compute_masked_class_hist_and_ratio():
+    labels = torch.tensor([[0, 1, 2], [2, 1, 0]])
+    valid_mask = torch.tensor([[True, False, True], [False, True, True]])
+
+    hist = scalematch.compute_masked_class_hist(labels, 3, valid_mask)
+    ratio = scalematch.compute_class_ratio(labels, 3, valid_mask)
+
+    assert torch.equal(hist, torch.tensor([2.0, 1.0, 1.0]))
+    assert torch.allclose(ratio, torch.tensor([0.5, 0.25, 0.25]))
+
+
+def test_masked_agreement_uses_valid_pixels_only():
+    pred_a = torch.tensor([[0, 1], [2, 2]])
+    pred_b = torch.tensor([[0, 0], [2, 1]])
+    valid_mask = torch.tensor([[True, False], [True, True]])
+
+    agreement = scalematch.masked_agreement(pred_a, pred_b, valid_mask)
+
+    assert torch.isclose(agreement, torch.tensor(2.0 / 3.0))
+
+
+def test_collect_debug_metrics_returns_expected_keys_and_shapes():
+    nclass = 3
+    num_lb = 1
+    pred_u_w = torch.tensor(
+        [
+            [
+                [[4.0, 0.0], [0.0, 4.0]],
+                [[0.0, 4.0], [4.0, 0.0]],
+                [[-1.0, -1.0], [-1.0, -1.0]],
+            ]
+        ]
+    )
+    student_out = {
+        "pred_ori": torch.tensor(
+            [
+                [[[4.0, 1.0], [1.0, 4.0]], [[1.0, 4.0], [4.0, 1.0]], [[0.0, 0.0], [0.0, 0.0]]],
+                [[[4.0, 0.0], [0.0, 4.0]], [[0.0, 4.0], [4.0, 0.0]], [[-1.0, -1.0], [-1.0, -1.0]]],
+            ]
+        ),
+        "pred_joint": torch.tensor(
+            [
+                [[[1.0, 4.0], [4.0, 1.0]], [[4.0, 1.0], [1.0, 4.0]], [[0.0, 0.0], [0.0, 0.0]]],
+                [[[4.0, 0.0], [0.0, 4.0]], [[0.0, 4.0], [4.0, 0.0]], [[-1.0, -1.0], [-1.0, -1.0]]],
+            ]
+        ),
+    }
+    pred_u_s = pred_u_w.clone()
+    pred_x_joint = student_out["pred_joint"][:1]
+    pred_x_ori = student_out["pred_ori"][:1]
+    mask_u_w_cutmixed1 = torch.tensor([[[0, 1], [1, 0]]])
+    conf_u_w = torch.tensor([[[0.99, 0.98], [0.97, 0.96]]])
+    conf_u_w_cutmixed1 = conf_u_w.clone()
+    valid_mask = torch.tensor([[[True, True], [True, False]]])
+    ignore_mask_cutmixed1 = torch.tensor([[[0, 0], [0, 255]]])
+
+    metrics = scalematch.collect_debug_metrics(
+        pred_u_w=pred_u_w,
+        student_out=student_out,
+        pred_u_s=pred_u_s,
+        pred_x_joint=pred_x_joint,
+        pred_x_ori=pred_x_ori,
+        mask_u_w_cutmixed1=mask_u_w_cutmixed1,
+        conf_u_w=conf_u_w,
+        conf_u_w_cutmixed1=conf_u_w_cutmixed1,
+        valid_mask=valid_mask,
+        ignore_mask_cutmixed1=ignore_mask_cutmixed1,
+        ignore_index=255,
+        conf_thresh=0.95,
+        num_lb=num_lb,
+        nclass=nclass,
+    )
+
+    expected_scalar_keys = {
+        "teacher_vs_student_ori_agreement",
+        "teacher_vs_student_joint_agreement",
+        "student_joint_vs_ori_agreement",
+        "strong_vs_pseudo_agreement",
+        "conf_teacher_pseudo",
+        "conf_student_ori_u",
+        "conf_student_joint_u",
+        "conf_student_strong",
+    }
+    expected_ratio_keys = {
+        "pseudo_ratio",
+        "accepted_pseudo_ratio",
+        "student_joint_ratio",
+        "student_ori_ratio",
+        "strong_ratio",
+        "labeled_joint_ratio",
+        "labeled_ori_ratio",
+    }
+
+    assert expected_scalar_keys.issubset(metrics.keys())
+    assert expected_ratio_keys.issubset(metrics.keys())
+    for key in expected_ratio_keys:
+        assert metrics[key].shape == (nclass,)
+        assert torch.isclose(metrics[key].sum(), torch.tensor(1.0))

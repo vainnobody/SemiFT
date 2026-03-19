@@ -5,6 +5,7 @@ Ported from the official ScaleMatch training logic onto the SemiFT DPT backbone.
 """
 
 import argparse
+from datetime import datetime
 import logging
 import os
 import pprint
@@ -65,6 +66,133 @@ MODEL_CONFIGS = {
         "out_channels": [1536, 1536, 1536, 1536],
     },
 }
+
+
+def get_debug_cfg(cfg):
+    debug_cfg = cfg.get("debug", {})
+    return {
+        "enabled": debug_cfg.get("enabled", False),
+        "class_stats_interval": max(int(debug_cfg.get("class_stats_interval", 50)), 1),
+        "grad_stats_interval": max(int(debug_cfg.get("grad_stats_interval", 50)), 1),
+        "viz_train_iters": max(int(debug_cfg.get("viz_train_iters", 5)), 0),
+    }
+
+
+def compute_masked_class_hist(labels, num_classes, valid_mask=None):
+    labels = labels.detach().reshape(-1).long()
+    if valid_mask is not None:
+        valid_mask = valid_mask.detach().reshape(-1).bool()
+        labels = labels[valid_mask]
+    if labels.numel() == 0:
+        return torch.zeros(num_classes, device=labels.device, dtype=torch.float32)
+    valid_labels = labels[(labels >= 0) & (labels < num_classes)]
+    if valid_labels.numel() == 0:
+        return torch.zeros(num_classes, device=labels.device, dtype=torch.float32)
+    hist = torch.bincount(valid_labels, minlength=num_classes).float()
+    return hist
+
+
+def compute_class_ratio(labels, num_classes, valid_mask=None):
+    hist = compute_masked_class_hist(labels, num_classes, valid_mask=valid_mask)
+    total = hist.sum()
+    if total <= 0:
+        return hist
+    return hist / total
+
+
+def masked_agreement(pred_a, pred_b, valid_mask=None):
+    same = pred_a.detach().eq(pred_b.detach())
+    if valid_mask is not None:
+        valid_mask = valid_mask.detach().bool()
+        denom = valid_mask.sum().clamp(min=1).float()
+        return (same & valid_mask).sum().float() / denom
+    return same.float().mean()
+
+
+def grad_norm(module):
+    total = 0.0
+    found = False
+    for param in module.parameters():
+        if param.grad is None:
+            continue
+        found = True
+        total += float(param.grad.detach().norm().item() ** 2)
+    if not found:
+        return 0.0
+    return total**0.5
+
+
+def write_class_ratios(writer, prefix, ratios, class_names, step):
+    for idx, class_name in enumerate(class_names):
+        writer.add_scalar(f"{prefix}/{class_name}", ratios[idx].item(), step)
+
+
+def collect_debug_metrics(
+    pred_u_w,
+    student_out,
+    pred_u_s,
+    pred_x_joint,
+    pred_x_ori,
+    mask_u_w_cutmixed1,
+    conf_u_w,
+    conf_u_w_cutmixed1,
+    valid_mask,
+    ignore_mask_cutmixed1,
+    ignore_index,
+    conf_thresh,
+    num_lb,
+    nclass,
+):
+    teacher_pred = pred_u_w.detach().argmax(dim=1)
+    student_ori_u = student_out["pred_ori"][num_lb:].detach().argmax(dim=1)
+    student_joint_u = student_out["pred_joint"][num_lb:].detach().argmax(dim=1)
+    strong_pred = pred_u_s.detach().argmax(dim=1)
+
+    accepted_valid_mask = valid_mask & (conf_u_w >= conf_thresh)
+    strong_valid_mask = (ignore_mask_cutmixed1 != ignore_index) & (
+        conf_u_w_cutmixed1 >= conf_thresh
+    )
+
+    metrics = {
+        "teacher_vs_student_ori_agreement": masked_agreement(
+            teacher_pred, student_ori_u, valid_mask
+        ),
+        "teacher_vs_student_joint_agreement": masked_agreement(
+            teacher_pred, student_joint_u, valid_mask
+        ),
+        "student_joint_vs_ori_agreement": masked_agreement(
+            student_joint_u, student_ori_u, valid_mask
+        ),
+        "strong_vs_pseudo_agreement": masked_agreement(
+            strong_pred, mask_u_w_cutmixed1, strong_valid_mask
+        ),
+        "conf_teacher_pseudo": conf_u_w.mean(),
+        "conf_student_ori_u": student_out["pred_ori"][num_lb:]
+        .detach()
+        .softmax(dim=1)
+        .amax(dim=1)
+        .mean(),
+        "conf_student_joint_u": student_out["pred_joint"][num_lb:]
+        .detach()
+        .softmax(dim=1)
+        .amax(dim=1)
+        .mean(),
+        "conf_student_strong": pred_u_s.detach().softmax(dim=1).amax(dim=1).mean(),
+        "pseudo_ratio": compute_class_ratio(teacher_pred, nclass, valid_mask),
+        "accepted_pseudo_ratio": compute_class_ratio(
+            teacher_pred, nclass, accepted_valid_mask
+        ),
+        "student_joint_ratio": compute_class_ratio(student_joint_u, nclass, valid_mask),
+        "student_ori_ratio": compute_class_ratio(student_ori_u, nclass, valid_mask),
+        "strong_ratio": compute_class_ratio(strong_pred, nclass, strong_valid_mask),
+        "labeled_joint_ratio": compute_class_ratio(
+            pred_x_joint.detach().argmax(dim=1), nclass
+        ),
+        "labeled_ori_ratio": compute_class_ratio(
+            pred_x_ori.detach().argmax(dim=1), nclass
+        ),
+    }
+    return metrics
 
 
 class ScaleMatchRemoteSemiDataset(RemoteSemiDataset):
@@ -154,6 +282,9 @@ def main(args, cfg):
 
     rank, world_size = setup_distributed(port=args.port)
     amp = cfg.get("amp", False)
+    debug_cfg = get_debug_cfg(cfg)
+    debug_enabled = debug_cfg["enabled"]
+    viz = None
 
     if rank == 0:
         all_args = {**cfg, **vars(args), "ngpus": world_size}
@@ -161,6 +292,13 @@ def main(args, cfg):
         logger.info("{}\n".format(pprint.pformat(all_args)))
         writer = SummaryWriter(args.save_path)
         os.makedirs(args.save_path, exist_ok=True)
+        if debug_enabled:
+            from util.viz import Visualizer
+
+            filename = datetime.now().strftime("%Y%m%d_%H%M%S")
+            viz = Visualizer(
+                save_dir=f"./viz/{filename}_scalematch", dataset=cfg["dataset"]
+            )
 
     cudnn.enabled = True
     cudnn.benchmark = True
@@ -477,6 +615,25 @@ def main(args, cfg):
                 ) / 2.0
 
             scaler.scale(loss_main).backward()
+
+            if (
+                debug_enabled
+                and rank == 0
+                and (i % debug_cfg["grad_stats_interval"] == 0)
+            ):
+                writer.add_scalar(
+                    "debug/grad/scale_attn", grad_norm(model_noddp.scale_attn), iters
+                )
+                writer.add_scalar(
+                    "debug/grad/se_block", grad_norm(model_noddp.se_block), iters
+                )
+                writer.add_scalar(
+                    "debug/grad/rwkv_layers", grad_norm(model_noddp.rwkv_layers), iters
+                )
+                writer.add_scalar(
+                    "debug/grad/head", grad_norm(model_noddp.head), iters
+                )
+
             scaler.step(optimizer)
             scaler.update()
 
@@ -503,6 +660,134 @@ def main(args, cfg):
                     "LR_head": optimizer.param_groups[1]["lr"],
                 }
             )
+
+            if (
+                debug_enabled
+                and rank == 0
+                and (i % debug_cfg["class_stats_interval"] == 0)
+            ):
+                debug_metrics = collect_debug_metrics(
+                    pred_u_w=pred_u_w,
+                    student_out=student_out,
+                    pred_u_s=pred_u_s,
+                    pred_x_joint=pred_x_joint,
+                    pred_x_ori=pred_x_ori,
+                    mask_u_w_cutmixed1=mask_u_w_cutmixed1,
+                    conf_u_w=conf_u_w,
+                    conf_u_w_cutmixed1=conf_u_w_cutmixed1,
+                    valid_mask=valid_mask,
+                    ignore_mask_cutmixed1=ignore_mask_cutmixed1,
+                    ignore_index=ignore_index,
+                    conf_thresh=conf_thresh,
+                    num_lb=num_lb,
+                    nclass=cfg["nclass"],
+                )
+                for metric_name in (
+                    "teacher_vs_student_ori_agreement",
+                    "teacher_vs_student_joint_agreement",
+                    "student_joint_vs_ori_agreement",
+                    "strong_vs_pseudo_agreement",
+                    "conf_teacher_pseudo",
+                    "conf_student_ori_u",
+                    "conf_student_joint_u",
+                    "conf_student_strong",
+                ):
+                    writer.add_scalar(
+                        f"debug/{metric_name}", debug_metrics[metric_name], iters
+                    )
+                write_class_ratios(
+                    writer,
+                    "debug/pseudo_ratio",
+                    debug_metrics["pseudo_ratio"],
+                    CLASSES[cfg["dataset"]],
+                    iters,
+                )
+                write_class_ratios(
+                    writer,
+                    "debug/accepted_pseudo_ratio",
+                    debug_metrics["accepted_pseudo_ratio"],
+                    CLASSES[cfg["dataset"]],
+                    iters,
+                )
+                write_class_ratios(
+                    writer,
+                    "debug/student_joint_ratio",
+                    debug_metrics["student_joint_ratio"],
+                    CLASSES[cfg["dataset"]],
+                    iters,
+                )
+                write_class_ratios(
+                    writer,
+                    "debug/student_ori_ratio",
+                    debug_metrics["student_ori_ratio"],
+                    CLASSES[cfg["dataset"]],
+                    iters,
+                )
+                write_class_ratios(
+                    writer,
+                    "debug/strong_ratio",
+                    debug_metrics["strong_ratio"],
+                    CLASSES[cfg["dataset"]],
+                    iters,
+                )
+                write_class_ratios(
+                    writer,
+                    "debug/labeled_joint_ratio",
+                    debug_metrics["labeled_joint_ratio"],
+                    CLASSES[cfg["dataset"]],
+                    iters,
+                )
+                write_class_ratios(
+                    writer,
+                    "debug/labeled_ori_ratio",
+                    debug_metrics["labeled_ori_ratio"],
+                    CLASSES[cfg["dataset"]],
+                    iters,
+                )
+
+            if (
+                debug_enabled
+                and rank == 0
+                and viz is not None
+                and i < debug_cfg["viz_train_iters"]
+            ):
+                viz.push(
+                    {
+                        "img_x": (img_x[0], viz.TENSOR),
+                        "mask_x": (mask_x[0], viz.SEGMENTATION),
+                        "pred_x_ori": (pred_x_ori.argmax(dim=1)[0], viz.SEGMENTATION),
+                        "pred_x_joint": (
+                            pred_x_joint.argmax(dim=1)[0],
+                            viz.SEGMENTATION,
+                        ),
+                        "img_u_w": (img_u_w[0], viz.TENSOR),
+                        "pseudo_u_w": (mask_u_w[0], viz.SEGMENTATION),
+                        "pred_u_w_ori_student": (
+                            student_out["pred_ori"][num_lb:].argmax(dim=1)[0],
+                            viz.SEGMENTATION,
+                        ),
+                        "pred_u_w_joint_student": (
+                            student_out["pred_joint"][num_lb:].argmax(dim=1)[0],
+                            viz.SEGMENTATION,
+                        ),
+                        "img_u_s1": (img_u_s1[0], viz.TENSOR),
+                        "mask_cutmix": (
+                            mask_u_w_cutmixed1[0],
+                            viz.SEGMENTATION,
+                        ),
+                        "pred_u_s": (pred_u_s.argmax(dim=1)[0], viz.SEGMENTATION),
+                        "pred_u_w_scale": (
+                            pred_u_w_scale.argmax(dim=1)[0],
+                            viz.SEGMENTATION,
+                        ),
+                        "pred_u_w_fp": (
+                            pred_u_w_fp.argmax(dim=1)[0],
+                            viz.SEGMENTATION,
+                        ),
+                    }
+                )
+                viz.render(f"epoch_{epoch}_iter_{i}")
+                viz.reset()
 
             lr = cfg["lr"] * (1 - iters / total_iters) ** 0.9
             optimizer.param_groups[0]["lr"] = lr

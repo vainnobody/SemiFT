@@ -22,6 +22,12 @@ warm_up: 10
 workers: 4
 val_workers: 1
 ignore_index: 255
+# Optional training debug instrumentation
+# debug:
+#   enabled: true
+#   class_stats_interval: 50
+#   grad_stats_interval: 50
+#   viz_train_iters: 5
 
 # arguments for model
 model: dpt
