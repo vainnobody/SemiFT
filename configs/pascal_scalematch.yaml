@@ -15,9 +15,9 @@ criterion:
     ignore_index: 255
 amp: True
 conf_thresh: 0.95
-img_scales: [0.25, 0.5, 1.5, 2.0]
+img_scales: [0.5, 0.75, 1.0, 1.25]
 feat_s_scales: [0.75]
-feat_l_scales: [1.25]
+feat_l_scales: [1.0, 1.25, 1.5]
 warm_up: 10
 workers: 4
 val_workers: 1

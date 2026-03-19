@@ -39,9 +39,9 @@ from util.train_utils import (
 
 NATURAL_IMAGE_DATASETS = {"pascal", "cityscapes"}
 REMOTE_SENSING_DATASETS = {"iSAID", "vaihingen", "potsdam", "loveda"}
-OFFICIAL_IMG_SCALES = [0.25, 0.5, 1.5, 2.0]
-OFFICIAL_FEAT_S_SCALES = [0.75]
-OFFICIAL_FEAT_L_SCALES = [1.25]
+DEFAULT_IMG_SCALES = [0.5, 0.75, 1.0, 1.25]
+DEFAULT_FEAT_S_SCALES = [0.75]
+DEFAULT_FEAT_L_SCALES = [1.0, 1.25, 1.5]
 OFFICIAL_WARM_UP = 10
 MODEL_CONFIGS = {
     "small": {
@@ -106,9 +106,9 @@ def get_eval_mode(cfg):
 
 def get_scalematch_recipe(cfg):
     return {
-        "img_scales": cfg.get("img_scales", OFFICIAL_IMG_SCALES),
-        "feat_s_scales": cfg.get("feat_s_scales", OFFICIAL_FEAT_S_SCALES),
-        "feat_l_scales": cfg.get("feat_l_scales", OFFICIAL_FEAT_L_SCALES),
+        "img_scales": cfg.get("img_scales", DEFAULT_IMG_SCALES),
+        "feat_s_scales": cfg.get("feat_s_scales", DEFAULT_FEAT_S_SCALES),
+        "feat_l_scales": cfg.get("feat_l_scales", DEFAULT_FEAT_L_SCALES),
         "conf_thresh": cfg.get(
             "conf_thresh", 0.0 if cfg["dataset"] == "cityscapes" else 0.95
         ),
@@ -391,38 +391,38 @@ def main(args, cfg):
             iters = epoch * len(trainloader_u) + i
             cutmix_img_(img_u_s1, img_u_s1_mix, cutmix_box1)
 
-            with torch.cuda.amp.autocast(enabled=amp):
-                model.eval()
-                with torch.no_grad():
-                    pred_u_w_mix = model_noddp(
-                        img_u_w_mix, scale_factor=None, scales=None
-                    )
+            model.eval()
+            with torch.no_grad():
+                with torch.cuda.amp.autocast(enabled=amp):
+                    pred_u_w_mix = model_noddp(img_u_w_mix, scale_factor=None)
                     if isinstance(pred_u_w_mix, dict):
                         pred_u_w_mix = pred_u_w_mix["pred_ori"]
                     conf_u_w_mix, mask_u_w_mix = pred_u_w_mix.softmax(dim=1).max(dim=1)
-                model.train()
 
-                num_lb = img_x.shape[0]
-                student_out = model(
-                    torch.cat((img_x, img_u_w)),
-                    scale_factor=random_scale,
-                    feature_scale=feature_scale,
-                    strong_inputs=img_u_s1,
-                    pseudo_mode="ori" if epoch < warm_up else "joint",
-                )
-                pred_u_s = student_out["pred_strong"]
-                pred_x_joint = student_out["pred_joint"][:num_lb]
-                pred_x_ori = student_out["pred_ori"][:num_lb]
-                pred_u_w_scale = student_out["pred_size"][num_lb:]
-                pred_u_w_fp = student_out["pred_fp"][num_lb:]
-                pred_u_w = student_out["pseudo_logits"][num_lb:]
-                conf_u_w, mask_u_w = pred_u_w.softmax(dim=1).max(dim=1)
+                    teacher_out = model_noddp(
+                        img_u_w,
+                        scale_factor=random_scale,
+                        feature_scale=feature_scale,
+                    )
+                    pred_u_w = (
+                        teacher_out["pred_ori"]
+                        if epoch < warm_up
+                        else teacher_out["pred_joint"]
+                    )
+                    conf_u_w, mask_u_w = pred_u_w.detach().softmax(dim=1).max(dim=1)
+            model.train()
+            optimizer.zero_grad()
 
-                mask_u_w_cutmixed1 = cutmix_mask(mask_u_w, mask_u_w_mix, cutmix_box1)
-                conf_u_w_cutmixed1 = cutmix_mask(conf_u_w, conf_u_w_mix, cutmix_box1)
-                ignore_mask_cutmixed1 = cutmix_mask(
-                    ignore_mask, ignore_mask_mix, cutmix_box1
-                )
+            mask_u_w_cutmixed1 = cutmix_mask(mask_u_w, mask_u_w_mix, cutmix_box1)
+            conf_u_w_cutmixed1 = cutmix_mask(conf_u_w, conf_u_w_mix, cutmix_box1)
+            ignore_mask_cutmixed1 = cutmix_mask(
+                ignore_mask, ignore_mask_mix, cutmix_box1
+            )
+
+            with torch.cuda.amp.autocast(enabled=amp):
+                pred_u_s = model(img_u_s1, scale_factor=None)
+                if isinstance(pred_u_s, dict):
+                    pred_u_s = pred_u_s["pred_ori"]
 
                 loss_u_s1 = criterion_u(pred_u_s, mask_u_w_cutmixed1)
                 loss_u_s1 = confidence_weighted_loss(
@@ -432,6 +432,22 @@ def main(args, cfg):
                     ignore_index,
                     conf_thresh=conf_thresh,
                 )
+                loss_strong = (0.25 * loss_u_s1) / 2.0
+
+            scaler.scale(loss_strong).backward()
+
+            with torch.cuda.amp.autocast(enabled=amp):
+                num_lb = img_x.shape[0]
+                student_out = model(
+                    torch.cat((img_x, img_u_w)),
+                    scale_factor=random_scale,
+                    feature_scale=feature_scale,
+                )
+
+                pred_x_joint = student_out["pred_joint"][:num_lb]
+                pred_x_ori = student_out["pred_ori"][:num_lb]
+                pred_u_w_scale = student_out["pred_size"][num_lb:]
+                pred_u_w_fp = student_out["pred_fp"][num_lb:]
 
                 loss_x_joint = criterion_l(pred_x_joint, mask_x)
                 loss_x_ori = criterion_l(pred_x_ori, mask_x)
@@ -455,13 +471,12 @@ def main(args, cfg):
                     conf_thresh=conf_thresh,
                 )
 
-                loss_standard = (
-                    0.25 * loss_u_s1 + 0.25 * loss_u_size + 0.5 * loss_u_w_fp
-                )
-                total_loss = (loss_x + loss_standard) / 2.0
+                loss_main = (loss_x + 0.25 * loss_u_size + 0.5 * loss_u_w_fp) / 2.0
+                total_loss = (
+                    loss_x + 0.25 * loss_u_s1 + 0.25 * loss_u_size + 0.5 * loss_u_w_fp
+                ) / 2.0
 
-            optimizer.zero_grad()
-            scaler.scale(total_loss).backward()
+            scaler.scale(loss_main).backward()
             scaler.step(optimizer)
             scaler.update()
 

@@ -79,7 +79,8 @@ def build_test_model():
 def test_scalematch_recipe_uses_cityscapes_defaults():
     recipe = scalematch.get_scalematch_recipe({"dataset": "cityscapes"})
     assert recipe["conf_thresh"] == 0.0
-    assert recipe["img_scales"] == [0.25, 0.5, 1.5, 2.0]
+    assert recipe["img_scales"] == [0.5, 0.75, 1.0, 1.25]
+    assert recipe["feat_l_scales"] == [1.0, 1.25, 1.5]
     assert recipe["warm_up"] == 10
 
 
