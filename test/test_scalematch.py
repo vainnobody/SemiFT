@@ -250,3 +250,17 @@ def test_collect_debug_metrics_returns_expected_keys_and_shapes():
     for key in expected_ratio_keys:
         assert metrics[key].shape == (nclass,)
         assert torch.isclose(metrics[key].sum(), torch.tensor(1.0))
+
+
+def test_compute_official_scalematch_total_loss_matches_official_weights():
+    loss_x = torch.tensor(2.0)
+    loss_u_s1 = torch.tensor(4.0)
+    loss_u_size = torch.tensor(6.0)
+    loss_u_w_fp = torch.tensor(8.0)
+
+    total = scalematch.compute_official_scalematch_total_loss(
+        loss_x, loss_u_s1, loss_u_size, loss_u_w_fp
+    )
+
+    expected = torch.tensor((2.0 + 0.25 * 4.0 + 0.25 * 6.0 + 0.5 * 8.0) / 2.0)
+    assert torch.isclose(total, expected)

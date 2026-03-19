@@ -127,6 +127,12 @@ def write_class_ratios(writer, prefix, ratios, class_names, step):
         writer.add_scalar(f"{prefix}/{class_name}", ratios[idx].item(), step)
 
 
+def compute_official_scalematch_total_loss(
+    loss_x, loss_u_s1, loss_u_size, loss_u_w_fp
+):
+    return (loss_x + 0.25 * loss_u_s1 + 0.25 * loss_u_size + 0.5 * loss_u_w_fp) / 2.0
+
+
 def collect_debug_metrics(
     pred_u_w,
     student_out,
@@ -558,6 +564,12 @@ def main(args, cfg):
             )
 
             with torch.cuda.amp.autocast(enabled=amp):
+                num_lb = img_x.shape[0]
+                student_out = model(
+                    torch.cat((img_x, img_u_w)),
+                    scale_factor=random_scale,
+                    feature_scale=feature_scale,
+                )
                 pred_u_s = model(img_u_s1, scale_factor=None)
                 if isinstance(pred_u_s, dict):
                     pred_u_s = pred_u_s["pred_ori"]
@@ -570,17 +582,6 @@ def main(args, cfg):
                     ignore_index,
                     conf_thresh=conf_thresh,
                 )
-                loss_strong = (0.25 * loss_u_s1) / 2.0
-
-            scaler.scale(loss_strong).backward()
-
-            with torch.cuda.amp.autocast(enabled=amp):
-                num_lb = img_x.shape[0]
-                student_out = model(
-                    torch.cat((img_x, img_u_w)),
-                    scale_factor=random_scale,
-                    feature_scale=feature_scale,
-                )
 
                 pred_x_joint = student_out["pred_joint"][:num_lb]
                 pred_x_ori = student_out["pred_ori"][:num_lb]
@@ -589,7 +590,7 @@ def main(args, cfg):
 
                 loss_x_joint = criterion_l(pred_x_joint, mask_x)
                 loss_x_ori = criterion_l(pred_x_ori, mask_x)
-                loss_x = loss_x_ori if epoch < warm_up else loss_x_joint
+                loss_x = loss_x_joint
 
                 loss_u_size = criterion_u(pred_u_w_scale, mask_u_w)
                 loss_u_size = confidence_weighted_loss(
@@ -609,12 +610,11 @@ def main(args, cfg):
                     conf_thresh=conf_thresh,
                 )
 
-                loss_main = (loss_x + 0.25 * loss_u_size + 0.5 * loss_u_w_fp) / 2.0
-                total_loss = (
-                    loss_x + 0.25 * loss_u_s1 + 0.25 * loss_u_size + 0.5 * loss_u_w_fp
-                ) / 2.0
+                total_loss = compute_official_scalematch_total_loss(
+                    loss_x, loss_u_s1, loss_u_size, loss_u_w_fp
+                )
 
-            scaler.scale(loss_main).backward()
+            scaler.scale(total_loss).backward()
 
             if (
                 debug_enabled
