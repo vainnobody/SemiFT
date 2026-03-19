@@ -47,3 +47,10 @@ docs/
 fig1_reference_beautified.png
 paper/
 skills/
+
+# latex build artifacts
+*.aux
+*.fdb_latexmk
+*.fls
+*.log
+*.out

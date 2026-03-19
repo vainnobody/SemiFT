@@ -236,7 +236,10 @@ def main(args, cfg):
         device_ids=[local_rank],
         broadcast_buffers=False,
         output_device=local_rank,
-        find_unused_parameters=False,
+        # DPT_ScaleMatch/PEFT uses branch-specific parameters that can be
+        # skipped on scale_factor=None forwards, so DDP must track unused
+        # parameters even though the official DeepLab ScaleMatch does not.
+        find_unused_parameters=True,
     )
 
     if cfg["criterion"]["name"] == "CELoss":
