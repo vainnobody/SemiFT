@@ -229,7 +229,7 @@ class DPT_ScaleMatch(nn.Module):
         )
         self.se_block = SqueezeExcitation(scale_in_ch + rwkv_channels)
         self.rwkv_layers = RWKVLayers(1, rwkv_channels, mlp_ratio=4.0, drop_path=0.0)
-        self.feature_dropout = nn.Dropout2d(0.1)
+        self.feature_dropout = nn.Dropout2d(0.5)
         self.binomial = torch.distributions.binomial.Binomial(probs=0.5)
 
     def lock_backbone(self):
@@ -269,15 +269,16 @@ class DPT_ScaleMatch(nn.Module):
                 align_corners=True,
             ).contiguous()
 
-        feats_fp = self.feature_dropout(feats_fp)
-        logits_fp = self.head.scratch.output_conv(feats_fp)
+        fp_inputs = torch.cat((feats_fp, self.feature_dropout(feats_fp)), dim=0)
+        logits_fp = self.head.scratch.output_conv(fp_inputs)
         logits_fp = F.interpolate(
             logits_fp,
             size=x.shape[-2:],
             mode="bilinear",
             align_corners=True,
         ).contiguous()
-        return logits, feats, logits_fp
+        _, logits_fp = logits_fp.chunk(2)
+        return logits, feats_fp, logits_fp
 
     def two_scale_forward(self, inputs, scale_factor, feature_scale):
         if scale_factor is None:
@@ -285,23 +286,7 @@ class DPT_ScaleMatch(nn.Module):
                 inputs, need_fp=self.training, feature_scale=feature_scale
             )
             if self.training:
-                out, feats, out_fp = base_forward_out
-                cat_feats = torch.cat([feats, feats], 1).contiguous()
-                h_f, w_f = cat_feats.size(2), cat_feats.size(3)
-
-                global_int_feats = self.rwkv_layers(cat_feats)
-                bsz, _, ch = global_int_feats.shape
-                global_int_feats = (
-                    global_int_feats.permute(0, 2, 1)
-                    .reshape(bsz, ch, h_f, w_f)
-                    .contiguous()
-                )
-                channel_attn_feats = self.se_block(
-                    torch.cat([cat_feats, global_int_feats], 1).contiguous()
-                )
-                logit_attn = self.scale_attn(channel_attn_feats)
-                dummy = 0.0 * (logit_attn.sum() + out_fp.sum())
-                out = (out + dummy).contiguous()
+                out, _, _ = base_forward_out
                 return out
 
             out, _ = base_forward_out

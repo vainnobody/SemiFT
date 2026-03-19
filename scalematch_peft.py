@@ -14,11 +14,11 @@ from torch.utils.tensorboard import SummaryWriter
 import yaml
 
 from dataset.val import ValDataset
-from model.semseg.dpt_scalematch import DPT_ScaleMatch
 from scalematch import (
     NATURAL_IMAGE_DATASETS,
     REMOTE_SENSING_DATASETS,
     ScaleMatchRemoteSemiDataset,
+    build_scalematch_model,
     get_eval_mode,
     get_scalematch_recipe,
     get_scalematch_dataset_cls,
@@ -124,35 +124,7 @@ def apply_peft(model, peft_cfg, cfg):
 
 
 def build_model(cfg, peft_cfg):
-    model_configs = {
-        "small": {
-            "encoder_size": "small",
-            "features": 64,
-            "out_channels": [48, 96, 192, 384],
-        },
-        "base": {
-            "encoder_size": "base",
-            "features": 128,
-            "out_channels": [96, 192, 384, 768],
-        },
-        "large": {
-            "encoder_size": "large",
-            "features": 256,
-            "out_channels": [256, 512, 1024, 1024],
-        },
-        "giant": {
-            "encoder_size": "giant",
-            "features": 384,
-            "out_channels": [1536, 1536, 1536, 1536],
-        },
-    }
-
-    backbone_size = cfg["backbone"].split("_")[-1]
-    backbone_version = cfg["backbone"].split("_")[0]
-    model = DPT_ScaleMatch(
-        **{**model_configs[backbone_size], "nclass": cfg["nclass"]},
-        backbone_version=backbone_version,
-    )
+    model, _ = build_scalematch_model(cfg)
 
     backbone_ckpt_path = f'./pretrained/{cfg["backbone"]}.pth'
     state_dict = torch.load(backbone_ckpt_path, map_location="cpu")

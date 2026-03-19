@@ -151,7 +151,7 @@ class UPerNetDecoder(nn.Module):
         # Final classifier
         self.classifier = nn.Conv2d(fpn_channels, num_classes, kernel_size=1)
 
-    def forward(self, feats):
+    def forward(self, feats, return_feats=False):
         assert len(feats) == 4, "Expecting [P2, P3, P4, P5] features"
 
         # Lateral + top-down FPN
@@ -186,7 +186,8 @@ class UPerNetDecoder(nn.Module):
         concat = torch.cat(fpn_outs, dim=1)
         out = self.fpn_bottleneck(concat)
         logits = self.classifier(out)
-
+        if return_feats:
+            return logits, out
         return logits
 
 

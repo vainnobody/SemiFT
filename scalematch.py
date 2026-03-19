@@ -23,6 +23,7 @@ from dataset.semi import SemiDataset as NaturalSemiDataset
 from dataset.semi_rs import SemiDataset as RemoteSemiDataset
 from dataset.val import ValDataset
 from model.semseg.dpt_scalematch import DPT_ScaleMatch
+from model.semseg.upernet_scalematch import UperNet_ScaleMatch
 from supervised import validation_cpu
 from util.classes import CLASSES
 from util.ohem import ProbOhemCrossEntropy2d
@@ -43,6 +44,28 @@ OFFICIAL_IMG_SCALES = [0.25, 0.5, 1.5, 2.0]
 OFFICIAL_FEAT_S_SCALES = [0.75]
 OFFICIAL_FEAT_L_SCALES = [1.25]
 OFFICIAL_WARM_UP = 10
+MODEL_CONFIGS = {
+    "small": {
+        "encoder_size": "small",
+        "features": 64,
+        "out_channels": [48, 96, 192, 384],
+    },
+    "base": {
+        "encoder_size": "base",
+        "features": 128,
+        "out_channels": [96, 192, 384, 768],
+    },
+    "large": {
+        "encoder_size": "large",
+        "features": 256,
+        "out_channels": [256, 512, 1024, 1024],
+    },
+    "giant": {
+        "encoder_size": "giant",
+        "features": 384,
+        "out_channels": [1536, 1536, 1536, 1536],
+    },
+}
 
 
 class ScaleMatchRemoteSemiDataset(RemoteSemiDataset):
@@ -94,6 +117,33 @@ def get_scalematch_recipe(cfg):
     }
 
 
+def build_scalematch_model(cfg):
+    backbone_size = cfg["backbone"].split("_")[-1]
+    backbone_version = cfg["backbone"].split("_")[0]
+    model_name = cfg.get("model", "dpt").lower()
+    model_kwargs = {**MODEL_CONFIGS[backbone_size], "nclass": cfg["nclass"]}
+
+    if model_name == "dpt":
+        model = DPT_ScaleMatch(
+            **model_kwargs,
+            backbone_version=backbone_version,
+        )
+    elif model_name == "upernet":
+        model = UperNet_ScaleMatch(
+            encoder_size=model_kwargs["encoder_size"],
+            nclass=cfg["nclass"],
+            fpn_channels=cfg.get("upernet_channels", 256),
+            backbone_version=backbone_version,
+            decoder_dropout=cfg.get("upernet_dropout", 0.1),
+        )
+    else:
+        raise ValueError(
+            f"Unsupported ScaleMatch model '{cfg.get('model')}'. Expected 'dpt' or 'upernet'."
+        )
+
+    return model, backbone_version
+
+
 def get_parser():
     parser = argparse.ArgumentParser(
         description="ScaleMatch: Multi-scale Semi-Supervised Semantic Segmentation"
@@ -124,35 +174,7 @@ def main(args, cfg):
     cudnn.enabled = True
     cudnn.benchmark = True
 
-    model_configs = {
-        "small": {
-            "encoder_size": "small",
-            "features": 64,
-            "out_channels": [48, 96, 192, 384],
-        },
-        "base": {
-            "encoder_size": "base",
-            "features": 128,
-            "out_channels": [96, 192, 384, 768],
-        },
-        "large": {
-            "encoder_size": "large",
-            "features": 256,
-            "out_channels": [256, 512, 1024, 1024],
-        },
-        "giant": {
-            "encoder_size": "giant",
-            "features": 384,
-            "out_channels": [1536, 1536, 1536, 1536],
-        },
-    }
-
-    backbone_size = cfg["backbone"].split("_")[-1]
-    backbone_version = cfg["backbone"].split("_")[0]
-    model = DPT_ScaleMatch(
-        **{**model_configs[backbone_size], "nclass": cfg["nclass"]},
-        backbone_version=backbone_version,
-    )
+    model, backbone_version = build_scalematch_model(cfg)
 
     backbone_ckpt_path = f'./pretrained/{cfg["backbone"]}.pth'
     if rank == 0:
