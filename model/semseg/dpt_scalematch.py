@@ -286,8 +286,23 @@ class DPT_ScaleMatch(nn.Module):
                 inputs, need_fp=self.training, feature_scale=feature_scale
             )
             if self.training:
-                out, _, _ = base_forward_out
-                return out
+                out, feats, out_fp = base_forward_out
+                cat_feats = torch.cat([feats, feats], 1).contiguous()
+                h_f, w_f = cat_feats.size(2), cat_feats.size(3)
+
+                global_int_feats = self.rwkv_layers(cat_feats)
+                bsz, _, ch = global_int_feats.shape
+                global_int_feats = (
+                    global_int_feats.permute(0, 2, 1)
+                    .reshape(bsz, ch, h_f, w_f)
+                    .contiguous()
+                )
+                channel_attn_feats = self.se_block(
+                    torch.cat([cat_feats, global_int_feats], 1).contiguous()
+                )
+                logit_attn = self.scale_attn(channel_attn_feats)
+                dummy = 0.0 * (logit_attn.sum() + out_fp.sum())
+                return (out + dummy).contiguous()
 
             out, _ = base_forward_out
             return out
