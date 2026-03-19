@@ -243,6 +243,7 @@ class UperNet_ScaleMatch(nn.Module):
             multi_scale = self.two_scale_forward(x, scale_factor, feature_scale)
             outputs = {
                 "pred_joint": multi_scale["pred_joint"],
+                "pred_ori": multi_scale["pred_ori"],
                 "pred_size": multi_scale["pred_size"],
                 "pred_fp": multi_scale["pred_fp"],
                 "pred_strong": self._strong_forward(strong_inputs),

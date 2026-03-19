@@ -421,6 +421,7 @@ def main(args, cfg):
                 )
                 pred_u_s = student_out["pred_strong"]
                 pred_x_joint = student_out["pred_joint"][:num_lb]
+                pred_x_ori = student_out["pred_ori"][:num_lb]
                 pred_u_w_scale = student_out["pred_size"][num_lb:]
                 pred_u_w_fp = student_out["pred_fp"][num_lb:]
                 pred_u_w = student_out["pseudo_logits"][num_lb:]
@@ -441,7 +442,9 @@ def main(args, cfg):
                     conf_thresh=conf_thresh,
                 )
 
-                loss_x = criterion_l(pred_x_joint, mask_x)
+                loss_x_joint = criterion_l(pred_x_joint, mask_x)
+                loss_x_ori = criterion_l(pred_x_ori, mask_x)
+                loss_x = loss_x_ori if epoch < warm_up else loss_x_joint
 
                 loss_u_size = criterion_u(pred_u_w_scale, mask_u_w)
                 loss_u_size = confidence_weighted_loss(
@@ -481,9 +484,14 @@ def main(args, cfg):
                     "iter_time": time.time() - iter_start,
                     "Total_loss": total_loss,
                     "Loss_x": loss_x,
+                    "Loss_x_joint": loss_x_joint.detach(),
+                    "Loss_x_ori": loss_x_ori.detach(),
                     "Loss_u_s": loss_u_s1,
                     "Loss_u_scale": loss_u_size,
                     "Loss_u_fp": loss_u_w_fp,
+                    "Conf_x_joint": pred_x_joint.detach().softmax(dim=1).amax(dim=1).mean(),
+                    "Conf_x_ori": pred_x_ori.detach().softmax(dim=1).amax(dim=1).mean(),
+                    "Conf_u_w": conf_u_w.mean(),
                     "Mask_ratio": mask_ratio,
                     "LR_backbone": optimizer.param_groups[0]["lr"],
                     "LR_head": optimizer.param_groups[1]["lr"],
