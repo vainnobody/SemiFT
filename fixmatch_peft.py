@@ -106,6 +106,17 @@ def build_model(cfg, peft_cfg):
     return model, patch_size
 
 
+def _load_state_dict_flexible(model, state_dict):
+    try:
+        return model.load_state_dict(state_dict)
+    except RuntimeError:
+        if state_dict and all(key.startswith("module.") for key in state_dict.keys()):
+            stripped = {key[len("module.") :]: value for key, value in state_dict.items()}
+            return model.load_state_dict(stripped)
+        prefixed = {f"module.{key}": value for key, value in state_dict.items()}
+        return model.load_state_dict(prefixed)
+
+
 def build_optimizer(model, cfg):
     trainable_backbone_params = []
     trainable_non_backbone_params = []
@@ -175,7 +186,10 @@ def main(args, cfg):
 
     local_rank = int(os.environ["LOCAL_RANK"])
     model = torch.nn.SyncBatchNorm.convert_sync_batchnorm(model)
+    model_ema = deepcopy(model)
+
     model.cuda()
+    model_ema.cuda()
 
     model = torch.nn.parallel.DistributedDataParallel(
         model,
@@ -185,7 +199,6 @@ def main(args, cfg):
         find_unused_parameters=True,
     )
 
-    model_ema = deepcopy(model)
     model_ema.eval()
     for param in model_ema.parameters():
         param.requires_grad = False
@@ -262,8 +275,8 @@ def main(args, cfg):
     latest_path = os.path.join(args.save_path, "latest.pth")
     if os.path.exists(latest_path):
         checkpoint = torch.load(latest_path)
-        model.load_state_dict(checkpoint["model"])
-        model_ema.load_state_dict(checkpoint["model_ema"])
+        _load_state_dict_flexible(model, checkpoint["model"])
+        _load_state_dict_flexible(model_ema, checkpoint["model_ema"])
         optimizer.load_state_dict(checkpoint["optimizer"])
         epoch = checkpoint["epoch"]
         previous_best = checkpoint["previous_best"]
