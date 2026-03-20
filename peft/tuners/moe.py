@@ -136,10 +136,13 @@ class GatingNetwork(nn.Module):
 
         aux_loss = router_logits.new_zeros(())
         z_loss = router_logits.new_zeros(())
-        expert_load = self._compute_expert_load(topk_idx)
-        self.expert_load.copy_(expert_load)
-        if self.training and self.num_experts > 1:
-            self._update_expert_bias(expert_load)
+        if self.training:
+            expert_load = self._compute_expert_load(topk_idx)
+            self.expert_load.copy_(expert_load)
+            if self.num_experts > 1:
+                self._update_expert_bias(expert_load)
+        else:
+            expert_load = self.expert_load.detach().clone()
 
         stats = {
             'aux_loss': aux_loss.to(x.dtype),
