@@ -71,49 +71,59 @@ def validation_cpu(cfg, model, valid_loader):
     for x, y, _ in valid_loader:
         x = x.cuda()
         if cfg["eval_mode"] == "slide_window":
-            b, _, h, w = x.shape  # 获取输入图像的尺寸 (batch, channels, height, width)
-            final = torch.zeros(b, cfg["nclass"], h, w).cuda()  # 用于存储最终预测结果
-            size = cfg["crop_size"]
-            step = 510
-            b = 0
-            a = 0
-            while a <= int(h / step):
-                while b <= int(w / step):
-                    sub_input = x[
-                        :,
-                        :,
-                        min(a * step, h - size) : min(a * step + size, h),
-                        min(b * step, w - size) : min(b * step + size, w),
-                    ]
-                    # print("sub_input.shape", sub_input.shape)
+            batch_size, _, h, w = x.shape
+            final = torch.zeros(batch_size, cfg["nclass"], h, w, device=x.device)
+            count = torch.zeros(batch_size, 1, h, w, device=x.device)
+
+            crop_size = cfg["crop_size"]
+            if isinstance(crop_size, int):
+                crop_h = crop_w = crop_size
+            else:
+                crop_h, crop_w = crop_size
+
+            step = cfg.get("stride", 510)
+            if isinstance(step, int):
+                step_h = step_w = step
+            else:
+                step_h, step_w = step
+
+            h_starts = list(range(0, max(h - crop_h, 0) + 1, step_h))
+            w_starts = list(range(0, max(w - crop_w, 0) + 1, step_w))
+            if not h_starts:
+                h_starts = [0]
+            if not w_starts:
+                w_starts = [0]
+            last_h = max(h - crop_h, 0)
+            last_w = max(w - crop_w, 0)
+            if h_starts[-1] != last_h:
+                h_starts.append(last_h)
+            if w_starts[-1] != last_w:
+                w_starts.append(last_w)
+
+            for hs in h_starts:
+                for ws in w_starts:
+                    he = min(hs + crop_h, h)
+                    we = min(ws + crop_w, w)
+                    sub_input = x[:, :, hs:he, ws:we]
                     mask = model(sub_input)[0]
-                    final[
-                        :,
-                        :,
-                        min(a * step, h - size) : min(a * step + size, h),
-                        min(b * step, w - size) : min(b * step + size, w),
-                    ] += mask
-                    b += 1
-                b = 0
-                a += 1
+                    final[:, :, hs:he, ws:we] += mask
+                    count[:, :, hs:he, ws:we] += 1
+
+            final = final / count.clamp_min(1.0)
             o = final.argmax(dim=1)
 
         elif cfg["eval_mode"] == "resize":
-            # 使用缩放方式进行预测
-            original_shape = x.shape[-2:]  # 保存原始图像的尺寸 (h, w)
+            original_shape = x.shape[-2:]
             resized_x = F.interpolate(
                 x, size=cfg["crop_size"], mode="bilinear", align_corners=True
             )
             resized_o = model(resized_x)[0]
-            # 将预测结果复原到原始尺寸
             o = F.interpolate(
                 resized_o, size=original_shape, mode="bilinear", align_corners=True
             )
             o = o.argmax(dim=1)
 
         else:
-            # 直接进行预测（非滑动窗口模式）
-
             o = model(x)[0]
             o = o.max(1)[1]
         gray = np.uint8(o.cpu().numpy())
