@@ -4,6 +4,9 @@ import types
 from pathlib import Path
 from types import SimpleNamespace
 
+REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
 
 stub_peft = types.ModuleType("peft")
 stub_peft.__path__ = []
@@ -34,7 +37,6 @@ sys.modules["peft.tuners.semift"] = stub_peft_semift
 from unimatchv2_peft import build_peft_config, resolve_peft_cfg
 
 
-REPO_ROOT = Path(__file__).resolve().parents[1]
 SEMIFT_PATH = REPO_ROOT / "peft" / "tuners" / "semift.py"
 
 
@@ -331,55 +333,7 @@ def test_adaptmodel_wraps_semift_scalegate_block():
     assert isinstance(adapted.model.block.mlp.adapter, semift.SemiFtScaleGate)
 
 
-def test_build_peft_config_backfills_scalegate_fields_for_legacy_config_class(monkeypatch):
-    import unimatchv2_peft as peft_mod
-
-    class LegacySemiFTConfig:
-        def __init__(
-            self,
-            method=None,
-            target_modules=None,
-            modules_to_save=None,
-            bias=None,
-            nclass=None,
-            r=None,
-            lora_alpha=None,
-            lora_dropout=None,
-            ssf_init_scale=None,
-            ssf_init_shift_std=None,
-            adapter_dim=None,
-            adapter_dropout=None,
-            adapter_scale=None,
-            adapter_layernorm_option=None,
-            fact_rank=None,
-            fact_scale=None,
-            fact_dropout=None,
-            conv_lora_kernel_size=None,
-            conv_lora_dropout=None,
-            hydra_num_branches=None,
-            hydra_router_hidden=None,
-            hydra_router_dropout=None,
-            moe_num_experts=None,
-            moe_topk=None,
-            moe_router_balance_mode=None,
-            moe_router_bias_update_speed=None,
-            moe_router_bias_clip=None,
-            moe_router_aux_loss_coef=None,
-            moe_router_z_loss_coef=None,
-            moe_router_jitter_noise=None,
-            moe_num_prefix_tokens=None,
-            moe_use_shared_expert=None,
-            moe_conv_hidden_ratio=None,
-            moe_conv_kernel_size=None,
-            moe_conv_context_kernel_size=None,
-            moe_conv_use_grn=None,
-            moe_conv_norm_type=None,
-        ):
-            self.method = method
-            self.target_modules = target_modules
-
-    monkeypatch.setattr(stub_peft_semift, "SemiFTConfig", LegacySemiFTConfig)
-
+def test_build_peft_config_passes_scalegate_fields_to_current_config():
     cfg = {
         "nclass": 6,
         "peft": {
@@ -389,8 +343,8 @@ def test_build_peft_config_backfills_scalegate_fields_for_legacy_config_class(mo
             "moe_conv_gate_temperature": 0.7,
         },
     }
-    peft_cfg = peft_mod.resolve_peft_cfg(cfg, make_args())
-    config = peft_mod.build_peft_config(peft_cfg, cfg)
+    peft_cfg = resolve_peft_cfg(cfg, make_args())
+    config = build_peft_config(peft_cfg, cfg)
 
     assert config.method == "semift_scalegate"
     assert config.moe_expert_scales == [1, 3, 5]

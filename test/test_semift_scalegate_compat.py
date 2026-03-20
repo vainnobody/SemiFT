@@ -49,7 +49,7 @@ def load_semift_module():
     return module
 
 
-def test_semift_kwargs_falls_back_for_missing_scalegate_fields():
+def test_semift_kwargs_uses_scalegate_fields_from_config():
     module = load_semift_module()
     fake_self = types.SimpleNamespace(
         peft_config=types.SimpleNamespace(
@@ -67,6 +67,8 @@ def test_semift_kwargs_falls_back_for_missing_scalegate_fields():
             moe_conv_context_kernel_size=5,
             moe_conv_use_grn=True,
             moe_conv_norm_type="layernorm",
+            moe_expert_scales=[1, 2, 4, 8],
+            moe_conv_gate_temperature=1.0,
         )
     )
 

@@ -1,6 +1,5 @@
 import argparse
 from copy import deepcopy
-import inspect
 import logging
 import os
 import pprint
@@ -167,115 +166,96 @@ def resolve_peft_cfg(cfg: Dict[str, Any], args) -> Dict[str, Any]:
 def build_peft_config(peft_cfg: Dict[str, Any], cfg: Dict[str, Any]):
     from peft.tuners.semift import SemiFTConfig
 
-    config_kwargs = {
-        "method": peft_cfg["method"],
-        "target_modules": peft_cfg["target_modules"],
-        "modules_to_save": peft_cfg.get("modules_to_save"),
-        "bias": peft_cfg.get("bias", DEFAULT_PEFT_CFG["bias"]),
-        "nclass": cfg["nclass"],
-        "r": peft_cfg.get("r", DEFAULT_PEFT_CFG["r"]),
-        "lora_alpha": peft_cfg.get("lora_alpha", DEFAULT_PEFT_CFG["lora_alpha"]),
-        "lora_dropout": peft_cfg.get("lora_dropout", DEFAULT_PEFT_CFG["lora_dropout"]),
-        "ssf_init_scale": peft_cfg.get("ssf_init_scale", DEFAULT_PEFT_CFG["ssf_init_scale"]),
-        "ssf_init_shift_std": peft_cfg.get(
+    return SemiFTConfig(
+        method=peft_cfg["method"],
+        target_modules=peft_cfg["target_modules"],
+        modules_to_save=peft_cfg.get("modules_to_save"),
+        bias=peft_cfg.get("bias", DEFAULT_PEFT_CFG["bias"]),
+        nclass=cfg["nclass"],
+        r=peft_cfg.get("r", DEFAULT_PEFT_CFG["r"]),
+        lora_alpha=peft_cfg.get("lora_alpha", DEFAULT_PEFT_CFG["lora_alpha"]),
+        lora_dropout=peft_cfg.get("lora_dropout", DEFAULT_PEFT_CFG["lora_dropout"]),
+        ssf_init_scale=peft_cfg.get("ssf_init_scale", DEFAULT_PEFT_CFG["ssf_init_scale"]),
+        ssf_init_shift_std=peft_cfg.get(
             "ssf_init_shift_std", DEFAULT_PEFT_CFG["ssf_init_shift_std"]
         ),
-        "adapter_dim": peft_cfg.get("adapter_dim", DEFAULT_PEFT_CFG["adapter_dim"]),
-        "adapter_dropout": peft_cfg.get(
+        adapter_dim=peft_cfg.get("adapter_dim", DEFAULT_PEFT_CFG["adapter_dim"]),
+        adapter_dropout=peft_cfg.get(
             "adapter_dropout", DEFAULT_PEFT_CFG["adapter_dropout"]
         ),
-        "adapter_scale": peft_cfg.get("adapter_scale", DEFAULT_PEFT_CFG["adapter_scale"]),
-        "adapter_layernorm_option": peft_cfg.get(
+        adapter_scale=peft_cfg.get("adapter_scale", DEFAULT_PEFT_CFG["adapter_scale"]),
+        adapter_layernorm_option=peft_cfg.get(
             "adapter_layernorm_option",
             DEFAULT_PEFT_CFG["adapter_layernorm_option"],
         ),
-        "fact_rank": peft_cfg.get("fact_rank", DEFAULT_PEFT_CFG["fact_rank"]),
-        "fact_scale": peft_cfg.get("fact_scale", DEFAULT_PEFT_CFG["fact_scale"]),
-        "fact_dropout": peft_cfg.get("fact_dropout", DEFAULT_PEFT_CFG["fact_dropout"]),
-        "conv_lora_kernel_size": peft_cfg.get(
+        fact_rank=peft_cfg.get("fact_rank", DEFAULT_PEFT_CFG["fact_rank"]),
+        fact_scale=peft_cfg.get("fact_scale", DEFAULT_PEFT_CFG["fact_scale"]),
+        fact_dropout=peft_cfg.get("fact_dropout", DEFAULT_PEFT_CFG["fact_dropout"]),
+        conv_lora_kernel_size=peft_cfg.get(
             "conv_lora_kernel_size", DEFAULT_PEFT_CFG["conv_lora_kernel_size"]
         ),
-        "conv_lora_dropout": peft_cfg.get(
+        conv_lora_dropout=peft_cfg.get(
             "conv_lora_dropout", DEFAULT_PEFT_CFG["conv_lora_dropout"]
         ),
-        "hydra_num_branches": peft_cfg.get(
+        hydra_num_branches=peft_cfg.get(
             "hydra_num_branches", DEFAULT_PEFT_CFG["hydra_num_branches"]
         ),
-        "hydra_router_hidden": peft_cfg.get(
+        hydra_router_hidden=peft_cfg.get(
             "hydra_router_hidden", DEFAULT_PEFT_CFG["hydra_router_hidden"]
         ),
-        "hydra_router_dropout": peft_cfg.get(
+        hydra_router_dropout=peft_cfg.get(
             "hydra_router_dropout", DEFAULT_PEFT_CFG["hydra_router_dropout"]
         ),
-        "moe_num_experts": peft_cfg.get("moe_num_experts", DEFAULT_PEFT_CFG["moe_num_experts"]),
-        "moe_topk": peft_cfg.get("moe_topk", DEFAULT_PEFT_CFG["moe_topk"]),
-        "moe_router_balance_mode": peft_cfg.get(
+        moe_num_experts=peft_cfg.get("moe_num_experts", DEFAULT_PEFT_CFG["moe_num_experts"]),
+        moe_topk=peft_cfg.get("moe_topk", DEFAULT_PEFT_CFG["moe_topk"]),
+        moe_router_balance_mode=peft_cfg.get(
             "moe_router_balance_mode", DEFAULT_PEFT_CFG["moe_router_balance_mode"]
         ),
-        "moe_router_bias_update_speed": peft_cfg.get(
+        moe_router_bias_update_speed=peft_cfg.get(
             "moe_router_bias_update_speed",
             DEFAULT_PEFT_CFG["moe_router_bias_update_speed"],
         ),
-        "moe_router_bias_clip": peft_cfg.get(
+        moe_router_bias_clip=peft_cfg.get(
             "moe_router_bias_clip", DEFAULT_PEFT_CFG["moe_router_bias_clip"]
         ),
-        "moe_router_aux_loss_coef": peft_cfg.get(
+        moe_router_aux_loss_coef=peft_cfg.get(
             "moe_router_aux_loss_coef", DEFAULT_PEFT_CFG["moe_router_aux_loss_coef"]
         ),
-        "moe_router_z_loss_coef": peft_cfg.get(
+        moe_router_z_loss_coef=peft_cfg.get(
             "moe_router_z_loss_coef", DEFAULT_PEFT_CFG["moe_router_z_loss_coef"]
         ),
-        "moe_router_jitter_noise": peft_cfg.get(
+        moe_router_jitter_noise=peft_cfg.get(
             "moe_router_jitter_noise", DEFAULT_PEFT_CFG["moe_router_jitter_noise"]
         ),
-        "moe_num_prefix_tokens": peft_cfg.get(
+        moe_num_prefix_tokens=peft_cfg.get(
             "moe_num_prefix_tokens", DEFAULT_PEFT_CFG["moe_num_prefix_tokens"]
         ),
-        "moe_use_shared_expert": peft_cfg.get(
+        moe_use_shared_expert=peft_cfg.get(
             "moe_use_shared_expert", DEFAULT_PEFT_CFG["moe_use_shared_expert"]
         ),
-        "moe_conv_hidden_ratio": peft_cfg.get(
+        moe_conv_hidden_ratio=peft_cfg.get(
             "moe_conv_hidden_ratio", DEFAULT_PEFT_CFG["moe_conv_hidden_ratio"]
         ),
-        "moe_conv_kernel_size": peft_cfg.get(
+        moe_conv_kernel_size=peft_cfg.get(
             "moe_conv_kernel_size", DEFAULT_PEFT_CFG["moe_conv_kernel_size"]
         ),
-        "moe_conv_context_kernel_size": peft_cfg.get(
+        moe_conv_context_kernel_size=peft_cfg.get(
             "moe_conv_context_kernel_size",
             DEFAULT_PEFT_CFG["moe_conv_context_kernel_size"],
         ),
-        "moe_conv_use_grn": peft_cfg.get(
+        moe_conv_use_grn=peft_cfg.get(
             "moe_conv_use_grn", DEFAULT_PEFT_CFG["moe_conv_use_grn"]
         ),
-        "moe_conv_norm_type": peft_cfg.get(
+        moe_conv_norm_type=peft_cfg.get(
             "moe_conv_norm_type", DEFAULT_PEFT_CFG["moe_conv_norm_type"]
         ),
-        "moe_expert_scales": peft_cfg.get(
+        moe_expert_scales=peft_cfg.get(
             "moe_expert_scales", DEFAULT_PEFT_CFG["moe_expert_scales"]
         ),
-        "moe_conv_gate_temperature": peft_cfg.get(
+        moe_conv_gate_temperature=peft_cfg.get(
             "moe_conv_gate_temperature", DEFAULT_PEFT_CFG["moe_conv_gate_temperature"]
         ),
-    }
-
-    signature = inspect.signature(SemiFTConfig)
-    accepts_var_kwargs = any(
-        parameter.kind == inspect.Parameter.VAR_KEYWORD
-        for parameter in signature.parameters.values()
     )
-    if accepts_var_kwargs:
-        config = SemiFTConfig(**config_kwargs)
-    else:
-        filtered_kwargs = {
-            key: value
-            for key, value in config_kwargs.items()
-            if key in signature.parameters
-        }
-        config = SemiFTConfig(**filtered_kwargs)
-
-    config.moe_expert_scales = config_kwargs["moe_expert_scales"]
-    config.moe_conv_gate_temperature = config_kwargs["moe_conv_gate_temperature"]
-    return config
 
 
 def apply_peft(model, peft_cfg: Dict[str, Any], cfg: Dict[str, Any]):
@@ -363,18 +343,6 @@ def build_model(cfg, peft_cfg):
     model = apply_peft(model, peft_cfg, cfg)
     return model, patch_size
 
-
-def _load_state_dict_flexible(model, state_dict):
-    try:
-        return model.load_state_dict(state_dict)
-    except RuntimeError:
-        if state_dict and all(key.startswith("module.") for key in state_dict.keys()):
-            stripped = {key[len("module.") :]: value for key, value in state_dict.items()}
-            return model.load_state_dict(stripped)
-        prefixed = {f"module.{key}": value for key, value in state_dict.items()}
-        return model.load_state_dict(prefixed)
-
-
 def build_optimizer(model, cfg):
     trainable_backbone_params = []
     trainable_non_backbone_params = []
@@ -446,10 +414,7 @@ def main(args, cfg):
 
     local_rank = int(os.environ["LOCAL_RANK"])
     model = torch.nn.SyncBatchNorm.convert_sync_batchnorm(model)
-    model_ema = deepcopy(model)
-
     model.cuda()
-    model_ema.cuda()
 
     model = torch.nn.parallel.DistributedDataParallel(
         model,
@@ -459,6 +424,7 @@ def main(args, cfg):
         find_unused_parameters=True,
     )
 
+    model_ema = deepcopy(model)
     model_ema.eval()
     for param in model_ema.parameters():
         param.requires_grad = False
@@ -535,8 +501,8 @@ def main(args, cfg):
     latest_path = os.path.join(args.save_path, "latest.pth")
     if os.path.exists(latest_path):
         checkpoint = torch.load(latest_path)
-        _load_state_dict_flexible(model, checkpoint["model"])
-        _load_state_dict_flexible(model_ema, checkpoint["model_ema"])
+        model.load_state_dict(checkpoint["model"])
+        model_ema.load_state_dict(checkpoint["model_ema"])
         optimizer.load_state_dict(checkpoint["optimizer"])
         epoch = checkpoint["epoch"]
         previous_best = checkpoint["previous_best"]
