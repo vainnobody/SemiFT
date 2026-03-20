@@ -92,7 +92,7 @@ def build_model(cfg, peft_cfg):
     else:
         raise NotImplementedError(f"Unsupported model type: {cfg['model']}")
 
-    state_dict = torch.load(f'./pretrained/{cfg["backbone"]}.pth')
+    state_dict = torch.load(f'./pretrained/{cfg["backbone"]}.pth', map_location="cpu", weights_only=False)
     model.backbone.load_state_dict(state_dict)
 
     if peft_cfg.get("freeze_backbone", True):

@@ -275,7 +275,7 @@ def main(args, cfg):
     else:
         raise NotImplementedError(f"Unsupported model: {cfg['model']}")
 
-    state_dict = torch.load(f'./pretrained/{cfg["backbone"]}.pth')
+    state_dict = torch.load(f'./pretrained/{cfg["backbone"]}.pth', map_location="cpu", weights_only=False)
     model.backbone.load_state_dict(state_dict)
 
     if cfg.get("lock_backbone", False):
