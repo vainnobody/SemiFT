@@ -31,6 +31,7 @@ from util.utils import count_params, init_log, AverageMeter, intersectionAndUnio
 from util.dist_helper import setup_distributed
 from util.train_utils import confidence_weighted_loss
 from util.viz import Visualizer
+from util.validation import validation_cpu as shared_validation_cpu
 
 
 def get_parser():
@@ -138,73 +139,7 @@ def scale_back(pred_c_back, mask_c_back, size, box):
 
 @torch.no_grad()
 def validation_cpu(cfg, model, valid_loader):
-    """Validation function that matches fixmatch.py style."""
-    intersection_meter = AverageMeter()
-    union_meter = AverageMeter()
-    target_meter = AverageMeter()
-
-    model.eval()
-
-    for x, y, _ in valid_loader:
-        x = x.cuda()
-
-        if cfg.get("eval_mode") == "slide_window":
-            b, _, h, w = x.shape
-            final = torch.zeros(b, cfg["nclass"], h, w).cuda()
-            size = cfg["crop_size"]
-            step = 510
-            row = 0
-            col = 0
-            while row <= int(h / step):
-                while col <= int(w / step):
-                    sub_input = x[
-                        :,
-                        :,
-                        min(row * step, h - size) : min(row * step + size, h),
-                        min(col * step, w - size) : min(col * step + size, w),
-                    ]
-                    mask = model(sub_input)
-                    final[
-                        :,
-                        :,
-                        min(row * step, h - size) : min(row * step + size, h),
-                        min(col * step, w - size) : min(col * step + size, w),
-                    ] += mask
-                    col += 1
-                col = 0
-                row += 1
-            o = final.argmax(dim=1)
-        elif cfg.get("eval_mode") == "resize":
-            original_shape = x.shape[-2:]
-            resized_x = F.interpolate(
-                x, size=cfg["crop_size"], mode="bilinear", align_corners=True
-            )
-            resized_o = model(resized_x)
-            o = F.interpolate(
-                resized_o, size=original_shape, mode="bilinear", align_corners=True
-            )
-            o = o.argmax(dim=1)
-        else:
-            o = model(x)
-            o = o.max(1)[1]
-
-        gray = np.uint8(o.cpu().numpy())
-        target = np.array(y, dtype=np.int32)
-        intersection, union, target_area = intersectionAndUnion(
-            gray, target, cfg["nclass"], cfg["ignore_index"]
-        )
-        intersection_meter.update(intersection)
-        union_meter.update(union)
-        target_meter.update(target_area)
-
-    iou_class = intersection_meter.sum / (union_meter.sum + 1e-10)
-
-    if cfg["dataset"] == "iSAID":
-        mIoU = np.mean(iou_class[1:]) * 100.0
-    else:
-        mIoU = np.nanmean(iou_class) * 100.0
-
-    return mIoU, iou_class * 100.0
+    return shared_validation_cpu(cfg, model, valid_loader)
 
 
 def main(args, cfg):

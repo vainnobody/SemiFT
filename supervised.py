@@ -22,6 +22,7 @@ from util.ohem import ProbOhemCrossEntropy2d
 from util.focal import FocalLoss
 from util.utils import count_params, init_log, AverageMeter, intersectionAndUnion
 from util.dist_helper import setup_distributed
+from util.validation import validation_cpu as shared_validation_cpu
 
 from util.viz import Visualizer
 
@@ -110,77 +111,7 @@ def evaluate(model, loader, mode, cfg, multiplier=None):
 
 @torch.no_grad()
 def validation_cpu(cfg, model, valid_loader):
-
-    intersection_meter = AverageMeter()
-    union_meter = AverageMeter()
-    target_meter = AverageMeter()
-
-    model.eval()
-
-    for x, y, _ in valid_loader:
-        x = x.cuda()
-        if cfg["eval_mode"] == "slide_window":
-            b, _, h, w = x.shape  # 获取输入图像的尺寸 (batch, channels, height, width)
-            final = torch.zeros(b, cfg["nclass"], h, w).cuda()  # 用于存储最终预测结果
-            size = cfg["crop_size"]
-            step = 510
-            b = 0
-            a = 0
-            while a <= int(h / step):
-                while b <= int(w / step):
-                    sub_input = x[
-                        :,
-                        :,
-                        min(a * step, h - size) : min(a * step + size, h),
-                        min(b * step, w - size) : min(b * step + size, w),
-                    ]
-                    # print("sub_input.shape", sub_input.shape)
-                    mask = model(sub_input)
-                    final[
-                        :,
-                        :,
-                        min(a * step, h - size) : min(a * step + size, h),
-                        min(b * step, w - size) : min(b * step + size, w),
-                    ] += mask
-                    b += 1
-                b = 0
-                a += 1
-            o = final.argmax(dim=1)
-
-        elif cfg["eval_mode"] == "resize":
-            # 使用缩放方式进行预测
-            original_shape = x.shape[-2:]  # 保存原始图像的尺寸 (h, w)
-            resized_x = F.interpolate(
-                x, size=cfg["crop_size"], mode="bilinear", align_corners=True
-            )
-            resized_o = model(resized_x)
-            # 将预测结果复原到原始尺寸
-            o = F.interpolate(
-                resized_o, size=original_shape, mode="bilinear", align_corners=True
-            )
-            o = o.argmax(dim=1)
-
-        else:
-            # 直接进行预测（非滑动窗口模式）
-
-            o = model(x)
-            o = o.max(1)[1]
-        gray = np.uint8(o.cpu().numpy())
-        target = np.array(y, dtype=np.int32)
-        intersection, union, target_area = intersectionAndUnion(
-            gray, target, cfg["nclass"], cfg["ignore_index"]
-        )
-        intersection_meter.update(intersection)
-        union_meter.update(union)
-        target_meter.update(target_area)
-    iou_class = intersection_meter.sum / (union_meter.sum + 1e-10)
-
-    if cfg["dataset"] == "iSAID":
-        mIoU = np.mean(iou_class[1:]) * 100.0
-    else:
-        mIoU = np.nanmean(iou_class) * 100.0
-
-    return mIoU, iou_class
+    return shared_validation_cpu(cfg, model, valid_loader)
 
 
 def get_parser():
