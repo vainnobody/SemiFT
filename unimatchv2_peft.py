@@ -52,10 +52,13 @@ DEFAULT_PEFT_CFG: Dict[str, Any] = {
     "moe_conv_context_kernel_size": 5,
     "moe_conv_use_grn": True,
     "moe_conv_norm_type": "layernorm",
+    "moe_expert_scales": [1, 2, 4, 8],
+    "moe_conv_gate_temperature": 1.0,
 }
 
 METHOD_DEFAULT_TARGETS: Dict[str, List[str]] = {
     "semift": ["mlp"],
+    "semift_scalegate": ["mlp"],
     "lora": ["qkv", "proj", "fc1", "fc2"],
     "ssf": ["patch_embed", "norm1", "norm2", "qkv", "proj", "fc1", "fc2"],
     "bitfit": ["qkv", "proj", "fc1", "fc2", "norm1", "norm2", "head"],
@@ -245,6 +248,12 @@ def build_peft_config(peft_cfg: Dict[str, Any], cfg: Dict[str, Any]):
         ),
         moe_conv_norm_type=peft_cfg.get(
             "moe_conv_norm_type", DEFAULT_PEFT_CFG["moe_conv_norm_type"]
+        ),
+        moe_expert_scales=peft_cfg.get(
+            "moe_expert_scales", DEFAULT_PEFT_CFG["moe_expert_scales"]
+        ),
+        moe_conv_gate_temperature=peft_cfg.get(
+            "moe_conv_gate_temperature", DEFAULT_PEFT_CFG["moe_conv_gate_temperature"]
         ),
     )
 

@@ -10,7 +10,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from ..utils import PeftConfig, PeftType
-from .moe import SemiFt
+from .moe import SemiFt, SemiFtScaleGate
 
 
 @dataclass
@@ -64,6 +64,8 @@ class SemiFTConfig(PeftConfig):
     moe_conv_context_kernel_size: int = field(default=5)
     moe_conv_use_grn: bool = field(default=True)
     moe_conv_norm_type: str = field(default="layernorm")
+    moe_expert_scales: List[int] = field(default_factory=lambda: [1, 2, 4, 8])
+    moe_conv_gate_temperature: float = field(default=1.0)
 
     def __post_init__(self):
         self.peft_type = PeftType.LORA
@@ -71,6 +73,7 @@ class SemiFTConfig(PeftConfig):
 
 METHOD_DEFAULT_TARGETS = {
     "semift": ["mlp"],
+    "semift_scalegate": ["mlp"],
     "lora": ["qkv", "proj", "fc1", "fc2"],
     "ssf": ["patch_embed", "norm1", "norm2", "qkv", "proj", "fc1", "fc2"],
     "bitfit": ["qkv", "proj", "fc1", "fc2", "norm1", "norm2", "head"],
@@ -85,7 +88,7 @@ HIGH_LEVEL_TO_SUBMODULES = {
     "attn": ["qkv", "proj"],
     "mlp": ["fc1", "fc2"],
 }
-BLOCK_LEVEL_METHODS = {"semift", "adaptformer", "fact_tt", "fact_tk"}
+BLOCK_LEVEL_METHODS = {"semift", "semift_scalegate", "adaptformer", "fact_tt", "fact_tk"}
 PARAMETER_ONLY_METHODS = {"bitfit"}
 SSF_METHODS = {"ssf"}
 
@@ -200,6 +203,8 @@ class AdaptModel(nn.Module):
         input_dim, output_dim = self._infer_block_dims(target_name, target)
         if self.peft_config.method == "semift":
             adapter = SemiFt(input_dim, output_dim, **self._semift_kwargs())
+        elif self.peft_config.method == "semift_scalegate":
+            adapter = SemiFtScaleGate(input_dim, output_dim, **self._semift_kwargs())
         elif self.peft_config.method == "adaptformer":
             adapter = AdapterFormer(
                 input_dim,
@@ -309,6 +314,8 @@ class AdaptModel(nn.Module):
             "conv_context_kernel_size": self.peft_config.moe_conv_context_kernel_size,
             "conv_use_grn": self.peft_config.moe_conv_use_grn,
             "conv_norm_type": self.peft_config.moe_conv_norm_type,
+            "scales": self.peft_config.moe_expert_scales,
+            "conv_gate_temperature": self.peft_config.moe_conv_gate_temperature,
         }
 
     def _infer_block_dims(self, target_name, target):

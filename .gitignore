@@ -54,3 +54,8 @@ skills/
 *.fls
 *.log
 *.out
+# local presentation / cache artifacts
+conda_ppt/
+output/
+semift_topformer_style_comparison.pptx
+

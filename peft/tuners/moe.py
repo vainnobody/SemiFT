@@ -409,6 +409,142 @@ class SemiFt(nn.Module):
         return x
 
 
+
+
+class ScaleGatedConvExpert(ConvExpert):
+    def __init__(
+        self,
+        r,
+        hidden_ratio=2.0,
+        kernel_size=3,
+        context_kernel_size=5,
+        dropout=0.0,
+        use_grn=True,
+        norm_type="layernorm",
+        scale=1,
+        gate_temperature=1.0,
+    ):
+        super().__init__(
+            r=r,
+            hidden_ratio=hidden_ratio,
+            kernel_size=kernel_size,
+            context_kernel_size=context_kernel_size,
+            dropout=dropout,
+            use_grn=use_grn,
+            norm_type=norm_type,
+        )
+        self.scale = max(int(scale), 1)
+        self.gate_temperature = float(gate_temperature)
+        self.branch_gate = nn.Conv2d(self.hidden_dim, self.hidden_dim * 2, kernel_size=1, bias=True)
+        nn.init.zeros_(self.branch_gate.weight)
+        nn.init.zeros_(self.branch_gate.bias)
+
+    def _scaled_context(self, x_2d):
+        if self.scale <= 1:
+            return self.dwconv_context(x_2d)
+
+        h, w = x_2d.shape[-2:]
+        pooled_h = max(1, h // self.scale)
+        pooled_w = max(1, w // self.scale)
+        pooled = F.adaptive_avg_pool2d(x_2d, output_size=(pooled_h, pooled_w))
+        context = self.dwconv_context(pooled)
+        if context.shape[-2:] != (h, w):
+            context = F.interpolate(context, size=(h, w), mode="bilinear", align_corners=False)
+        return context
+
+    def forward(self, x, hw=None):
+        if x.numel() == 0:
+            return x
+        bsz, n_tokens, channels = x.shape
+        if channels != self.r:
+            raise ValueError(f"Expected channel dim {self.r}, got {channels}")
+
+        h, w = self._resolve_hw(n_tokens, hw)
+        x_norm = self.pre_norm(x)
+        value, gate = self.pw_expand(x_norm).chunk(2, dim=-1)
+        x_hidden = value * F.silu(gate)
+
+        x_2d = x_hidden.transpose(1, 2).reshape(bsz, self.hidden_dim, h, w).contiguous()
+        x_local = self.dwconv_local(x_2d)
+        x_context = self._scaled_context(x_2d)
+
+        gate_logits = self.branch_gate(x_2d).view(bsz, 2, self.hidden_dim, h, w)
+        gate_logits = gate_logits / max(self.gate_temperature, 1e-6)
+        gate_weight = torch.softmax(gate_logits, dim=1)
+        local_weight = gate_weight[:, 0]
+        context_weight = gate_weight[:, 1]
+        x_2d = x_2d + local_weight * x_local + context_weight * x_context
+
+        x_hidden = x_2d.permute(0, 2, 3, 1).contiguous()
+        x_hidden = self.grn(x_hidden)
+        x_hidden = self.mid_norm(x_hidden)
+        x_hidden = self.pw_project(x_hidden.view(bsz, n_tokens, self.hidden_dim))
+        x_hidden = self.dropout(x_hidden)
+        return x_hidden
+
+
+class SemiFtScaleGate(SemiFt):
+    def __init__(
+        self,
+        in_features,
+        out_features,
+        r,
+        num_experts=4,
+        topk=2,
+        num_prefix_tokens=5,
+        router_jitter_noise=0.01,
+        router_balance_mode="deepseek_v3",
+        router_bias_update_speed=1e-3,
+        router_bias_clip=0.05,
+        use_shared_expert=True,
+        expert_dropout=0.0,
+        scales=None,
+        conv_hidden_ratio=2.0,
+        conv_kernel_size=3,
+        conv_context_kernel_size=5,
+        conv_use_grn=True,
+        conv_norm_type="layernorm",
+        conv_gate_temperature=1.0,
+    ):
+        super().__init__(
+            in_features=in_features,
+            out_features=out_features,
+            r=r,
+            num_experts=num_experts,
+            topk=topk,
+            num_prefix_tokens=num_prefix_tokens,
+            router_jitter_noise=router_jitter_noise,
+            router_balance_mode=router_balance_mode,
+            router_bias_update_speed=router_bias_update_speed,
+            router_bias_clip=router_bias_clip,
+            use_shared_expert=use_shared_expert,
+            expert_dropout=expert_dropout,
+            scales=scales,
+            conv_hidden_ratio=conv_hidden_ratio,
+            conv_kernel_size=conv_kernel_size,
+            conv_context_kernel_size=conv_context_kernel_size,
+            conv_use_grn=conv_use_grn,
+            conv_norm_type=conv_norm_type,
+        )
+        if len(self.scales) != self.num_experts:
+            raise ValueError(
+                f"Expected len(scales) == num_experts, got {len(self.scales)} and {self.num_experts}"
+            )
+        expert_kwargs = dict(
+            r=r,
+            hidden_ratio=conv_hidden_ratio,
+            kernel_size=conv_kernel_size,
+            context_kernel_size=conv_context_kernel_size,
+            dropout=expert_dropout,
+            use_grn=conv_use_grn,
+            norm_type=conv_norm_type,
+            gate_temperature=conv_gate_temperature,
+        )
+        self.shared_expert = ScaleGatedConvExpert(scale=1, **expert_kwargs) if use_shared_expert else None
+        self.experts = nn.ModuleList([
+            ScaleGatedConvExpert(scale=scale, **expert_kwargs) for scale in self.scales
+        ])
+
 class DWConv(nn.Module):
     def __init__(self, in_channels, out_channels, kernel_size=3, stride=1, padding=1):
         super().__init__()
