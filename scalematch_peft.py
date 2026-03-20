@@ -35,6 +35,7 @@ from scalematch import (
 from supervised import validation_cpu
 from util.classes import CLASSES
 from util.dist_helper import setup_distributed
+from util.ssl_method_utils import get_local_rank, load_checkpoint_on_cpu, save_checkpoint_to_disk, log_cuda_memory, checkpoint_to_cpu
 from util.focal import FocalLoss
 from util.ohem import ProbOhemCrossEntropy2d
 from util.train_utils import (
@@ -181,9 +182,10 @@ def main(args, cfg):
         )
         show_trainable_parameters(model, logger)
 
-    local_rank = int(os.environ["LOCAL_RANK"])
+    local_rank = get_local_rank()
     model = torch.nn.SyncBatchNorm.convert_sync_batchnorm(model)
-    model.cuda()
+    model.cuda(local_rank)
+    log_cuda_memory(logger, rank, "after_model_to_cuda", local_rank=local_rank, save_path=args.save_path)
 
     model = torch.nn.parallel.DistributedDataParallel(
         model,
@@ -192,6 +194,7 @@ def main(args, cfg):
         output_device=local_rank,
         find_unused_parameters=True,
     )
+    log_cuda_memory(logger, rank, "after_ddp_wrap", local_rank=local_rank, save_path=args.save_path)
     enable_ddp_static_graph(model, logger=logger if rank == 0 else None)
     model_noddp = model.module
 
@@ -300,9 +303,11 @@ def main(args, cfg):
 
     latest_path = os.path.join(args.save_path, "latest.pth")
     if os.path.exists(latest_path):
-        checkpoint = torch.load(latest_path, map_location="cpu")
+        log_cuda_memory(logger, rank, "before_resume_load", save_path=args.save_path)
+        checkpoint = load_checkpoint_on_cpu(latest_path)
         model.load_state_dict(checkpoint["model"])
         optimizer.load_state_dict(checkpoint["optimizer"])
+        log_cuda_memory(logger, rank, "after_resume_load", save_path=args.save_path)
         epoch = checkpoint["epoch"]
         previous_best = checkpoint["previous_best"]
         best_epoch = checkpoint.get("best_epoch", 0)
@@ -618,9 +623,12 @@ def main(args, cfg):
                 "previous_best": previous_best,
                 "best_epoch": best_epoch,
             }
-            torch.save(checkpoint, latest_path)
-            if is_best:
-                torch.save(checkpoint, os.path.join(args.save_path, "best.pth"))
+            save_checkpoint_to_disk(
+                checkpoint,
+                latest_path,
+                os.path.join(args.save_path, "best.pth"),
+                is_best=is_best,
+            )
 
         eta_seconds = (total_epochs - (epoch + 1)) * (time.time() - start_time)
 

@@ -22,6 +22,7 @@ from util.ohem import ProbOhemCrossEntropy2d
 from util.focal import FocalLoss
 from util.utils import count_params, init_log, AverageMeter, intersectionAndUnion
 from util.dist_helper import setup_distributed
+from util.ssl_method_utils import get_local_rank, load_checkpoint_on_cpu, save_checkpoint_to_disk, log_cuda_memory
 from util.validation import validation_cpu as shared_validation_cpu
 
 from util.viz import Visualizer
@@ -216,9 +217,10 @@ def main(args, cfg):
         logger.info("Encoder params: {:.1f}M".format(count_params(model.backbone)))
         logger.info("Decoder params: {:.1f}M\n".format(count_params(model.head)))
 
-    local_rank = int(os.environ["LOCAL_RANK"])
+    local_rank = get_local_rank()
     model = torch.nn.SyncBatchNorm.convert_sync_batchnorm(model)
-    model.cuda()
+    model.cuda(local_rank)
+    log_cuda_memory(logger, rank, "after_model_to_cuda", local_rank=local_rank, save_path=args.save_path)
 
     model = torch.nn.parallel.DistributedDataParallel(
         model,
@@ -227,6 +229,7 @@ def main(args, cfg):
         output_device=local_rank,
         find_unused_parameters=True,
     )
+    log_cuda_memory(logger, rank, "after_ddp_wrap", local_rank=local_rank, save_path=args.save_path)
 
     if cfg["criterion"]["name"] == "CELoss":
         criterion = nn.CrossEntropyLoss(**cfg["criterion"]["kwargs"]).cuda(local_rank)
@@ -288,11 +291,11 @@ def main(args, cfg):
     epoch = -1
 
     if os.path.exists(os.path.join(args.save_path, "latest.pth")):
-        checkpoint = torch.load(
-            os.path.join(args.save_path, "latest.pth"), map_location="cpu"
-        )
+        log_cuda_memory(logger, rank, "before_resume_load", save_path=args.save_path)
+        checkpoint = load_checkpoint_on_cpu(os.path.join(args.save_path, "latest.pth"))
         model.load_state_dict(checkpoint["model"])
         optimizer.load_state_dict(checkpoint["optimizer"])
+        log_cuda_memory(logger, rank, "after_resume_load", save_path=args.save_path)
         epoch = checkpoint["epoch"]
         previous_best = checkpoint["previous_best"]
 
@@ -394,9 +397,12 @@ def main(args, cfg):
                 "previous_best": previous_best,
                 "best_epoch": best_epoch,
             }
-            torch.save(checkpoint, os.path.join(args.save_path, "latest.pth"))
-            if is_best:
-                torch.save(checkpoint, os.path.join(args.save_path, "best.pth"))
+            save_checkpoint_to_disk(
+                checkpoint,
+                os.path.join(args.save_path, "latest.pth"),
+                os.path.join(args.save_path, "best.pth"),
+                is_best=is_best,
+            )
 
 
 if __name__ == "__main__":

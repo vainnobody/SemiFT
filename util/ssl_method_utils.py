@@ -2,6 +2,7 @@ import logging
 import os
 import pprint
 from copy import deepcopy
+from pathlib import Path
 
 import torch
 from torch import nn
@@ -51,10 +52,65 @@ class NullWriter:
         return None
 
 
+def get_local_rank():
+    return int(os.environ.get("LOCAL_RANK", os.environ.get("RANK", 0)))
+
+
+def load_checkpoint_on_cpu(path):
+    return torch.load(path, map_location="cpu", weights_only=False)
+
+
+def checkpoint_to_cpu(value):
+    if torch.is_tensor(value):
+        return value.detach().cpu()
+    if isinstance(value, dict):
+        return {k: checkpoint_to_cpu(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [checkpoint_to_cpu(v) for v in value]
+    if isinstance(value, tuple):
+        return tuple(checkpoint_to_cpu(v) for v in value)
+    return value
+
+
+def save_checkpoint_to_disk(checkpoint, latest_path, best_path=None, is_best=False):
+    cpu_checkpoint = checkpoint_to_cpu(checkpoint)
+    latest_path = Path(latest_path)
+    torch.save(cpu_checkpoint, latest_path)
+    if is_best and best_path is not None:
+        torch.save(cpu_checkpoint, Path(best_path))
+
+
+def log_cuda_memory(logger, rank, stage, local_rank=None, save_path=None):
+    if os.environ.get("SEMIFT_DDP_DEBUG_INIT", "0") != "1":
+        return
+
+    if local_rank is None:
+        local_rank = get_local_rank()
+
+    if torch.cuda.is_available():
+        current_device = torch.cuda.current_device()
+        allocated_gb = torch.cuda.memory_allocated(local_rank) / 1024**3
+        reserved_gb = torch.cuda.memory_reserved(local_rank) / 1024**3
+        message = (
+            f"[ddp-init] stage={stage} rank={rank} local_rank={local_rank} "
+            f"current_device={current_device} allocated_gb={allocated_gb:.2f} "
+            f"reserved_gb={reserved_gb:.2f}"
+        )
+    else:
+        message = f"[ddp-init] stage={stage} rank={rank} local_rank={local_rank} cuda_unavailable"
+
+    if save_path is not None:
+        latest_path = Path(save_path) / "latest.pth"
+        message += f" save_path={save_path} latest_exists={latest_path.exists()}"
+
+    logger.info(message)
+
+
 def build_logger_and_runtime(args, cfg):
     logger = init_log("global", logging.INFO)
     logger.propagate = 0
     rank, world_size = setup_distributed(port=args.port)
+    log_cuda_memory(logger, rank, "after_setup_distributed", save_path=args.save_path)
 
     if rank == 0:
         os.makedirs(args.save_path, exist_ok=True)
@@ -93,17 +149,20 @@ def build_model(cfg, method="fixmatch"):
     else:
         model = DPT(**kwargs, backbone_version=backbone_version)
 
-    state_dict = torch.load(f'./pretrained/{cfg["backbone"]}.pth', map_location="cpu")
+    state_dict = torch.load(f'./pretrained/{cfg["backbone"]}.pth', map_location="cpu", weights_only=False)
     load_result = model.backbone.load_state_dict(state_dict, strict=False)
     if cfg.get("lock_backbone"):
         model.lock_backbone()
     return model, load_result
 
 
-def wrap_ddp(model):
-    local_rank = int(os.environ["LOCAL_RANK"])
+def wrap_ddp(model, logger=None, rank=None, save_path=None):
+    local_rank = get_local_rank()
+    torch.cuda.set_device(local_rank)
     model = torch.nn.SyncBatchNorm.convert_sync_batchnorm(model)
-    model.cuda()
+    model.cuda(local_rank)
+    if logger is not None and rank is not None:
+        log_cuda_memory(logger, rank, "after_model_to_cuda", local_rank=local_rank, save_path=save_path)
     model = torch.nn.parallel.DistributedDataParallel(
         model,
         device_ids=[local_rank],
@@ -111,6 +170,8 @@ def wrap_ddp(model):
         output_device=local_rank,
         find_unused_parameters=True,
     )
+    if logger is not None and rank is not None:
+        log_cuda_memory(logger, rank, "after_ddp_wrap", local_rank=local_rank, save_path=save_path)
     return model, local_rank
 
 
@@ -227,7 +288,7 @@ def build_standard_dataloaders(args, cfg, unlabeled_dataset=None, labeled_datase
     return trainloader_l, trainloader_u, valloader
 
 
-def maybe_load_checkpoint(args, model, optimizer, model_ema=None):
+def maybe_load_checkpoint(args, model, optimizer, model_ema=None, logger=None, rank=None):
     latest_path = os.path.join(args.save_path, "latest.pth")
     state = {
         "epoch": -1,
@@ -239,11 +300,15 @@ def maybe_load_checkpoint(args, model, optimizer, model_ema=None):
     if not os.path.exists(latest_path):
         return state
 
-    checkpoint = torch.load(latest_path, map_location="cpu")
+    if logger is not None and rank is not None:
+        log_cuda_memory(logger, rank, "before_resume_load", save_path=args.save_path)
+    checkpoint = load_checkpoint_on_cpu(latest_path)
     model.load_state_dict(checkpoint["model"])
     if model_ema is not None and "model_ema" in checkpoint:
         model_ema.load_state_dict(checkpoint["model_ema"])
     optimizer.load_state_dict(checkpoint["optimizer"])
+    if logger is not None and rank is not None:
+        log_cuda_memory(logger, rank, "after_resume_load", save_path=args.save_path)
     for key in state:
         if key in checkpoint:
             state[key] = checkpoint[key]
@@ -266,9 +331,12 @@ def save_checkpoint(args, rank, model, optimizer, epoch, previous_best, best_epo
         checkpoint["best_epoch_ema"] = best_epoch_ema
     if extra:
         checkpoint.update(extra)
-    torch.save(checkpoint, os.path.join(args.save_path, "latest.pth"))
-    if is_best:
-        torch.save(checkpoint, os.path.join(args.save_path, "best.pth"))
+    save_checkpoint_to_disk(
+        checkpoint,
+        os.path.join(args.save_path, "latest.pth"),
+        os.path.join(args.save_path, "best.pth"),
+        is_best=is_best,
+    )
 
 
 def update_ema(model, model_ema, iters, max_decay=0.996):

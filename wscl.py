@@ -88,12 +88,12 @@ def main(args, cfg):
     model, load_result = build_model(cfg, method="fixmatch")
     optimizer = build_optimizer(cfg, model)
     log_model_info(logger, rank, model, load_result)
-    model, local_rank = wrap_ddp(model)
+    model, local_rank = wrap_ddp(model, logger=logger, rank=rank, save_path=args.save_path)
     criterion_l, criterion_u = build_criterions(cfg, local_rank)
     trainloader_l, trainloader_u, valloader = build_dataloaders(args, cfg)
     total_iters = len(trainloader_u) * cfg["epochs"]
 
-    state = maybe_load_checkpoint(args, model, optimizer)
+    state = maybe_load_checkpoint(args, model, optimizer, logger=logger, rank=rank)
     previous_best = state["previous_best"]
     best_epoch = state["best_epoch"]
     start_epoch = state["epoch"]

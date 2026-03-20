@@ -20,6 +20,7 @@ from model.semseg.dpt_corrmatch import DPT_CorrMatch
 from model.semseg.corrmatch_utils import ThreshController
 from util.utils import count_params, init_log, AverageMeter, intersectionAndUnion
 from util.dist_helper import setup_distributed
+from util.ssl_method_utils import get_local_rank, load_checkpoint_on_cpu, save_checkpoint_to_disk, log_cuda_memory, checkpoint_to_cpu
 from util.viz import Visualizer
 from util.validation import validation_cpu as shared_validation_cpu
 import numpy as np
@@ -120,9 +121,10 @@ def main(args, cfg):
     if rank == 0:
         logger.info("Total params: {:.1f}M".format(count_params(model)))
 
-    local_rank = int(os.environ["LOCAL_RANK"])
+    local_rank = get_local_rank()
     model = torch.nn.SyncBatchNorm.convert_sync_batchnorm(model)
-    model.cuda()
+    model.cuda(local_rank)
+    log_cuda_memory(logger, rank, "after_model_to_cuda", local_rank=local_rank, save_path=args.save_path)
 
     model = torch.nn.parallel.DistributedDataParallel(
         model,
@@ -130,6 +132,7 @@ def main(args, cfg):
         output_device=local_rank,
         find_unused_parameters=True,
     )
+    log_cuda_memory(logger, rank, "after_ddp_wrap", local_rank=local_rank, save_path=args.save_path)
 
     # EMA model not strictly used in standard CorrMatch logic shown, but optional in FixMatch.
     # We'll skip for strict CorrMatch port or keep if desired. Let's keep it simple and skip EMA for now to verify CorrMatch logic first.
@@ -487,10 +490,10 @@ def main(args, cfg):
             if mIoU > best_iou:
                 best_iou = mIoU
                 torch.save(
-                    model.module.state_dict(), os.path.join(args.save_path, "best.pth")
+                    checkpoint_to_cpu(model.module.state_dict()), os.path.join(args.save_path, "best.pth")
                 )
             torch.save(
-                model.module.state_dict(), os.path.join(args.save_path, "latest.pth")
+                checkpoint_to_cpu(model.module.state_dict()), os.path.join(args.save_path, "latest.pth")
             )
 
 

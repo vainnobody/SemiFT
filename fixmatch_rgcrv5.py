@@ -41,6 +41,7 @@ from util.ohem import ProbOhemCrossEntropy2d
 from util.focal import FocalLoss
 from util.utils import count_params, init_log, AverageMeter, intersectionAndUnion
 from util.dist_helper import setup_distributed
+from util.ssl_method_utils import get_local_rank, load_checkpoint_on_cpu, save_checkpoint_to_disk, log_cuda_memory
 from util.train_utils import confidence_weighted_loss
 from util.viz import Visualizer
 from util.validation import validation_cpu as shared_validation_cpu
@@ -264,9 +265,10 @@ def main(args, cfg):
         logger.info("Encoder params: {:.1f}M".format(count_params(model.backbone)))
         logger.info("Decoder params: {:.1f}M\n".format(count_params(model.head)))
 
-    local_rank = int(os.environ["LOCAL_RANK"])
+    local_rank = get_local_rank()
     model = torch.nn.SyncBatchNorm.convert_sync_batchnorm(model)
-    model.cuda()
+    model.cuda(local_rank)
+    log_cuda_memory(logger, rank, "after_model_to_cuda", local_rank=local_rank, save_path=args.save_path)
 
     model = torch.nn.parallel.DistributedDataParallel(
         model,
@@ -275,6 +277,7 @@ def main(args, cfg):
         output_device=local_rank,
         find_unused_parameters=True,
     )
+    log_cuda_memory(logger, rank, "after_ddp_wrap", local_rank=local_rank, save_path=args.save_path)
 
     # EMA Teacher follows the same configurable model path as UniMatch v2
     model_ema = deepcopy(model)
@@ -365,10 +368,12 @@ def main(args, cfg):
 
     # Resume from checkpoint
     if os.path.exists(os.path.join(args.save_path, "latest.pth")):
-        checkpoint = torch.load(os.path.join(args.save_path, "latest.pth"))
+        log_cuda_memory(logger, rank, "before_resume_load", save_path=args.save_path)
+        checkpoint = load_checkpoint_on_cpu(os.path.join(args.save_path, "latest.pth"))
         model.load_state_dict(checkpoint["model"])
         model_ema.load_state_dict(checkpoint["model_ema"])
         optimizer.load_state_dict(checkpoint["optimizer"])
+        log_cuda_memory(logger, rank, "after_resume_load", save_path=args.save_path)
         epoch = checkpoint["epoch"]
         previous_best = checkpoint["previous_best"]
         previous_best_ema = checkpoint.get("previous_best_ema", 0.0)
@@ -802,9 +807,12 @@ def main(args, cfg):
                 "best_epoch": best_epoch,
                 "best_epoch_ema": best_epoch_ema,
             }
-            torch.save(checkpoint, os.path.join(args.save_path, "latest.pth"))
-            if is_best:
-                torch.save(checkpoint, os.path.join(args.save_path, "best.pth"))
+            save_checkpoint_to_disk(
+                checkpoint,
+                os.path.join(args.save_path, "latest.pth"),
+                os.path.join(args.save_path, "best.pth"),
+                is_best=is_best,
+            )
 
 
 if __name__ == "__main__":

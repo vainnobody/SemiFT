@@ -31,7 +31,14 @@ def setup_distributed(backend="nccl", port=None):
         rank = int(os.environ["RANK"])
         world_size = int(os.environ["WORLD_SIZE"])
 
-    torch.cuda.set_device(rank % num_gpus)
+    local_rank = int(os.environ.get("LOCAL_RANK", rank % num_gpus))
+    torch.cuda.set_device(local_rank)
+
+    if os.environ.get("SEMIFT_DDP_DEBUG_INIT", "0") == "1":
+        print(
+            f"[ddp-init] stage=setup_distributed rank={rank} local_rank={local_rank} current_device={torch.cuda.current_device()}",
+            flush=True,
+        )
 
     dist.init_process_group(
         backend=backend,

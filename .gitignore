@@ -40,6 +40,7 @@ test/*
 !test/test_batch_train.py
 !test/test_unimatch_v2_rgcr.py
 !test/test_cka.py
+!test/test_ddp_checkpoint_io.py
 
 # local-only artifacts
 .DS_Store
