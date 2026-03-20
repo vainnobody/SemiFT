@@ -314,8 +314,10 @@ class AdaptModel(nn.Module):
             "conv_context_kernel_size": self.peft_config.moe_conv_context_kernel_size,
             "conv_use_grn": self.peft_config.moe_conv_use_grn,
             "conv_norm_type": self.peft_config.moe_conv_norm_type,
-            "scales": self.peft_config.moe_expert_scales,
-            "conv_gate_temperature": self.peft_config.moe_conv_gate_temperature,
+            "scales": getattr(self.peft_config, "moe_expert_scales", [1, 2, 4, 8]),
+            "conv_gate_temperature": getattr(
+                self.peft_config, "moe_conv_gate_temperature", 1.0
+            ),
         }
 
     def _infer_block_dims(self, target_name, target):
