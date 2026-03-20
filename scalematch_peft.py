@@ -143,6 +143,10 @@ def get_reference_eval_settings(cfg, model_noddp):
     return eval_mode, multiplier
 
 
+def get_reference_eval_mode_from_cfg(cfg):
+    return "sliding_window" if cfg["dataset"] == "cityscapes" else "original"
+
+
 def main(args, cfg):
     logger = init_log("global", logging.INFO)
     logger.propagate = 0
@@ -156,9 +160,7 @@ def main(args, cfg):
 
     if rank == 0:
         all_args = {**cfg, **vars(args), "ngpus": world_size}
-        ref_eval_mode, ref_multiplier = get_reference_eval_settings(cfg, model)
-        all_args.setdefault("eval_mode", ref_eval_mode)
-        all_args.setdefault("eval_multiplier", ref_multiplier)
+        all_args.setdefault("eval_mode", get_reference_eval_mode_from_cfg(cfg))
         logger.info("{}\n".format(pprint.pformat(all_args)))
         logger.info(
             "Running ScaleMatch + PEFT with method=%s, target_modules=%s, freeze_backbone=%s",

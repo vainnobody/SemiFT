@@ -241,3 +241,12 @@ def test_reference_eval_settings_use_sliding_window_for_cityscapes():
 
     assert eval_mode == "sliding_window"
     assert multiplier == 16
+
+
+@pytest.mark.parametrize(
+    ("dataset_name", "expected_mode"),
+    [("cityscapes", "sliding_window"), ("potsdam", "original")],
+)
+def test_reference_eval_mode_from_cfg_does_not_require_model(dataset_name, expected_mode):
+    cfg = {"dataset": dataset_name}
+    assert scalematch_peft.get_reference_eval_mode_from_cfg(cfg) == expected_mode
