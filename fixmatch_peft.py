@@ -12,12 +12,7 @@ import yaml
 
 from util.utils import count_params, init_log, AverageMeter
 from util.dist_helper import setup_distributed
-from unimatchv2_peft import (
-    DEFAULT_PEFT_CFG,
-    METHOD_DEFAULT_TARGETS,
-    _normalize_target_modules,
-    build_peft_config,
-)
+from unimatchv2_peft import apply_peft, resolve_peft_cfg, show_trainable_parameters
 
 
 def get_parser():
@@ -51,72 +46,6 @@ def get_parser():
     )
     parser.set_defaults(freeze_backbone=None)
     return parser.parse_args()
-
-
-def resolve_peft_cfg(cfg, args):
-    raw_yaml_peft = cfg.get("peft", {})
-    peft_cfg = dict(DEFAULT_PEFT_CFG)
-    peft_cfg.update(raw_yaml_peft)
-
-    if args.peft_method is not None:
-        peft_cfg["method"] = args.peft_method
-    if args.peft_target_modules is not None:
-        peft_cfg["target_modules"] = args.peft_target_modules
-    if args.freeze_backbone is not None:
-        peft_cfg["freeze_backbone"] = args.freeze_backbone
-
-    peft_cfg["method"] = str(peft_cfg["method"]).lower()
-
-    modules_to_save = peft_cfg.get("modules_to_save")
-    if isinstance(modules_to_save, str):
-        peft_cfg["modules_to_save"] = [modules_to_save]
-    elif modules_to_save is None:
-        peft_cfg["modules_to_save"] = list(DEFAULT_PEFT_CFG["modules_to_save"])
-
-    supported_methods = set(METHOD_DEFAULT_TARGETS)
-    if peft_cfg["method"] not in supported_methods:
-        raise ValueError(
-            f"Unsupported PEFT method '{peft_cfg['method']}'. Expected one of {sorted(supported_methods)}."
-        )
-
-    target_modules_from_user = (
-        args.peft_target_modules is not None or "target_modules" in raw_yaml_peft
-    )
-    if target_modules_from_user:
-        peft_cfg["target_modules"] = _normalize_target_modules(peft_cfg.get("target_modules"))
-    else:
-        peft_cfg["target_modules"] = list(METHOD_DEFAULT_TARGETS[peft_cfg["method"]])
-
-    cfg["peft"] = peft_cfg
-    return peft_cfg
-
-
-def apply_peft(model, peft_cfg, cfg):
-    from peft.tuners.semift import AdaptModel
-
-    return AdaptModel(build_peft_config(peft_cfg, cfg), model)
-
-
-def show_trainable_parameters(model, logger):
-    total_params = sum(p.numel() for p in model.parameters())
-    trainable_params = 0
-    trainable_params_names = []
-
-    for name, param in model.named_parameters():
-        if param.requires_grad:
-            trainable_params += param.numel()
-            trainable_params_names.append(name)
-
-    percentage = 100 * trainable_params / total_params if total_params > 0 else 0
-
-    logger.info("--- 模型可训练参数 ---")
-    logger.info("--- 可训练模块/参数列表 ---")
-    for name in trainable_params_names:
-        logger.info(f" - {name}")
-    logger.info("\n--- 统计信息 ---")
-    logger.info(f" - 总参数数量: {total_params:,}")
-    logger.info(f" - 可训练参数数量: {trainable_params:,}")
-    logger.info(f" - 可训练参数占比: {percentage:.2f}%")
 
 
 def build_model(cfg, peft_cfg):
