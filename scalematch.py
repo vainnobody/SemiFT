@@ -25,7 +25,6 @@ from dataset.semi_rs import SemiDataset as RemoteSemiDataset
 from dataset.val import ValDataset
 from model.semseg.dpt_scalematch import DPT_ScaleMatch
 from model.semseg.upernet_scalematch import UperNet_ScaleMatch
-from supervised import validation_cpu
 from util.classes import CLASSES
 from util.ohem import ProbOhemCrossEntropy2d
 from util.focal import FocalLoss
@@ -38,6 +37,12 @@ from util.train_utils import (
     cutmix_img_,
     cutmix_mask,
 )
+from util.validation import validation_cpu as shared_validation_cpu
+
+
+@torch.no_grad()
+def validation_cpu(cfg, model, valid_loader):
+    return shared_validation_cpu(cfg, model, valid_loader)
 
 
 NATURAL_IMAGE_DATASETS = {"pascal", "cityscapes"}

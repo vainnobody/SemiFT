@@ -480,8 +480,13 @@ def main(args, cfg):
                 )
 
         # Validation
-        mIoU, iou_class = validation_cpu(cfg, model, valloader)
-        mIoU_ema, iou_class_ema = validation_cpu(cfg, model_ema, valloader)
+        val_cfg = dict(cfg)
+        val_cfg.setdefault(
+            "eval_mode", "slide_window" if cfg["dataset"] == "cityscapes" else "original"
+        )
+        val_cfg.setdefault("ignore_index", ignore_index)
+        mIoU, iou_class = validation_cpu(val_cfg, model, valloader)
+        mIoU_ema, iou_class_ema = validation_cpu(val_cfg, model_ema, valloader)
 
         if rank == 0:
             for cls_idx, iou in enumerate(iou_class):

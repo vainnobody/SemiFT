@@ -8,7 +8,6 @@ from torch.utils.data import DataLoader
 
 from dataset.semi_rs import SemiDataset
 from dataset.val import ValDataset
-from supervised import validation_cpu
 from util.classes import CLASSES
 from util.ssl_method_utils import (
     build_criterions,
@@ -24,7 +23,13 @@ from util.ssl_method_utils import (
     wrap_ddp,
 )
 from util.utils import AverageMeter
+from util.validation import validation_cpu as shared_validation_cpu
 from util.viz import Visualizer
+
+
+@torch.no_grad()
+def validation_cpu(cfg, model, valid_loader):
+    return shared_validation_cpu(cfg, model, valid_loader)
 
 
 def get_parser():
@@ -182,8 +187,13 @@ def main(args, cfg):
                         i, lr, total_loss.avg, total_loss_x.avg, total_loss_s.avg, total_mask_ratio.avg,
                     )
 
-        mIoU, iou_class = validation_cpu(cfg, model, valloader)
-        mIoU_ema, iou_class_ema = validation_cpu(cfg, model_ema, valloader)
+        val_cfg = dict(cfg)
+        val_cfg.setdefault(
+            "eval_mode", "slide_window" if cfg["dataset"] == "cityscapes" else "original"
+        )
+        val_cfg.setdefault("ignore_index", cfg.get("ignore_index", 255))
+        mIoU, iou_class = validation_cpu(val_cfg, model, valloader)
+        mIoU_ema, iou_class_ema = validation_cpu(val_cfg, model_ema, valloader)
         if rank == 0:
             for cls_idx, iou in enumerate(iou_class):
                 logger.info(

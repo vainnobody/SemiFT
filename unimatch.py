@@ -16,13 +16,18 @@ from dataset.semi_rs import SemiDataset
 from dataset.val import ValDataset
 from model.semseg.dpt_unimatch import DPT_UniMatch
 from model.semseg.upernet import UperNet
-from supervised import evaluate, validation_cpu
 from util.classes import CLASSES
 from util.ohem import ProbOhemCrossEntropy2d
 from util.focal import FocalLoss
 from util.utils import count_params, init_log, AverageMeter
 from util.dist_helper import setup_distributed
 from util.ssl_method_utils import get_local_rank, load_checkpoint_on_cpu, save_checkpoint_to_disk, log_cuda_memory
+from util.validation import validation_cpu as shared_validation_cpu
+
+
+@torch.no_grad()
+def validation_cpu(cfg, model, valid_loader):
+    return shared_validation_cpu(cfg, model, valid_loader)
 
 
 def get_parser():
@@ -410,10 +415,15 @@ def main(args, cfg):
                     )
                 )
 
-        eval_mode = "sliding_window" if cfg["dataset"] == "cityscapes" else "original"
+        val_cfg = dict(cfg)
+        val_cfg.setdefault(
+            "eval_mode", "slide_window" if cfg["dataset"] == "cityscapes" else "original"
+        )
+        val_cfg.setdefault("ignore_index", cfg.get("ignore_index", 255))
+        eval_mode = val_cfg["eval_mode"]
 
-        mIoU, iou_class = validation_cpu(cfg, model, valloader)
-        mIoU_ema, iou_class_ema = validation_cpu(cfg, model_ema, valloader)
+        mIoU, iou_class = validation_cpu(val_cfg, model, valloader)
+        mIoU_ema, iou_class_ema = validation_cpu(val_cfg, model_ema, valloader)
 
         if rank == 0:
             for cls_idx, iou in enumerate(iou_class):

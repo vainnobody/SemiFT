@@ -359,8 +359,13 @@ def main(args, cfg):
                     )
                 )
 
-        eval_mode = "sliding_window" if cfg["dataset"] == "cityscapes" else "original"
-        mIoU, iou_class = validation_cpu(cfg, model, valloader)
+        val_cfg = dict(cfg)
+        val_cfg.setdefault(
+            "eval_mode", "slide_window" if cfg["dataset"] == "cityscapes" else "original"
+        )
+        val_cfg.setdefault("ignore_index", cfg.get("ignore_index", 255))
+        eval_mode = val_cfg["eval_mode"]
+        mIoU, iou_class = validation_cpu(val_cfg, model, valloader)
 
         if rank == 0:
             for cls_idx, iou in enumerate(iou_class):

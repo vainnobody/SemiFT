@@ -26,13 +26,12 @@ from scalematch import (
     compute_official_scalematch_total_loss,
     enable_ddp_static_graph,
     get_debug_cfg,
-    get_eval_mode,
     get_scalematch_dataset_cls,
     get_scalematch_recipe,
     grad_norm,
     write_class_ratios,
 )
-from supervised import validation_cpu
+from supervised import evaluate
 from util.classes import CLASSES
 from util.dist_helper import setup_distributed
 from util.ssl_method_utils import get_local_rank, load_checkpoint_on_cpu, save_checkpoint_to_disk, log_cuda_memory, checkpoint_to_cpu
@@ -134,6 +133,16 @@ def build_optimizer(model, cfg):
     )
 
 
+def get_reference_eval_settings(cfg, model_noddp):
+    eval_mode = "sliding_window" if cfg["dataset"] == "cityscapes" else "original"
+    multiplier = (
+        None
+        if cfg.get("model", "dpt").lower() == "upernet"
+        else model_noddp.backbone.patch_size
+    )
+    return eval_mode, multiplier
+
+
 def main(args, cfg):
     logger = init_log("global", logging.INFO)
     logger.propagate = 0
@@ -147,7 +156,9 @@ def main(args, cfg):
 
     if rank == 0:
         all_args = {**cfg, **vars(args), "ngpus": world_size}
-        all_args.setdefault("eval_mode", get_eval_mode(cfg))
+        ref_eval_mode, ref_multiplier = get_reference_eval_settings(cfg, model)
+        all_args.setdefault("eval_mode", ref_eval_mode)
+        all_args.setdefault("eval_multiplier", ref_multiplier)
         logger.info("{}\n".format(pprint.pformat(all_args)))
         logger.info(
             "Running ScaleMatch + PEFT with method=%s, target_modules=%s, freeze_backbone=%s",
@@ -245,9 +256,6 @@ def main(args, cfg):
         ignore_index=ignore_index,
         **dataset_kwargs,
     )
-    val_cfg = dict(cfg)
-    val_cfg.setdefault("eval_mode", get_eval_mode(cfg))
-    val_cfg.setdefault("ignore_index", ignore_index)
     valset = ValDataset(
         cfg["dataset"],
         cfg["data_root"],
@@ -590,8 +598,8 @@ def main(args, cfg):
                 logger.info(f"Iters: {i}, " + str(log_avg))
                 log_avg.reset()
 
-        eval_mode = get_eval_mode(cfg)
-        mIoU, iou_class = validation_cpu(val_cfg, model, valloader)
+        eval_mode, multiplier = get_reference_eval_settings(cfg, model_noddp)
+        mIoU, iou_class = evaluate(model, valloader, eval_mode, cfg, multiplier=multiplier)
 
         if rank == 0:
             for cls_idx, iou in enumerate(iou_class):

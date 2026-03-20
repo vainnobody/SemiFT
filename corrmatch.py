@@ -484,7 +484,12 @@ def main(args, cfg):
                     viz.reset()
 
         # Validation
-        mIoU, _ = validation_cpu(cfg, model, valloader)
+        val_cfg = dict(cfg)
+        val_cfg.setdefault(
+            "eval_mode", "slide_window" if cfg["dataset"] == "cityscapes" else "original"
+        )
+        val_cfg.setdefault("ignore_index", cfg.get("ignore_index", 255))
+        mIoU, _ = validation_cpu(val_cfg, model, valloader)
         if rank == 0:
             logger.info(f"Epoch {epoch} mIoU: {mIoU:.4f}")
             if mIoU > best_iou:

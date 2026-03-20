@@ -28,7 +28,12 @@ def _validation_cpu(*args, **kwargs):
     return 0.0, []
 
 
+def _evaluate(*args, **kwargs):
+    return 0.0, []
+
+
 stub_supervised.validation_cpu = _validation_cpu
+stub_supervised.evaluate = _evaluate
 sys.modules.setdefault("supervised", stub_supervised)
 
 stub_peft = types.ModuleType("peft")
@@ -203,3 +208,36 @@ def test_enable_ddp_static_graph_supports_public_method():
     model = DummyDDPPublic()
     scalematch_peft.enable_ddp_static_graph(model)
     assert model.called == ["public"]
+
+
+@pytest.mark.parametrize(
+    ("model_name", "expected_mode", "expected_multiplier"),
+    [
+        ("dpt", "original", 14),
+        ("upernet", "original", None),
+    ],
+)
+def test_reference_eval_settings_follow_unimatch_v2_semantics(model_name, expected_mode, expected_multiplier):
+    cfg = {
+        "dataset": "potsdam",
+        "model": model_name,
+    }
+    model_noddp = SimpleNamespace(backbone=SimpleNamespace(patch_size=14))
+
+    eval_mode, multiplier = scalematch_peft.get_reference_eval_settings(cfg, model_noddp)
+
+    assert eval_mode == expected_mode
+    assert multiplier == expected_multiplier
+
+
+def test_reference_eval_settings_use_sliding_window_for_cityscapes():
+    cfg = {
+        "dataset": "cityscapes",
+        "model": "dpt",
+    }
+    model_noddp = SimpleNamespace(backbone=SimpleNamespace(patch_size=16))
+
+    eval_mode, multiplier = scalematch_peft.get_reference_eval_settings(cfg, model_noddp)
+
+    assert eval_mode == "sliding_window"
+    assert multiplier == 16

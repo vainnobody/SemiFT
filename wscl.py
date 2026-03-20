@@ -9,7 +9,6 @@ import yaml
 from torch.utils.data import DataLoader
 
 from dataset.semi_rs import SemiDataset
-from supervised import validation_cpu
 from util.classes import CLASSES
 from util.utils import AverageMeter
 from util.ssl_method_utils import (
@@ -24,6 +23,7 @@ from util.ssl_method_utils import (
     update_lr,
     wrap_ddp,
 )
+from util.validation import validation_cpu as shared_validation_cpu
 from util.viz import Visualizer
 from util.wscl_utils import (
     entropy_map,
@@ -33,6 +33,11 @@ from util.wscl_utils import (
     generate_unsup_aug_sdc,
 )
 from dataset.val import ValDataset
+
+
+@torch.no_grad()
+def validation_cpu(cfg, model, valid_loader):
+    return shared_validation_cpu(cfg, model, valid_loader)
 
 
 AUG_HANDLERS = {
@@ -190,7 +195,12 @@ def main(args, cfg):
                         i, lr, total_loss.avg, total_loss_x.avg, total_loss_s.avg, total_mask_ratio.avg,
                     )
 
-        mIoU, iou_class = validation_cpu(cfg, model, valloader)
+        val_cfg = dict(cfg)
+        val_cfg.setdefault(
+            "eval_mode", "slide_window" if cfg["dataset"] == "cityscapes" else "original"
+        )
+        val_cfg.setdefault("ignore_index", cfg.get("ignore_index", 255))
+        mIoU, iou_class = validation_cpu(val_cfg, model, valloader)
         if rank == 0:
             for cls_idx, iou in enumerate(iou_class):
                 logger.info("***** Evaluation ***** >>>> Class [%d %s] IoU: %.2f", cls_idx, CLASSES[cfg["dataset"]][cls_idx], iou)
