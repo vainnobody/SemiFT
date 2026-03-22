@@ -41,7 +41,11 @@ def load_peft_modules():
     class SemiFtScaleGate(SemiFt):
         pass
 
+    class SemiFtSAMoE(SemiFt):
+        pass
+
     moe_mod.SemiFt = SemiFt
+    moe_mod.SemiFtSAMoE = SemiFtSAMoE
     moe_mod.SemiFtScaleGate = SemiFtScaleGate
 
     sys.modules["peft"] = peft_pkg
@@ -107,6 +111,7 @@ def test_wrapper_deepcopy_preserves_semift_config_state():
             self.peft_config = semift_module.SemiFTConfig(
                 moe_expert_scales=[2, 4],
                 moe_conv_gate_temperature=1.5,
+                moe_expert_drop_path_rate=0.2,
             )
 
     wrapped = Wrapper()
@@ -114,3 +119,4 @@ def test_wrapper_deepcopy_preserves_semift_config_state():
 
     assert cloned.peft_config.moe_expert_scales == [2, 4]
     assert cloned.peft_config.moe_conv_gate_temperature == 1.5
+    assert cloned.peft_config.moe_expert_drop_path_rate == 0.2

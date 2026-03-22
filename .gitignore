@@ -60,3 +60,6 @@ conda_ppt/
 output/
 semift_topformer_style_comparison.pptx
 
+# ignore root markdown files except README
+/*.md
+!/README.md

@@ -46,7 +46,7 @@ DEFAULT_PEFT_CFG: Dict[str, Any] = {
     "moe_router_aux_loss_coef": 1e-2,
     "moe_router_z_loss_coef": 1e-3,
     "moe_router_jitter_noise": 1e-2,
-    "moe_num_prefix_tokens": 5,
+    "moe_num_prefix_tokens": -1,
     "moe_use_shared_expert": True,
     "moe_conv_hidden_ratio": 2.0,
     "moe_conv_kernel_size": 3,
@@ -55,10 +55,13 @@ DEFAULT_PEFT_CFG: Dict[str, Any] = {
     "moe_conv_norm_type": "layernorm",
     "moe_expert_scales": [1, 2, 4, 8],
     "moe_conv_gate_temperature": 1.0,
+    "moe_layerscale_init": 1e-5,
+    "moe_expert_drop_path_rate": 0.0,
 }
 
 METHOD_DEFAULT_TARGETS: Dict[str, List[str]] = {
     "semift": ["mlp"],
+    "semift_samoe": ["mlp"],
     "semift_scalegate": ["mlp"],
     "lora": ["qkv", "proj", "fc1", "fc2"],
     "ssf": ["patch_embed", "norm1", "norm2", "qkv", "proj", "fc1", "fc2"],
@@ -255,6 +258,12 @@ def build_peft_config(peft_cfg: Dict[str, Any], cfg: Dict[str, Any]):
         ),
         moe_conv_gate_temperature=peft_cfg.get(
             "moe_conv_gate_temperature", DEFAULT_PEFT_CFG["moe_conv_gate_temperature"]
+        ),
+        moe_layerscale_init=peft_cfg.get(
+            "moe_layerscale_init", DEFAULT_PEFT_CFG["moe_layerscale_init"]
+        ),
+        moe_expert_drop_path_rate=peft_cfg.get(
+            "moe_expert_drop_path_rate", DEFAULT_PEFT_CFG["moe_expert_drop_path_rate"]
         ),
     )
 

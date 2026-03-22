@@ -10,7 +10,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from ..utils import PeftConfig, PeftType
-from .moe import SemiFt, SemiFtScaleGate
+from .moe import SemiFt, SemiFtSAMoE, SemiFtScaleGate
 
 
 @dataclass
@@ -57,7 +57,7 @@ class SemiFTConfig(PeftConfig):
     moe_router_aux_loss_coef: float = field(default=1e-2)
     moe_router_z_loss_coef: float = field(default=1e-3)
     moe_router_jitter_noise: float = field(default=1e-2)
-    moe_num_prefix_tokens: int = field(default=5)
+    moe_num_prefix_tokens: int = field(default=-1)
     moe_use_shared_expert: bool = field(default=True)
     moe_conv_hidden_ratio: float = field(default=2.0)
     moe_conv_kernel_size: int = field(default=3)
@@ -66,6 +66,8 @@ class SemiFTConfig(PeftConfig):
     moe_conv_norm_type: str = field(default="layernorm")
     moe_expert_scales: List[int] = field(default_factory=lambda: [1, 2, 4, 8])
     moe_conv_gate_temperature: float = field(default=1.0)
+    moe_layerscale_init: float = field(default=1e-5)
+    moe_expert_drop_path_rate: float = field(default=0.0)
 
     def __post_init__(self):
         self.peft_type = PeftType.LORA
@@ -73,6 +75,7 @@ class SemiFTConfig(PeftConfig):
 
 METHOD_DEFAULT_TARGETS = {
     "semift": ["mlp"],
+    "semift_samoe": ["mlp"],
     "semift_scalegate": ["mlp"],
     "lora": ["qkv", "proj", "fc1", "fc2"],
     "ssf": ["patch_embed", "norm1", "norm2", "qkv", "proj", "fc1", "fc2"],
@@ -88,7 +91,7 @@ HIGH_LEVEL_TO_SUBMODULES = {
     "attn": ["qkv", "proj"],
     "mlp": ["fc1", "fc2"],
 }
-BLOCK_LEVEL_METHODS = {"semift", "semift_scalegate", "adaptformer", "fact_tt", "fact_tk"}
+BLOCK_LEVEL_METHODS = {"semift", "semift_samoe", "semift_scalegate", "adaptformer", "fact_tt", "fact_tk"}
 PARAMETER_ONLY_METHODS = {"bitfit"}
 SSF_METHODS = {"ssf"}
 
@@ -203,6 +206,8 @@ class AdaptModel(nn.Module):
         input_dim, output_dim = self._infer_block_dims(target_name, target)
         if self.peft_config.method == "semift":
             adapter = SemiFt(input_dim, output_dim, **self._semift_kwargs())
+        elif self.peft_config.method == "semift_samoe":
+            adapter = SemiFtSAMoE(input_dim, output_dim, **self._semift_kwargs())
         elif self.peft_config.method == "semift_scalegate":
             adapter = SemiFtScaleGate(input_dim, output_dim, **self._semift_kwargs())
         elif self.peft_config.method == "adaptformer":
@@ -299,7 +304,27 @@ class AdaptModel(nn.Module):
                 param.requires_grad = True
 
     def _semift_kwargs(self):
-        return {
+        num_prefix_tokens = self.peft_config.moe_num_prefix_tokens
+        if num_prefix_tokens is None or int(num_prefix_tokens) <= 0:
+            num_prefix_tokens = AdaptModel._infer_num_prefix_tokens_from_model(self)
+        if self.peft_config.method == "semift_samoe":
+            return {
+                "r": self.peft_config.r,
+                "num_experts": self.peft_config.moe_num_experts,
+                "topk": self.peft_config.moe_topk,
+                "router_balance_mode": self.peft_config.moe_router_balance_mode,
+                "router_bias_update_speed": self.peft_config.moe_router_bias_update_speed,
+                "router_bias_clip": self.peft_config.moe_router_bias_clip,
+                "router_jitter_noise": self.peft_config.moe_router_jitter_noise,
+                "num_prefix_tokens": num_prefix_tokens,
+                "use_shared_expert": self.peft_config.moe_use_shared_expert,
+                "conv_kernel_size": self.peft_config.moe_conv_kernel_size,
+                "conv_norm_type": self.peft_config.moe_conv_norm_type,
+                "scales": self.peft_config.moe_expert_scales,
+                "layerscale_init": self.peft_config.moe_layerscale_init,
+                "drop_path_rate": self.peft_config.moe_expert_drop_path_rate,
+            }
+        kwargs = {
             "r": self.peft_config.r,
             "num_experts": self.peft_config.moe_num_experts,
             "topk": self.peft_config.moe_topk,
@@ -307,7 +332,7 @@ class AdaptModel(nn.Module):
             "router_bias_update_speed": self.peft_config.moe_router_bias_update_speed,
             "router_bias_clip": self.peft_config.moe_router_bias_clip,
             "router_jitter_noise": self.peft_config.moe_router_jitter_noise,
-            "num_prefix_tokens": self.peft_config.moe_num_prefix_tokens,
+            "num_prefix_tokens": num_prefix_tokens,
             "use_shared_expert": self.peft_config.moe_use_shared_expert,
             "conv_hidden_ratio": self.peft_config.moe_conv_hidden_ratio,
             "conv_kernel_size": self.peft_config.moe_conv_kernel_size,
@@ -317,6 +342,17 @@ class AdaptModel(nn.Module):
             "scales": self.peft_config.moe_expert_scales,
             "conv_gate_temperature": self.peft_config.moe_conv_gate_temperature,
         }
+        return kwargs
+
+    def _infer_num_prefix_tokens_from_model(self):
+        backbone = getattr(self.model, "backbone", None)
+        if backbone is None:
+            return 1
+        if hasattr(backbone, "num_register_tokens"):
+            return 1 + int(getattr(backbone, "num_register_tokens"))
+        if hasattr(backbone, "n_storage_tokens"):
+            return 1 + int(getattr(backbone, "n_storage_tokens"))
+        return 1
 
     def _infer_block_dims(self, target_name, target):
         if target_name == "attn":

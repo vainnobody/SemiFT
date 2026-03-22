@@ -33,6 +33,16 @@ stub_peft_semift.AdaptModel = StubAdaptModel
 sys.modules.setdefault("peft", stub_peft)
 sys.modules.setdefault("peft.tuners", stub_peft_tuners)
 sys.modules["peft.tuners.semift"] = stub_peft_semift
+stub_tensorboard = types.ModuleType("torch.utils.tensorboard")
+
+
+class StubSummaryWriter:
+    def __init__(self, *args, **kwargs):
+        pass
+
+
+stub_tensorboard.SummaryWriter = StubSummaryWriter
+sys.modules["torch.utils.tensorboard"] = stub_tensorboard
 
 from unimatchv2_peft import build_peft_config, resolve_peft_cfg
 
@@ -68,7 +78,11 @@ def load_semift_module():
     class SemiFtScaleGate(SemiFt):
         pass
 
+    class SemiFtSAMoE(SemiFt):
+        pass
+
     moe_mod.SemiFt = SemiFt
+    moe_mod.SemiFtSAMoE = SemiFtSAMoE
     moe_mod.SemiFtScaleGate = SemiFtScaleGate
 
     sys.modules["peft.utils"] = utils_mod
@@ -170,6 +184,21 @@ def test_semift_router_bias_settings_are_built_from_config():
     assert abs(config.moe_router_bias_clip - 0.1) < 1e-8
     assert config.moe_router_aux_loss_coef == 0.0
     assert config.moe_router_z_loss_coef == 0.0
+
+
+def test_semift_samoe_config_builds_drop_path_rate():
+    cfg = {
+        "nclass": 6,
+        "peft": {
+            "method": "semift_samoe",
+            "target_modules": ["mlp"],
+            "moe_expert_drop_path_rate": 0.15,
+        },
+    }
+    peft_cfg = resolve_peft_cfg(cfg, make_args())
+    config = build_peft_config(peft_cfg, cfg)
+    assert config.method == "semift_samoe"
+    assert abs(config.moe_expert_drop_path_rate - 0.15) < 1e-8
 
 
 class DummyAttention(types.SimpleNamespace):
@@ -333,6 +362,15 @@ def test_adaptmodel_wraps_semift_scalegate_block():
     assert isinstance(adapted.model.block.mlp.adapter, semift.SemiFtScaleGate)
 
 
+def test_adaptmodel_wraps_semift_samoe_block():
+    semift = load_semift_module()
+    model = build_dummy_block(semift.torch)
+    cfg = semift.SemiFTConfig(method="semift_samoe", target_modules=["mlp"], r=4, moe_num_prefix_tokens=-1)
+    adapted = semift.AdaptModel(cfg, model)
+    assert isinstance(adapted.model.block.mlp, semift.WarpBlock)
+    assert isinstance(adapted.model.block.mlp.adapter, semift.SemiFtSAMoE)
+
+
 def test_build_peft_config_passes_scalegate_fields_to_current_config():
     cfg = {
         "nclass": 6,
@@ -349,3 +387,23 @@ def test_build_peft_config_passes_scalegate_fields_to_current_config():
     assert config.method == "semift_scalegate"
     assert config.moe_expert_scales == [1, 3, 5]
     assert abs(config.moe_conv_gate_temperature - 0.7) < 1e-8
+
+
+def test_build_peft_config_supports_semift_samoe():
+    cfg = {
+        "nclass": 6,
+        "peft": {
+            "method": "semift_samoe",
+            "target_modules": ["mlp"],
+            "moe_expert_scales": [1, 2, 4, 8],
+            "moe_layerscale_init": 1e-5,
+            "moe_num_prefix_tokens": -1,
+        },
+    }
+    peft_cfg = resolve_peft_cfg(cfg, make_args())
+    config = build_peft_config(peft_cfg, cfg)
+
+    assert config.method == "semift_samoe"
+    assert config.moe_expert_scales == [1, 2, 4, 8]
+    assert abs(config.moe_layerscale_init - 1e-5) < 1e-8
+    assert config.moe_num_prefix_tokens == -1
