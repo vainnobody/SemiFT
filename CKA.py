@@ -104,6 +104,7 @@ METHOD_DEFAULT_TARGETS: Dict[str, List[str]] = {
     "semift_samoe": ["mlp"],
     "samoev4": ["mlp"],
     "samoev5": ["mlp"],
+    "samoev6": ["mlp"],
     "semift_scalegate": ["mlp"],
     "lora": ["qkv", "proj", "fc1", "fc2"],
     "ssf": ["patch_embed", "norm1", "norm2", "qkv", "proj", "fc1", "fc2"],
