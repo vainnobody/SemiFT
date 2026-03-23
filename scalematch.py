@@ -325,8 +325,9 @@ def main(args, cfg):
         device_ids=[local_rank],
         broadcast_buffers=False,
         output_device=local_rank,
-        find_unused_parameters=True,
+        find_unused_parameters=False,
     )
+    enable_ddp_static_graph(model, logger=logger)
     log_cuda_memory(logger, rank, "after_ddp_wrap", local_rank=local_rank, save_path=args.save_path)
 
     if cfg["criterion"]["name"] == "CELoss":
