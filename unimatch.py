@@ -1,5 +1,4 @@
 import argparse
-from copy import deepcopy
 import logging
 import os
 import pprint
@@ -14,7 +13,7 @@ import yaml
 
 from dataset.semi_rs import SemiDataset
 from dataset.val import ValDataset
-from model.semseg.dpt_unimatch import DPT_UniMatch
+from model.semseg.dpt import DPT
 from model.semseg.upernet import UperNet
 from util.classes import CLASSES
 from util.ohem import ProbOhemCrossEntropy2d
@@ -40,7 +39,7 @@ def validation_cpu(cfg, model, valid_loader):
 
 def get_parser():
     parser = argparse.ArgumentParser(
-        description="UniMatch with FixMatch-style Training for Semi-Supervised Semantic Segmentation"
+        description="UniMatch training rebuilt on top of the supervised.py scaffold"
     )
     parser.add_argument("--config", type=str, required=True)
     parser.add_argument("--labeled-id-path", type=str, required=True)
@@ -60,9 +59,7 @@ def main(args, cfg):
     if rank == 0:
         all_args = {**cfg, **vars(args), "ngpus": world_size}
         logger.info("{}\n".format(pprint.pformat(all_args)))
-
         writer = SummaryWriter(args.save_path)
-
         os.makedirs(args.save_path, exist_ok=True)
 
     cudnn.enabled = True
@@ -72,7 +69,7 @@ def main(args, cfg):
     _, backbone_version = get_backbone_info(cfg)
 
     if cfg["model"] == "dpt":
-        model = DPT_UniMatch(
+        model = DPT(
             **model_kwargs,
             backbone_version=backbone_version,
         )
@@ -81,6 +78,8 @@ def main(args, cfg):
             **model_kwargs,
             backbone_version=backbone_version,
         )
+    else:
+        raise ValueError(f"Unsupported UniMatch model: {cfg['model']}")
 
     load_backbone_checkpoint(model, cfg)
 
@@ -115,7 +114,13 @@ def main(args, cfg):
     local_rank = get_local_rank()
     model = torch.nn.SyncBatchNorm.convert_sync_batchnorm(model)
     model.cuda(local_rank)
-    log_cuda_memory(logger, rank, "after_model_to_cuda", local_rank=local_rank, save_path=args.save_path)
+    log_cuda_memory(
+        logger,
+        rank,
+        "after_model_to_cuda",
+        local_rank=local_rank,
+        save_path=args.save_path,
+    )
 
     model = torch.nn.parallel.DistributedDataParallel(
         model,
@@ -124,12 +129,13 @@ def main(args, cfg):
         output_device=local_rank,
         find_unused_parameters=True,
     )
-
-    # EMA Teacher Model
-    model_ema = deepcopy(model)
-    model_ema.eval()
-    for param in model_ema.parameters():
-        param.requires_grad = False
+    log_cuda_memory(
+        logger,
+        rank,
+        "after_ddp_wrap",
+        local_rank=local_rank,
+        save_path=args.save_path,
+    )
 
     if cfg["criterion"]["name"] == "CELoss":
         criterion_l = nn.CrossEntropyLoss(**cfg["criterion"]["kwargs"]).cuda(local_rank)
@@ -176,7 +182,6 @@ def main(args, cfg):
         drop_last=True,
         sampler=trainsampler_l,
     )
-
     trainsampler_u = torch.utils.data.distributed.DistributedSampler(trainset_u)
     trainloader_u = DataLoader(
         trainset_u,
@@ -186,7 +191,6 @@ def main(args, cfg):
         drop_last=True,
         sampler=trainsampler_u,
     )
-
     valsampler = torch.utils.data.distributed.DistributedSampler(valset)
     valloader = DataLoader(
         valset,
@@ -198,22 +202,19 @@ def main(args, cfg):
     )
 
     total_iters = len(trainloader_u) * cfg["epochs"]
-    previous_best, previous_best_ema = 0.0, 0.0
-    best_epoch, best_epoch_ema = 0, 0
+    previous_best = 0.0
+    best_epoch = 0
     epoch = -1
 
     if os.path.exists(os.path.join(args.save_path, "latest.pth")):
         log_cuda_memory(logger, rank, "before_resume_load", save_path=args.save_path)
         checkpoint = load_checkpoint_on_cpu(os.path.join(args.save_path, "latest.pth"))
         model.load_state_dict(checkpoint["model"])
-        model_ema.load_state_dict(checkpoint["model_ema"])
         optimizer.load_state_dict(checkpoint["optimizer"])
         log_cuda_memory(logger, rank, "after_resume_load", save_path=args.save_path)
         epoch = checkpoint["epoch"]
         previous_best = checkpoint["previous_best"]
-        previous_best_ema = checkpoint["previous_best_ema"]
         best_epoch = checkpoint["best_epoch"]
-        best_epoch_ema = checkpoint["best_epoch_ema"]
 
         if rank == 0:
             logger.info("************ Load from checkpoint at epoch %i\n" % epoch)
@@ -221,9 +222,8 @@ def main(args, cfg):
     for epoch in range(epoch + 1, cfg["epochs"]):
         if rank == 0:
             logger.info(
-                "===========> Epoch: {:}, Previous best: {:.2f} @epoch-{:}, "
-                "EMA: {:.2f} @epoch-{:}".format(
-                    epoch, previous_best, best_epoch, previous_best_ema, best_epoch_ema
+                "===========> Epoch: {:}, Previous best: {:.2f} @epoch-{:}".format(
+                    epoch, previous_best, best_epoch
                 )
             )
 
@@ -235,7 +235,6 @@ def main(args, cfg):
 
         trainloader_l.sampler.set_epoch(epoch)
         trainloader_u.sampler.set_epoch(epoch)
-
         loader = zip(trainloader_l, trainloader_u, trainloader_u)
 
         model.train()
@@ -245,7 +244,6 @@ def main(args, cfg):
             (img_u_w, img_u_s1, img_u_s2, ignore_mask, cutmix_box1, cutmix_box2),
             (img_u_w_mix, img_u_s1_mix, img_u_s2_mix, ignore_mask_mix, _, _),
         ) in enumerate(loader):
-
             img_x, mask_x = img_x.cuda(), mask_x.cuda()
             img_u_w = img_u_w.cuda()
             img_u_s1, img_u_s2, ignore_mask = (
@@ -258,13 +256,13 @@ def main(args, cfg):
             img_u_s1_mix, img_u_s2_mix = img_u_s1_mix.cuda(), img_u_s2_mix.cuda()
             ignore_mask_mix = ignore_mask_mix.cuda()
 
-            # EMA Teacher generates pseudo-labels
             with torch.no_grad():
-                pred_u_w_mix = model_ema(img_u_w_mix).detach()
+                model.eval()
+                pred_u_w_mix = model(img_u_w_mix).detach()
                 conf_u_w_mix = pred_u_w_mix.softmax(dim=1).max(dim=1)[0]
                 mask_u_w_mix = pred_u_w_mix.argmax(dim=1)
+            model.train()
 
-            # Apply CutMix augmentation
             img_u_s1[cutmix_box1.unsqueeze(1).expand(img_u_s1.shape) == 1] = (
                 img_u_s1_mix[cutmix_box1.unsqueeze(1).expand(img_u_s1.shape) == 1]
             )
@@ -274,21 +272,17 @@ def main(args, cfg):
 
             num_lb, num_ulb = img_x.shape[0], img_u_w.shape[0]
 
-            # Forward pass for labeled and weak unlabeled data (with official UniMatch feature perturbation)
             preds, preds_fp = model(torch.cat((img_x, img_u_w)), need_fp=True)
             pred_x, pred_u_w = preds.split([num_lb, num_ulb])
             pred_u_w_fp = preds_fp[num_lb:]
 
-            # Forward pass for strong augmented unlabeled data
             pred_u_s1, pred_u_s2 = model(torch.cat((img_u_s1, img_u_s2))).chunk(2)
 
-            # Get pseudo-labels from weak predictions (using EMA teacher)
             with torch.no_grad():
-                pred_u_w_ema = model_ema(img_u_w).detach()
-                conf_u_w = pred_u_w_ema.softmax(dim=1).max(dim=1)[0]
-                mask_u_w = pred_u_w_ema.argmax(dim=1)
+                pred_u_w = pred_u_w.detach()
+                conf_u_w = pred_u_w.softmax(dim=1).max(dim=1)[0]
+                mask_u_w = pred_u_w.argmax(dim=1)
 
-            # CutMix for pseudo-labels
             mask_u_w_cutmixed1, conf_u_w_cutmixed1, ignore_mask_cutmixed1 = (
                 mask_u_w.clone(),
                 conf_u_w.clone(),
@@ -308,10 +302,8 @@ def main(args, cfg):
             conf_u_w_cutmixed2[cutmix_box2 == 1] = conf_u_w_mix[cutmix_box2 == 1]
             ignore_mask_cutmixed2[cutmix_box2 == 1] = ignore_mask_mix[cutmix_box2 == 1]
 
-            # Supervised loss
             loss_x = criterion_l(pred_x, mask_x)
 
-            # Unsupervised loss for strong augmented branch 1
             loss_u_s1 = criterion_u(pred_u_s1, mask_u_w_cutmixed1)
             loss_mask_s1 = (conf_u_w_cutmixed1 >= cfg["conf_thresh"]) & (
                 ignore_mask_cutmixed1 != 255
@@ -320,7 +312,6 @@ def main(args, cfg):
                 min=1.0
             )
 
-            # Unsupervised loss for strong augmented branch 2
             loss_u_s2 = criterion_u(pred_u_s2, mask_u_w_cutmixed2)
             loss_mask_s2 = (conf_u_w_cutmixed2 >= cfg["conf_thresh"]) & (
                 ignore_mask_cutmixed2 != 255
@@ -329,19 +320,15 @@ def main(args, cfg):
                 min=1.0
             )
 
-            # Feature perturbation loss
             loss_u_w_fp = criterion_u(pred_u_w_fp, mask_u_w)
             loss_mask_fp = (conf_u_w >= cfg["conf_thresh"]) & (ignore_mask != 255)
             loss_u_w_fp = (loss_u_w_fp * loss_mask_fp).sum() / loss_mask_fp.sum().clamp(
                 min=1.0
             )
 
-            # Total loss with UniMatch weighting
             loss = (
                 loss_x + loss_u_s1 * 0.25 + loss_u_s2 * 0.25 + loss_u_w_fp * 0.5
             ) / 2.0
-
-            torch.distributed.barrier()
 
             optimizer.zero_grad()
             loss.backward()
@@ -354,25 +341,13 @@ def main(args, cfg):
 
             mask_ratio = (
                 (conf_u_w >= cfg["conf_thresh"]) & (ignore_mask != 255)
-            ).sum().item() / (ignore_mask != 255).sum()
-            total_mask_ratio.update(mask_ratio.item())
+            ).sum().item() / (ignore_mask != 255).sum().clamp(min=1).item()
+            total_mask_ratio.update(mask_ratio)
 
             iters = epoch * len(trainloader_u) + i
             lr = cfg["lr"] * (1 - iters / total_iters) ** 0.9
             optimizer.param_groups[0]["lr"] = lr
             optimizer.param_groups[1]["lr"] = lr * cfg["lr_multi"]
-
-            # EMA update
-            ema_ratio = min(1 - 1 / (iters + 1), 0.996)
-
-            for param, param_ema in zip(model.parameters(), model_ema.parameters()):
-                param_ema.copy_(
-                    param_ema * ema_ratio + param.detach() * (1 - ema_ratio)
-                )
-            for buffer, buffer_ema in zip(model.buffers(), model_ema.buffers()):
-                buffer_ema.copy_(
-                    buffer_ema * ema_ratio + buffer.detach() * (1 - ema_ratio)
-                )
 
             if rank == 0:
                 writer.add_scalar("train/loss_all", loss.item(), iters)
@@ -383,10 +358,9 @@ def main(args, cfg):
                 writer.add_scalar("train/loss_w_fp", loss_u_w_fp.item(), iters)
                 writer.add_scalar("train/mask_ratio", mask_ratio, iters)
 
-            if (i % (len(trainloader_u) // 8) == 0) and (rank == 0):
+            if (i % max(1, len(trainloader_u) // 8) == 0) and (rank == 0):
                 logger.info(
-                    "Iters: {:}, LR: {:.7f}, Total loss: {:.3f}, Loss x: {:.3f}, Loss s: {:.3f}, "
-                    "Loss w_fp: {:.3f}, Mask ratio: {:.3f}".format(
+                    "Iters: {:}, LR: {:.7f}, Total loss: {:.3f}, Loss x: {:.3f}, Loss s: {:.3f}, Loss w_fp: {:.3f}, Mask ratio: {:.3f}".format(
                         i,
                         optimizer.param_groups[0]["lr"],
                         total_loss.avg,
@@ -405,56 +379,38 @@ def main(args, cfg):
         eval_mode = val_cfg["eval_mode"]
 
         mIoU, iou_class = validation_cpu(val_cfg, model, valloader)
-        mIoU_ema, iou_class_ema = validation_cpu(val_cfg, model_ema, valloader)
 
         if rank == 0:
             for cls_idx, iou in enumerate(iou_class):
                 logger.info(
-                    "***** Evaluation ***** >>>> Class [{:} {:}] IoU: {:.2f}, "
-                    "EMA: {:.2f}".format(
-                        cls_idx,
-                        CLASSES[cfg["dataset"]][cls_idx],
-                        iou,
-                        iou_class_ema[cls_idx],
+                    "***** Evaluation ***** >>>> Class [{:} {:}] IoU: {:.2f}".format(
+                        cls_idx, CLASSES[cfg["dataset"]][cls_idx], iou
                     )
                 )
             logger.info(
-                "***** Evaluation {} ***** >>>> MeanIoU: {:.2f}, EMA: {:.2f}\n".format(
-                    eval_mode, mIoU, mIoU_ema
+                "***** Evaluation {} ***** >>>> MeanIoU: {:.2f}\n".format(
+                    eval_mode, mIoU
                 )
             )
 
             writer.add_scalar("eval/mIoU", mIoU, epoch)
-            writer.add_scalar("eval/mIoU_ema", mIoU_ema, epoch)
             for i, iou in enumerate(iou_class):
                 writer.add_scalar(
                     "eval/%s_IoU" % (CLASSES[cfg["dataset"]][i]), iou, epoch
                 )
-                writer.add_scalar(
-                    "eval/%s_IoU_ema" % (CLASSES[cfg["dataset"]][i]),
-                    iou_class_ema[i],
-                    epoch,
-                )
 
         is_best = mIoU >= previous_best
-
         previous_best = max(mIoU, previous_best)
-        previous_best_ema = max(mIoU_ema, previous_best_ema)
         if mIoU == previous_best:
             best_epoch = epoch
-        if mIoU_ema == previous_best_ema:
-            best_epoch_ema = epoch
 
         if rank == 0:
             checkpoint = {
                 "model": model.state_dict(),
-                "model_ema": model_ema.state_dict(),
                 "optimizer": optimizer.state_dict(),
                 "epoch": epoch,
                 "previous_best": previous_best,
-                "previous_best_ema": previous_best_ema,
                 "best_epoch": best_epoch,
-                "best_epoch_ema": best_epoch_ema,
             }
             save_checkpoint_to_disk(
                 checkpoint,

@@ -14,7 +14,6 @@ from torch.utils.tensorboard import SummaryWriter
 from dataset.semi_rs import SemiDataset as RemoteSemiDataset
 from dataset.val import ValDataset
 from model.semseg.dpt import DPT
-from model.semseg.dpt_unimatch import DPT_UniMatch
 from model.semseg.dpt_segmind import DPT_SegMind
 from model.semseg.upernet import UperNet
 from util.dist_helper import setup_distributed
@@ -241,8 +240,6 @@ def build_model(cfg, method="fixmatch"):
 
     if cfg["model"] == "upernet":
         model = UperNet(**kwargs, backbone_version=backbone_version)
-    elif method == "unimatch":
-        model = DPT_UniMatch(**kwargs, backbone_version=backbone_version)
     elif method == "segmind":
         segmind_cfg = cfg.get("segmind", {})
         model = DPT_SegMind(

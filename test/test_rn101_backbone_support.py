@@ -26,7 +26,6 @@ sys.modules.setdefault("torch.utils.tensorboard", stub_tb)
 
 from model.semseg import dpt as dpt_mod
 from model.semseg import dpt_scalematch as dpt_scalematch_mod
-from model.semseg import dpt_unimatch as dpt_unimatch_mod
 from model.semseg import dpt_segmind as dpt_segmind_mod
 from model.semseg import upernet as upernet_mod
 from model.semseg import upernet_scalematch as upernet_scalematch_mod
@@ -61,7 +60,6 @@ class FakeResNet101Backbone(torch.nn.Module):
 def patch_fake_resnet(monkeypatch):
     monkeypatch.setattr(dpt_mod, "ResNet101Backbone", FakeResNet101Backbone)
     monkeypatch.setattr(dpt_scalematch_mod, "ResNet101Backbone", FakeResNet101Backbone)
-    monkeypatch.setattr(dpt_unimatch_mod, "ResNet101Backbone", FakeResNet101Backbone)
     monkeypatch.setattr(dpt_segmind_mod, "ResNet101Backbone", FakeResNet101Backbone)
     monkeypatch.setattr(upernet_mod, "ResNet101Backbone", FakeResNet101Backbone)
     monkeypatch.setattr(upernet_scalematch_mod, "ResNet101Backbone", FakeResNet101Backbone)
@@ -149,8 +147,8 @@ def test_upernet_supports_resnet101_need_fp():
     assert y_fp.shape == (2, 4, 128, 128)
 
 
-def test_dpt_unimatch_supports_resnet101_need_fp():
-    model = dpt_unimatch_mod.DPT_UniMatch(
+def test_dpt_supports_resnet101_need_fp():
+    model = dpt_mod.DPT(
         encoder_size="resnet101",
         nclass=3,
         features=64,

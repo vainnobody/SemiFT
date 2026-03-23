@@ -191,6 +191,7 @@ class DPT(nn.Module):
         )
 
         self.binomial = torch.distributions.binomial.Binomial(probs=0.5)
+        self.fp_dropout = nn.Dropout2d(0.5)
 
     def lock_backbone(self):
         for p in self.backbone.parameters():
@@ -228,9 +229,35 @@ class DPT(nn.Module):
             perturbed_features.append(perturbed_feature)
         return tuple(perturbed_features)
 
-    def forward(self, x, comp_drop=False, feature_perturb=None):
+    def _apply_unimatch_feature_dropout(self, features, patch_h, patch_w):
+        features_fp = []
+        for feature in features:
+            if feature.dim() == 4:
+                feat_map = feature
+            else:
+                batch_size, num_tokens, dim = feature.shape
+                feat_map = feature.permute(0, 2, 1).reshape(
+                    batch_size, dim, patch_h, patch_w
+                )
+
+            feat_map_fp = self.fp_dropout(feat_map)
+
+            if feature.dim() == 4:
+                feature_fp = feat_map_fp
+            else:
+                feature_fp = feat_map_fp.reshape(batch_size, dim, num_tokens).permute(
+                    0, 2, 1
+                )
+            features_fp.append(feature_fp)
+
+        return tuple(features_fp)
+
+    def forward(self, x, comp_drop=False, feature_perturb=None, need_fp=False):
         batch_size = x.shape[0]
         features, patch_h, patch_w = self._extract_features(x)
+
+        if need_fp and comp_drop:
+            raise ValueError("DPT does not support need_fp=True together with comp_drop=True.")
 
         if comp_drop:
             if features[0].dim() == 4:
@@ -270,6 +297,24 @@ class DPT(nn.Module):
             features = self._apply_feature_perturbation(
                 features, patch_h, patch_w, batch_size, feature_perturb
             )
+
+        if need_fp:
+            features_fp = self._apply_unimatch_feature_dropout(
+                features, patch_h, patch_w
+            )
+            features = tuple(
+                torch.cat((feature, feature_fp), dim=0)
+                for feature, feature_fp in zip(features, features_fp)
+            )
+            out = self.head(features, patch_h, patch_w)
+            out = F.interpolate(
+                out,
+                x.shape[-2:],
+                mode="bilinear",
+                align_corners=True,
+            )
+            out, out_fp = out.chunk(2, dim=0)
+            return out, out_fp
 
         out = self.head(features, patch_h, patch_w)
         out = F.interpolate(out, x.shape[-2:], mode="bilinear", align_corners=True)
