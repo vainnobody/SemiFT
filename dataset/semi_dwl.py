@@ -5,11 +5,13 @@ import random
 
 import numpy as np
 from PIL import Image
-import torch
 from torch.utils.data import Dataset
 from torchvision import transforms
 
 from dataset.transform import blur, crop, hflip, normalize, resize
+
+
+TRAIN_LEN_MULTIPLIER = 50
 
 
 def vflip(image, label, p=0.5):
@@ -27,7 +29,7 @@ def rotate(image, label):
 
 
 class SemiDataset(Dataset):
-    """DWL-specific dataset path aligned with official RS-DWL semantics."""
+    """DWL-specific dataset with SemiFT-style epoch length semantics."""
 
     def __init__(
         self, name, root, mode, size=None, id_path=None, nsample=None, ignore_index=255
@@ -49,10 +51,14 @@ class SemiDataset(Dataset):
                 self.ids = f.read().splitlines()
 
     def __len__(self):
+        if self.mode in {"train_l", "train_u"}:
+            return len(self.ids) * TRAIN_LEN_MULTIPLIER
         return len(self.ids)
 
     def __getitem__(self, item):
-        sample_id = self.ids[item]
+        sample_id = (
+            random.choice(self.ids) if self.mode in {"train_l", "train_u"} else self.ids[item]
+        )
         img = Image.open(os.path.join(self.root, sample_id.split(" ")[0])).convert("RGB")
         mask = Image.fromarray(
             np.array(Image.open(os.path.join(self.root, sample_id.split(" ")[1])))
