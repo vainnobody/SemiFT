@@ -73,10 +73,7 @@ def test_direct_entrypoints_use_cpu_resume_and_cpu_safe_save_helpers():
     for name in DIRECT_ENTRYPOINTS:
         text = (REPO_ROOT / name).read_text()
         assert 'load_checkpoint_on_cpu' in text, f'{name} should resume checkpoints on CPU.'
-        if name == 'corrmatch.py':
-            assert 'checkpoint_to_cpu(model.module.state_dict())' in text
-        else:
-            assert 'save_checkpoint_to_disk' in text, f'{name} should save checkpoints after moving tensors to CPU.'
+        assert 'save_checkpoint_to_disk' in text, f'{name} should save checkpoints after moving tensors to CPU.'
         assert 'model.cuda(local_rank)' in text, f'{name} should bind model initialization to local_rank.'
 
 

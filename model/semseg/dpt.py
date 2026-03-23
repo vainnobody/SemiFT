@@ -13,6 +13,7 @@ from model.semseg.scalematch_core import (
     scale_as,
 )
 from model.semseg.feature_perturb import apply_structured_feature_perturbation
+from model.semseg.corrmatch_utils import Corr
 from model.util.blocks import FeatureFusionBlock, _make_scratch
 
 
@@ -149,6 +150,7 @@ class DPT(nn.Module):
         use_bn=False,
         backbone_version="dinov2",  # 'dinov2' or 'dinov3'
         enable_scalematch=False,
+        enable_corrmatch=False,
     ):
         super(DPT, self).__init__()
 
@@ -189,6 +191,7 @@ class DPT(nn.Module):
             )
         self.feature_kind = getattr(self.backbone, "feature_kind", "token")
         self.enable_scalematch = enable_scalematch
+        self.enable_corrmatch = enable_corrmatch
         self.scalematch_features = features
 
         self.head = DPTHead(
@@ -202,6 +205,14 @@ class DPT(nn.Module):
 
         self.binomial = torch.distributions.binomial.Binomial(probs=0.5)
         self.fp_dropout = nn.Dropout2d(0.5)
+        if self.enable_corrmatch:
+            self.corr_proj = nn.Sequential(
+                nn.Conv2d(features, 256, kernel_size=3, stride=1, padding=1, bias=True),
+                nn.BatchNorm2d(256),
+                nn.ReLU(inplace=True),
+                nn.Dropout2d(0.1),
+            )
+            self.corr = Corr(nclass=nclass)
         if self.enable_scalematch:
             scale_in_ch = 2 * features
             rwkv_channels = max(scale_in_ch // 16, 1)
@@ -411,20 +422,64 @@ class DPT(nn.Module):
             "pred_size": p_lo_ori,
         }
 
+    def _corrmatch_forward(
+        self,
+        x,
+        features,
+        patch_h,
+        patch_w,
+        need_fp=False,
+    ):
+        logits, corr_feats = self.head(features, patch_h, patch_w, return_feats=True)
+        logits = F.interpolate(
+            logits,
+            x.shape[-2:],
+            mode="bilinear",
+            align_corners=True,
+        )
+
+        outputs = {"out": logits}
+
+        if need_fp:
+            features_fp = self._apply_unimatch_feature_dropout(
+                features, patch_h, patch_w
+            )
+            logits_fp = self.head(features_fp, patch_h, patch_w)
+            logits_fp = F.interpolate(
+                logits_fp,
+                x.shape[-2:],
+                mode="bilinear",
+                align_corners=True,
+            )
+            outputs["out_fp"] = logits_fp
+
+        corr_inputs = self.corr_proj(corr_feats)
+        corr_dict = self.corr(corr_inputs, logits)
+        outputs["corr_map"] = corr_dict["corr_map"]
+        outputs["corr_out"] = F.interpolate(
+            corr_dict["out"],
+            size=x.shape[-2:],
+            mode="bilinear",
+            align_corners=True,
+        )
+
+        return outputs
+
     def forward(
         self,
         x,
         comp_drop=False,
         feature_perturb=None,
         need_fp=False,
+        use_corr=False,
         scale_factor=None,
         feature_scale=1.0,
     ):
         if scale_factor is not None:
             if not self.enable_scalematch:
                 raise ValueError("ScaleMatch forward requested but enable_scalematch=False.")
-            if need_fp or feature_perturb is not None or comp_drop:
-                raise ValueError("ScaleMatch forward does not support comp_drop/need_fp/feature_perturb.")
+            if need_fp or feature_perturb is not None or comp_drop or use_corr:
+                raise ValueError("ScaleMatch forward does not support comp_drop/need_fp/feature_perturb/use_corr.")
             return self._scalematch_two_scale_forward(x, scale_factor, feature_scale)
 
         batch_size = x.shape[0]
@@ -432,6 +487,8 @@ class DPT(nn.Module):
 
         if need_fp and comp_drop:
             raise ValueError("DPT does not support need_fp=True together with comp_drop=True.")
+        if use_corr and not self.enable_corrmatch:
+            raise ValueError("CorrMatch forward requested but enable_corrmatch=False.")
 
         if comp_drop:
             if features[0].dim() == 4:
@@ -470,6 +527,15 @@ class DPT(nn.Module):
         if feature_perturb is not None:
             features = self._apply_feature_perturbation(
                 features, patch_h, patch_w, batch_size, feature_perturb
+            )
+
+        if use_corr:
+            return self._corrmatch_forward(
+                x,
+                features,
+                patch_h,
+                patch_w,
+                need_fp=need_fp,
             )
 
         if need_fp:
