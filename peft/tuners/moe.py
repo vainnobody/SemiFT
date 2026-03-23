@@ -737,6 +737,115 @@ class ScaleSpecificExpertV2(nn.Module):
         return out
 
 
+class SharedDetailExpertV3(nn.Module):
+    def __init__(self, r, scale=1, kernel_size=3, norm_type="layernorm"):
+        super().__init__()
+        self.r = r
+        self.scale = 1
+        self.dwconv = nn.Conv2d(
+            r,
+            r,
+            kernel_size=kernel_size,
+            stride=1,
+            padding=kernel_size // 2,
+            groups=r,
+            bias=True,
+        )
+        if norm_type == "layernorm":
+            self.norm = LayerNorm2d(r)
+        elif norm_type == "groupnorm":
+            self.norm = nn.GroupNorm(1, r)
+        elif norm_type == "batchnorm":
+            self.norm = nn.BatchNorm2d(r)
+        elif norm_type in {"identity", "none"}:
+            self.norm = nn.Identity()
+        else:
+            raise ValueError(f"Unsupported norm_type for SharedDetailExpertV3: {norm_type}")
+        self.act = nn.SiLU()
+        self.reset_parameters()
+
+    def reset_parameters(self):
+        nn.init.kaiming_uniform_(self.dwconv.weight, a=math.sqrt(5))
+        nn.init.zeros_(self.dwconv.bias)
+
+    def forward(self, x_2d):
+        out = self.dwconv(x_2d)
+        out = self.norm(out)
+        out = self.act(out)
+        return out
+
+
+class ScaleContextExpertV3(nn.Module):
+    def __init__(self, r, scale=1, kernel_size=3, norm_type="layernorm"):
+        super().__init__()
+        self.r = r
+        self.scale = max(int(scale), 1)
+        self.dwconv = nn.Conv2d(
+            r,
+            r,
+            kernel_size=kernel_size,
+            stride=1,
+            padding=kernel_size // 2,
+            groups=r,
+            bias=True,
+        )
+        if norm_type == "layernorm":
+            self.norm = LayerNorm2d(r)
+        elif norm_type == "groupnorm":
+            self.norm = nn.GroupNorm(1, r)
+        elif norm_type == "batchnorm":
+            self.norm = nn.BatchNorm2d(r)
+        elif norm_type in {"identity", "none"}:
+            self.norm = nn.Identity()
+        else:
+            raise ValueError(f"Unsupported norm_type for ScaleContextExpertV3: {norm_type}")
+        self.act = nn.SiLU()
+        self.reset_parameters()
+
+    def reset_parameters(self):
+        nn.init.kaiming_uniform_(self.dwconv.weight, a=math.sqrt(5))
+        nn.init.zeros_(self.dwconv.bias)
+
+    def _load_from_state_dict(
+        self,
+        state_dict,
+        prefix,
+        local_metadata,
+        strict,
+        missing_keys,
+        unexpected_keys,
+        error_msgs,
+    ):
+        legacy_weight_key = prefix + "context_dwconv.weight"
+        legacy_bias_key = prefix + "context_dwconv.bias"
+        if legacy_weight_key in state_dict:
+            state_dict.setdefault(prefix + "dwconv.weight", state_dict[legacy_weight_key])
+            if legacy_bias_key in state_dict:
+                state_dict.setdefault(prefix + "dwconv.bias", state_dict[legacy_bias_key])
+        super()._load_from_state_dict(
+            state_dict,
+            prefix,
+            local_metadata,
+            strict,
+            missing_keys,
+            unexpected_keys,
+            error_msgs,
+        )
+
+    def forward(self, x_2d):
+        if self.scale > 1:
+            h, w = x_2d.shape[-2:]
+            pooled = F.adaptive_avg_pool2d(x_2d, output_size=(max(1, h // self.scale), max(1, w // self.scale)))
+            out = self.dwconv(pooled)
+            out = self.norm(out)
+            out = self.act(out)
+            return F.interpolate(out, size=(h, w), mode="bilinear", align_corners=False)
+        out = self.dwconv(x_2d)
+        out = self.norm(out)
+        out = self.act(out)
+        return out
+
+
 class SemiFtSAMoE(nn.Module):
     def __init__(
         self,
@@ -929,6 +1038,115 @@ class SemiFtSAMoEV4(SemiFtSAMoE):
         if not contributions:
             return x_2d.new_zeros(x_2d.shape)
         return torch.stack(contributions, dim=0).sum(dim=0)
+
+
+class SemiFtSAMoEV5(SemiFtSAMoE):
+    def __init__(
+        self,
+        in_features,
+        out_features,
+        r,
+        num_experts=4,
+        topk=2,
+        num_prefix_tokens=-1,
+        router_jitter_noise=0.01,
+        router_balance_mode="deepseek_v3",
+        router_bias_update_speed=1e-3,
+        router_bias_clip=0.05,
+        use_shared_expert=True,
+        scales=None,
+        conv_kernel_size=3,
+        conv_norm_type="layernorm",
+        layerscale_init=1e-5,
+        drop_path_rate=0.0,
+        branch_gate_init_bias=-2.0,
+    ):
+        self.branch_gate_init_bias = float(branch_gate_init_bias)
+        self.context_gate = None
+        self.context_gate_values = None
+        super().__init__(
+            in_features=in_features,
+            out_features=out_features,
+            r=r,
+            num_experts=num_experts,
+            topk=topk,
+            num_prefix_tokens=num_prefix_tokens,
+            router_jitter_noise=router_jitter_noise,
+            router_balance_mode=router_balance_mode,
+            router_bias_update_speed=router_bias_update_speed,
+            router_bias_clip=router_bias_clip,
+            use_shared_expert=use_shared_expert,
+            scales=scales,
+            conv_kernel_size=conv_kernel_size,
+            conv_norm_type=conv_norm_type,
+            layerscale_init=layerscale_init,
+            drop_path_rate=drop_path_rate,
+        )
+        if use_shared_expert:
+            self.shared_expert = SharedDetailExpertV3(
+                r=r,
+                scale=1,
+                kernel_size=conv_kernel_size,
+                norm_type=conv_norm_type,
+            )
+        self.context_gate = nn.Linear(r, 1, bias=True)
+        nn.init.zeros_(self.context_gate.weight)
+        nn.init.constant_(self.context_gate.bias, self.branch_gate_init_bias)
+
+    def _expert_cls(self):
+        return ScaleContextExpertV3
+
+    def forward(self, x, hw=None):
+        x = self.input_act(self.proj_down(self.pre_norm(x)))
+
+        prefix = x[:, : self.num_prefix_tokens, :]
+        patch_tokens = x[:, self.num_prefix_tokens :, :]
+        if patch_tokens.numel() == 0:
+            out = self.proj_up(x)
+            zero = x.new_zeros(())
+            self.aux_loss = zero
+            self.router_aux_loss = zero
+            self.router_z_loss = zero
+            self.router_logits = None
+            self.router_probs = None
+            self.selection_scores = None
+            self.expert_bias = self.gating_network.expert_bias.detach().clone()
+            self.expert_load = self.gating_network.expert_load.detach().clone()
+            self.selected_experts = None
+            self.last_hw = None
+            self.context_gate_values = None
+            return out
+
+        bsz, n_tokens, _ = patch_tokens.shape
+        h, w = self._resolve_hw(n_tokens, hw=hw)
+        self.last_hw = (h, w)
+        x_2d = patch_tokens.transpose(1, 2).reshape(bsz, self.r, h, w).contiguous()
+
+        topk_idx, topk_weight, router_stats = self.gating_network(x_2d)
+        self.selected_experts = topk_idx.detach().clone()
+        sparse_out = self._sparse_moe_forward(x_2d, topk_idx, topk_weight)
+        gate_input = x_2d.mean(dim=(-2, -1))
+        context_gate = torch.sigmoid(self.context_gate(gate_input)).to(x_2d.dtype)
+        self.context_gate_values = context_gate.detach().clone()
+        sparse_out = self.drop_path(sparse_out * context_gate.view(-1, 1, 1, 1))
+        shared_out = self.shared_expert(x_2d) if self.shared_expert is not None else x_2d.new_zeros(x_2d.shape)
+
+        combined_2d = x_2d + self.shared_scale(shared_out) + self.moe_scale(sparse_out)
+        combined = combined_2d.flatten(2).transpose(1, 2).contiguous()
+
+        zero = patch_tokens.new_zeros(())
+        self.router_aux_loss = zero
+        self.router_z_loss = zero
+        self.router_logits = router_stats["router_logits"]
+        self.router_probs = router_stats["router_probs"]
+        self.selection_scores = router_stats["selection_scores"]
+        self.expert_bias = router_stats["expert_bias"]
+        self.expert_load = router_stats["expert_load"]
+        self.aux_loss = zero
+
+        prefix_out = self.proj_up(prefix)
+        patch_out = self.output_scale(self.proj_up(combined))
+        return torch.cat([prefix_out, patch_out], dim=1)
 
 
 

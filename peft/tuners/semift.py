@@ -10,7 +10,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from ..utils import PeftConfig, PeftType
-from .moe import SemiFt, SemiFtSAMoE, SemiFtSAMoEV4, SemiFtScaleGate
+from .moe import SemiFt, SemiFtSAMoE, SemiFtSAMoEV4, SemiFtSAMoEV5, SemiFtScaleGate
 
 
 @dataclass
@@ -68,6 +68,7 @@ class SemiFTConfig(PeftConfig):
     moe_conv_gate_temperature: float = field(default=1.0)
     moe_layerscale_init: float = field(default=1e-5)
     moe_expert_drop_path_rate: float = field(default=0.0)
+    moe_branch_gate_init_bias: float = field(default=-2.0)
 
     def __post_init__(self):
         self.peft_type = PeftType.LORA
@@ -77,6 +78,7 @@ METHOD_DEFAULT_TARGETS = {
     "semift": ["mlp"],
     "semift_samoe": ["mlp"],
     "samoev4": ["mlp"],
+    "samoev5": ["mlp"],
     "semift_scalegate": ["mlp"],
     "lora": ["qkv", "proj", "fc1", "fc2"],
     "ssf": ["patch_embed", "norm1", "norm2", "qkv", "proj", "fc1", "fc2"],
@@ -92,7 +94,7 @@ HIGH_LEVEL_TO_SUBMODULES = {
     "attn": ["qkv", "proj"],
     "mlp": ["fc1", "fc2"],
 }
-BLOCK_LEVEL_METHODS = {"semift", "semift_samoe", "samoev4", "semift_scalegate", "adaptformer", "fact_tt", "fact_tk"}
+BLOCK_LEVEL_METHODS = {"semift", "semift_samoe", "samoev4", "samoev5", "semift_scalegate", "adaptformer", "fact_tt", "fact_tk"}
 PARAMETER_ONLY_METHODS = {"bitfit"}
 SSF_METHODS = {"ssf"}
 
@@ -211,6 +213,8 @@ class AdaptModel(nn.Module):
             adapter = SemiFtSAMoE(input_dim, output_dim, **self._semift_kwargs())
         elif self.peft_config.method == "samoev4":
             adapter = SemiFtSAMoEV4(input_dim, output_dim, **self._semift_kwargs())
+        elif self.peft_config.method == "samoev5":
+            adapter = SemiFtSAMoEV5(input_dim, output_dim, **self._semift_kwargs())
         elif self.peft_config.method == "semift_scalegate":
             adapter = SemiFtScaleGate(input_dim, output_dim, **self._semift_kwargs())
         elif self.peft_config.method == "adaptformer":
@@ -310,8 +314,8 @@ class AdaptModel(nn.Module):
         num_prefix_tokens = self.peft_config.moe_num_prefix_tokens
         if num_prefix_tokens is None or int(num_prefix_tokens) <= 0:
             num_prefix_tokens = AdaptModel._infer_num_prefix_tokens_from_model(self)
-        if self.peft_config.method in {"semift_samoe", "samoev4"}:
-            return {
+        if self.peft_config.method in {"semift_samoe", "samoev4", "samoev5"}:
+            kwargs = {
                 "r": self.peft_config.r,
                 "num_experts": self.peft_config.moe_num_experts,
                 "topk": self.peft_config.moe_topk,
@@ -327,6 +331,9 @@ class AdaptModel(nn.Module):
                 "layerscale_init": self.peft_config.moe_layerscale_init,
                 "drop_path_rate": self.peft_config.moe_expert_drop_path_rate,
             }
+            if self.peft_config.method == "samoev5":
+                kwargs["branch_gate_init_bias"] = self.peft_config.moe_branch_gate_init_bias
+            return kwargs
         kwargs = {
             "r": self.peft_config.r,
             "num_experts": self.peft_config.moe_num_experts,

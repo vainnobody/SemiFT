@@ -57,12 +57,14 @@ DEFAULT_PEFT_CFG: Dict[str, Any] = {
     "moe_conv_gate_temperature": 1.0,
     "moe_layerscale_init": 1e-5,
     "moe_expert_drop_path_rate": 0.0,
+    "moe_branch_gate_init_bias": -2.0,
 }
 
 METHOD_DEFAULT_TARGETS: Dict[str, List[str]] = {
     "semift": ["mlp"],
     "semift_samoe": ["mlp"],
     "samoev4": ["mlp"],
+    "samoev5": ["mlp"],
     "semift_scalegate": ["mlp"],
     "lora": ["qkv", "proj", "fc1", "fc2"],
     "ssf": ["patch_embed", "norm1", "norm2", "qkv", "proj", "fc1", "fc2"],
@@ -265,6 +267,9 @@ def build_peft_config(peft_cfg: Dict[str, Any], cfg: Dict[str, Any]):
         ),
         moe_expert_drop_path_rate=peft_cfg.get(
             "moe_expert_drop_path_rate", DEFAULT_PEFT_CFG["moe_expert_drop_path_rate"]
+        ),
+        moe_branch_gate_init_bias=peft_cfg.get(
+            "moe_branch_gate_init_bias", DEFAULT_PEFT_CFG["moe_branch_gate_init_bias"]
         ),
     )
 

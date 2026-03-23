@@ -217,6 +217,7 @@ def test_semift_config_exposes_moe_fields():
     assert "moe_conv_gate_temperature" in semift_text
     assert "moe_layerscale_init" in semift_text
     assert "moe_expert_drop_path_rate" in semift_text
+    assert "moe_branch_gate_init_bias" in semift_text
 
 
 def test_scale_gated_conv_expert_forward_with_explicit_hw():
@@ -449,3 +450,39 @@ def test_semift_samoe_v4_sparse_dispatch_uses_stack_sum():
     topk_weight = torch.tensor([[1.0], [1.0]])
     y = module._sparse_moe_forward(x_2d, topk_idx, topk_weight)
     assert y.shape == x_2d.shape
+
+
+def test_semift_samoe_v5_forward_shape_and_gate_values():
+    module = moe.SemiFtSAMoEV5(
+        in_features=16,
+        out_features=16,
+        r=8,
+        num_experts=4,
+        topk=2,
+        num_prefix_tokens=5,
+        scales=[1, 2, 4, 8],
+        branch_gate_init_bias=-2.0,
+    )
+    module.train()
+    x = torch.randn(2, 14, 16, requires_grad=True)
+    y = module(x)
+
+    assert y.shape == x.shape
+    assert isinstance(module.experts[0], moe.ScaleContextExpertV3)
+    assert isinstance(module.shared_expert, moe.SharedDetailExpertV3)
+    assert module.context_gate_values.shape == (2, 1)
+    assert torch.all(module.context_gate_values > 0.0)
+    assert torch.all(module.context_gate_values < 0.5)
+
+    loss = y.sum()
+    loss.backward()
+    assert module.context_gate.weight.grad is not None
+    assert module.proj_down.weight.grad is not None
+    assert module.proj_up.weight.grad is not None
+
+
+def test_scale_context_expert_v3_loads_v4_context_weights():
+    legacy = moe.ScaleSpecificExpertV2(r=4, scale=2, kernel_size=3, norm_type="identity")
+    upgraded = moe.ScaleContextExpertV3(r=4, scale=2, kernel_size=3, norm_type="identity")
+    upgraded.load_state_dict(legacy.state_dict(), strict=False)
+    assert torch.allclose(upgraded.dwconv.weight, legacy.context_dwconv.weight)
