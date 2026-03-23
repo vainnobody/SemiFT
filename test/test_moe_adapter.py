@@ -395,3 +395,57 @@ def test_semift_samoe_layernorm2d_is_constructed():
     )
     assert isinstance(module.experts[0].norm, moe.LayerNorm2d)
     assert isinstance(module.shared_expert.norm, moe.LayerNorm2d)
+
+
+def test_scale_specific_expert_v2_preserves_shape():
+    expert = moe.ScaleSpecificExpertV2(r=8, scale=2, kernel_size=3, norm_type="layernorm")
+    x = torch.randn(2, 8, 3, 5)
+    y = expert(x)
+    assert y.shape == x.shape
+
+
+def test_scale_specific_expert_v2_loads_legacy_v1_state_dict():
+    legacy = moe.ScaleSpecificExpertV1(r=4, scale=2, kernel_size=3, norm_type="identity")
+    upgraded = moe.ScaleSpecificExpertV2(r=4, scale=2, kernel_size=3, norm_type="identity")
+    upgraded.load_state_dict(legacy.state_dict(), strict=True)
+    assert torch.allclose(upgraded.context_dwconv.weight, legacy.dwconv.weight)
+    assert torch.allclose(upgraded.context_dwconv.bias, legacy.dwconv.bias)
+
+
+def test_semift_samoe_v4_forward_shape_and_gradients():
+    module = moe.SemiFtSAMoEV4(
+        in_features=16,
+        out_features=16,
+        r=8,
+        num_experts=4,
+        topk=2,
+        num_prefix_tokens=5,
+        scales=[1, 2, 4, 8],
+    )
+    module.train()
+    x = torch.randn(2, 14, 16, requires_grad=True)
+    y = module(x)
+
+    assert y.shape == x.shape
+    assert isinstance(module.experts[0], moe.ScaleSpecificExpertV2)
+    loss = y.sum()
+    loss.backward()
+    assert module.proj_down.weight.grad is not None
+    assert module.proj_up.weight.grad is not None
+
+
+def test_semift_samoe_v4_sparse_dispatch_uses_stack_sum():
+    module = moe.SemiFtSAMoEV4(
+        in_features=16,
+        out_features=16,
+        r=8,
+        num_experts=2,
+        topk=1,
+        num_prefix_tokens=5,
+        scales=[1, 2],
+    )
+    x_2d = torch.randn(2, 8, 3, 3)
+    topk_idx = torch.tensor([[0], [1]])
+    topk_weight = torch.tensor([[1.0], [1.0]])
+    y = module._sparse_moe_forward(x_2d, topk_idx, topk_weight)
+    assert y.shape == x_2d.shape

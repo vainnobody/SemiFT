@@ -40,8 +40,14 @@ def load_semift_module():
             self.args = args
             self.kwargs = kwargs
 
+    class SemiFtSAMoEV4(types.SimpleNamespace):
+        def __init__(self, *args, **kwargs):
+            self.args = args
+            self.kwargs = kwargs
+
     moe_mod.SemiFt = SemiFt
     moe_mod.SemiFtSAMoE = SemiFtSAMoE
+    moe_mod.SemiFtSAMoEV4 = SemiFtSAMoEV4
     moe_mod.SemiFtScaleGate = SemiFtScaleGate
 
     sys.modules["peft.utils"] = utils_mod
@@ -124,3 +130,35 @@ def test_semift_kwargs_uses_layerscale_for_samoe():
     assert "conv_context_kernel_size" not in kwargs
     assert "conv_use_grn" not in kwargs
     assert "conv_gate_temperature" not in kwargs
+
+
+def test_semift_kwargs_uses_same_subset_for_samoev4():
+    module = load_semift_module()
+    fake_self = types.SimpleNamespace(
+        peft_config=types.SimpleNamespace(
+            method="samoev4",
+            r=32,
+            moe_num_experts=4,
+            moe_topk=2,
+            moe_router_balance_mode="deepseek_v3",
+            moe_router_bias_update_speed=1e-3,
+            moe_router_bias_clip=0.05,
+            moe_router_jitter_noise=1e-2,
+            moe_num_prefix_tokens=5,
+            moe_use_shared_expert=True,
+            moe_conv_hidden_ratio=2.0,
+            moe_conv_kernel_size=3,
+            moe_conv_context_kernel_size=5,
+            moe_conv_use_grn=True,
+            moe_conv_norm_type="groupnorm",
+            moe_expert_scales=[1, 2, 4, 8],
+            moe_conv_gate_temperature=1.0,
+            moe_layerscale_init=1e-5,
+            moe_expert_drop_path_rate=0.1,
+        )
+    )
+    kwargs = module.AdaptModel._semift_kwargs(fake_self)
+    assert kwargs["layerscale_init"] == 1e-5
+    assert kwargs["drop_path_rate"] == 0.1
+    assert "conv_hidden_ratio" not in kwargs
+    assert "conv_context_kernel_size" not in kwargs

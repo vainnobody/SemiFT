@@ -81,8 +81,12 @@ def load_semift_module():
     class SemiFtSAMoE(SemiFt):
         pass
 
+    class SemiFtSAMoEV4(SemiFt):
+        pass
+
     moe_mod.SemiFt = SemiFt
     moe_mod.SemiFtSAMoE = SemiFtSAMoE
+    moe_mod.SemiFtSAMoEV4 = SemiFtSAMoEV4
     moe_mod.SemiFtScaleGate = SemiFtScaleGate
 
     sys.modules["peft.utils"] = utils_mod
@@ -371,6 +375,15 @@ def test_adaptmodel_wraps_semift_samoe_block():
     assert isinstance(adapted.model.block.mlp.adapter, semift.SemiFtSAMoE)
 
 
+def test_adaptmodel_wraps_samoev4_block():
+    semift = load_semift_module()
+    model = build_dummy_block(semift.torch)
+    cfg = semift.SemiFTConfig(method="samoev4", target_modules=["mlp"], r=4, moe_num_prefix_tokens=-1)
+    adapted = semift.AdaptModel(cfg, model)
+    assert isinstance(adapted.model.block.mlp, semift.WarpBlock)
+    assert isinstance(adapted.model.block.mlp.adapter, semift.SemiFtSAMoEV4)
+
+
 def test_build_peft_config_passes_scalegate_fields_to_current_config():
     cfg = {
         "nclass": 6,
@@ -404,6 +417,26 @@ def test_build_peft_config_supports_semift_samoe():
     config = build_peft_config(peft_cfg, cfg)
 
     assert config.method == "semift_samoe"
+    assert config.moe_expert_scales == [1, 2, 4, 8]
+    assert abs(config.moe_layerscale_init - 1e-5) < 1e-8
+    assert config.moe_num_prefix_tokens == -1
+
+
+def test_build_peft_config_supports_samoev4():
+    cfg = {
+        "nclass": 6,
+        "peft": {
+            "method": "samoev4",
+            "target_modules": ["mlp"],
+            "moe_expert_scales": [1, 2, 4, 8],
+            "moe_layerscale_init": 1e-5,
+            "moe_num_prefix_tokens": -1,
+        },
+    }
+    peft_cfg = resolve_peft_cfg(cfg, make_args())
+    config = build_peft_config(peft_cfg, cfg)
+
+    assert config.method == "samoev4"
     assert config.moe_expert_scales == [1, 2, 4, 8]
     assert abs(config.moe_layerscale_init - 1e-5) < 1e-8
     assert config.moe_num_prefix_tokens == -1

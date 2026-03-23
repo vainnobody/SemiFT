@@ -643,6 +643,100 @@ class ScaleSpecificExpertV1(nn.Module):
         return out
 
 
+class ScaleSpecificExpertV2(nn.Module):
+    def __init__(self, r, scale=1, kernel_size=3, norm_type="layernorm"):
+        super().__init__()
+        self.r = r
+        self.scale = max(int(scale), 1)
+        self.detail_dwconv = nn.Conv2d(
+            r,
+            r,
+            kernel_size=kernel_size,
+            stride=1,
+            padding=kernel_size // 2,
+            groups=r,
+            bias=True,
+        )
+        self.context_dwconv = nn.Conv2d(
+            r,
+            r,
+            kernel_size=kernel_size,
+            stride=1,
+            padding=kernel_size // 2,
+            groups=r,
+            bias=True,
+        )
+        if norm_type == "layernorm":
+            self.norm = LayerNorm2d(r)
+        elif norm_type == "groupnorm":
+            self.norm = nn.GroupNorm(1, r)
+        elif norm_type == "batchnorm":
+            self.norm = nn.BatchNorm2d(r)
+        elif norm_type in {"identity", "none"}:
+            self.norm = nn.Identity()
+        else:
+            raise ValueError(f"Unsupported norm_type for ScaleSpecificExpertV2: {norm_type}")
+        self.act = nn.SiLU()
+        self.reset_parameters()
+
+    def reset_parameters(self):
+        nn.init.kaiming_uniform_(self.detail_dwconv.weight, a=math.sqrt(5))
+        nn.init.zeros_(self.detail_dwconv.bias)
+        nn.init.kaiming_uniform_(self.context_dwconv.weight, a=math.sqrt(5))
+        nn.init.zeros_(self.context_dwconv.bias)
+
+    def _load_from_state_dict(
+        self,
+        state_dict,
+        prefix,
+        local_metadata,
+        strict,
+        missing_keys,
+        unexpected_keys,
+        error_msgs,
+    ):
+        legacy_weight_key = prefix + "dwconv.weight"
+        legacy_bias_key = prefix + "dwconv.bias"
+        if legacy_weight_key in state_dict:
+            state_dict.setdefault(prefix + "context_dwconv.weight", state_dict[legacy_weight_key])
+            state_dict.setdefault(prefix + "detail_dwconv.weight", self.detail_dwconv.weight.detach().clone())
+            if legacy_bias_key in state_dict:
+                state_dict.setdefault(prefix + "context_dwconv.bias", state_dict[legacy_bias_key])
+                state_dict.setdefault(prefix + "detail_dwconv.bias", self.detail_dwconv.bias.detach().clone())
+            state_dict.pop(legacy_weight_key, None)
+            state_dict.pop(legacy_bias_key, None)
+        super()._load_from_state_dict(
+            state_dict,
+            prefix,
+            local_metadata,
+            strict,
+            missing_keys,
+            unexpected_keys,
+            error_msgs,
+        )
+
+    def forward(self, x_2d):
+        if self.scale <= 1:
+            out = self.detail_dwconv(x_2d)
+            out = self.norm(out)
+            out = self.act(out)
+            return out
+
+        h, w = x_2d.shape[-2:]
+        detail = F.interpolate(x_2d, scale_factor=float(self.scale), mode="bilinear", align_corners=False)
+        detail = self.detail_dwconv(detail)
+        detail = F.interpolate(detail, size=(h, w), mode="bilinear", align_corners=False)
+
+        pooled = F.adaptive_avg_pool2d(x_2d, output_size=(max(1, h // self.scale), max(1, w // self.scale)))
+        context = self.context_dwconv(pooled)
+        context = F.interpolate(context, size=(h, w), mode="bilinear", align_corners=False)
+
+        out = detail + context
+        out = self.norm(out)
+        out = self.act(out)
+        return out
+
+
 class SemiFtSAMoE(nn.Module):
     def __init__(
         self,
@@ -682,14 +776,15 @@ class SemiFtSAMoE(nn.Module):
         self.pre_norm = nn.LayerNorm(in_features)
         self.proj_down = nn.Linear(in_features, r, bias=False)
         self.input_act = nn.GELU()
+        expert_cls = self._expert_cls()
         self.shared_expert = (
-            ScaleSpecificExpertV1(r=r, scale=1, kernel_size=conv_kernel_size, norm_type=conv_norm_type)
+            expert_cls(r=r, scale=1, kernel_size=conv_kernel_size, norm_type=conv_norm_type)
             if use_shared_expert
             else None
         )
         self.experts = nn.ModuleList(
             [
-                ScaleSpecificExpertV1(
+                expert_cls(
                     r=r,
                     scale=scale,
                     kernel_size=conv_kernel_size,
@@ -724,6 +819,9 @@ class SemiFtSAMoE(nn.Module):
         self.selected_experts = None
         self.last_hw = None
         self.reset_parameters()
+
+    def _expert_cls(self):
+        return ScaleSpecificExpertV1
 
     def reset_parameters(self):
         nn.init.kaiming_uniform_(self.proj_down.weight, a=math.sqrt(5))
@@ -810,6 +908,27 @@ class SemiFtSAMoE(nn.Module):
         prefix_out = self.proj_up(prefix)
         patch_out = self.output_scale(self.proj_up(combined))
         return torch.cat([prefix_out, patch_out], dim=1)
+
+
+class SemiFtSAMoEV4(SemiFtSAMoE):
+    def _expert_cls(self):
+        return ScaleSpecificExpertV2
+
+    def _sparse_moe_forward(self, x_2d, topk_idx, topk_weight):
+        contributions = []
+        for expert_idx, expert in enumerate(self.experts):
+            selected = (topk_idx == expert_idx)
+            sample_mask = selected.any(dim=-1)
+            if not sample_mask.any():
+                continue
+            sample_weight = (topk_weight * selected.to(topk_weight.dtype)).sum(dim=-1)
+            expert_out = expert(x_2d[sample_mask])
+            contribution = x_2d.new_zeros(x_2d.shape)
+            contribution[sample_mask] = expert_out * sample_weight[sample_mask].view(-1, 1, 1, 1)
+            contributions.append(contribution)
+        if not contributions:
+            return x_2d.new_zeros(x_2d.shape)
+        return torch.stack(contributions, dim=0).sum(dim=0)
 
 
 

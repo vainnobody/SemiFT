@@ -160,6 +160,9 @@ torchrun --nproc_per_node=4 unimatchv2_peft.py \
 `peft/tuners/semift.py` 当前支持以下方法：
 
 - `semift`
+- `semift_samoe`
+- `samoev4`
+- `semift_scalegate`
 - `lora`
 - `ssf`
 - `bitfit`
@@ -174,6 +177,9 @@ torchrun --nproc_per_node=4 unimatchv2_peft.py \
 | method | default target_modules |
 |---|---|
 | semift | `["mlp"]` |
+| semift_samoe | `["mlp"]` |
+| samoev4 | `["mlp"]` |
+| semift_scalegate | `["mlp"]` |
 | lora | `["qkv", "proj", "fc1", "fc2"]` |
 | ssf | `["patch_embed", "norm1", "norm2", "qkv", "proj", "fc1", "fc2"]` |
 | bitfit | `["qkv", "proj", "fc1", "fc2", "norm1", "norm2", "head"]` |

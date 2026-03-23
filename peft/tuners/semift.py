@@ -10,7 +10,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from ..utils import PeftConfig, PeftType
-from .moe import SemiFt, SemiFtSAMoE, SemiFtScaleGate
+from .moe import SemiFt, SemiFtSAMoE, SemiFtSAMoEV4, SemiFtScaleGate
 
 
 @dataclass
@@ -76,6 +76,7 @@ class SemiFTConfig(PeftConfig):
 METHOD_DEFAULT_TARGETS = {
     "semift": ["mlp"],
     "semift_samoe": ["mlp"],
+    "samoev4": ["mlp"],
     "semift_scalegate": ["mlp"],
     "lora": ["qkv", "proj", "fc1", "fc2"],
     "ssf": ["patch_embed", "norm1", "norm2", "qkv", "proj", "fc1", "fc2"],
@@ -91,7 +92,7 @@ HIGH_LEVEL_TO_SUBMODULES = {
     "attn": ["qkv", "proj"],
     "mlp": ["fc1", "fc2"],
 }
-BLOCK_LEVEL_METHODS = {"semift", "semift_samoe", "semift_scalegate", "adaptformer", "fact_tt", "fact_tk"}
+BLOCK_LEVEL_METHODS = {"semift", "semift_samoe", "samoev4", "semift_scalegate", "adaptformer", "fact_tt", "fact_tk"}
 PARAMETER_ONLY_METHODS = {"bitfit"}
 SSF_METHODS = {"ssf"}
 
@@ -208,6 +209,8 @@ class AdaptModel(nn.Module):
             adapter = SemiFt(input_dim, output_dim, **self._semift_kwargs())
         elif self.peft_config.method == "semift_samoe":
             adapter = SemiFtSAMoE(input_dim, output_dim, **self._semift_kwargs())
+        elif self.peft_config.method == "samoev4":
+            adapter = SemiFtSAMoEV4(input_dim, output_dim, **self._semift_kwargs())
         elif self.peft_config.method == "semift_scalegate":
             adapter = SemiFtScaleGate(input_dim, output_dim, **self._semift_kwargs())
         elif self.peft_config.method == "adaptformer":
@@ -307,7 +310,7 @@ class AdaptModel(nn.Module):
         num_prefix_tokens = self.peft_config.moe_num_prefix_tokens
         if num_prefix_tokens is None or int(num_prefix_tokens) <= 0:
             num_prefix_tokens = AdaptModel._infer_num_prefix_tokens_from_model(self)
-        if self.peft_config.method == "semift_samoe":
+        if self.peft_config.method in {"semift_samoe", "samoev4"}:
             return {
                 "r": self.peft_config.r,
                 "num_experts": self.peft_config.moe_num_experts,

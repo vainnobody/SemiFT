@@ -28,7 +28,7 @@ peft:
   modules_to_save: ["head"]
   bias: lora_only
   # supported methods:
-  # semift | lora | ssf | bitfit | adaptformer | fact_tt | fact_tk | conv_lora | hydralora
+  # semift | semift_samoe | samoev4 | semift_scalegate | lora | ssf | bitfit | adaptformer | fact_tt | fact_tk | conv_lora | hydralora
 
   # LoRA parameters
   r: 32
