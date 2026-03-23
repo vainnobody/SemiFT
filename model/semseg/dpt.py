@@ -6,6 +6,12 @@ import torch.nn.functional as F
 from model.backbone.dinov2 import DINOv2
 from model.backbone.dinov3 import DINOv3
 from model.backbone.resnet import ResNet101Backbone
+from model.semseg.scalematch_core import (
+    RWKVLayers,
+    SqueezeExcitation,
+    resize_x,
+    scale_as,
+)
 from model.semseg.feature_perturb import apply_structured_feature_perturbation
 from model.util.blocks import FeatureFusionBlock, _make_scratch
 
@@ -100,7 +106,7 @@ class DPTHead(nn.Module):
             nn.Conv2d(features, nclass, kernel_size=1, stride=1, padding=0),
         )
 
-    def forward(self, out_features, patch_h, patch_w):
+    def forward(self, out_features, patch_h, patch_w, return_feats=False):
         out = []
         for i, x in enumerate(out_features):
             if x.dim() == 3:
@@ -128,7 +134,8 @@ class DPTHead(nn.Module):
         path_1 = self.scratch.refinenet1(path_2, layer_1_rn)
 
         out = self.scratch.output_conv(path_1)
-
+        if return_feats:
+            return out, path_1
         return out
 
 
@@ -141,6 +148,7 @@ class DPT(nn.Module):
         out_channels=[96, 192, 384, 768],
         use_bn=False,
         backbone_version="dinov2",  # 'dinov2' or 'dinov3'
+        enable_scalematch=False,
     ):
         super(DPT, self).__init__()
 
@@ -180,6 +188,8 @@ class DPT(nn.Module):
                 f"Unknown backbone version: {backbone_version}. Use 'dinov2', 'dinov3', or 'resnet'."
             )
         self.feature_kind = getattr(self.backbone, "feature_kind", "token")
+        self.enable_scalematch = enable_scalematch
+        self.scalematch_features = features
 
         self.head = DPTHead(
             nclass,
@@ -192,6 +202,31 @@ class DPT(nn.Module):
 
         self.binomial = torch.distributions.binomial.Binomial(probs=0.5)
         self.fp_dropout = nn.Dropout2d(0.5)
+        if self.enable_scalematch:
+            scale_in_ch = 2 * features
+            rwkv_channels = max(scale_in_ch // 16, 1)
+            self.scale_attn = nn.Sequential(
+                nn.Conv2d(
+                    scale_in_ch + rwkv_channels,
+                    scale_in_ch + rwkv_channels,
+                    kernel_size=3,
+                    padding=1,
+                    groups=scale_in_ch + rwkv_channels,
+                    bias=False,
+                ),
+                nn.BatchNorm2d(scale_in_ch + rwkv_channels),
+                nn.ReLU(inplace=True),
+                nn.Conv2d(scale_in_ch + rwkv_channels, 128, kernel_size=1, bias=False),
+                nn.BatchNorm2d(128),
+                nn.ReLU(inplace=True),
+                nn.Conv2d(128, 128, kernel_size=3, padding=1, groups=128, bias=False),
+                nn.BatchNorm2d(128),
+                nn.ReLU(inplace=True),
+                nn.Conv2d(128, 1, kernel_size=1, bias=False),
+                nn.Sigmoid(),
+            )
+            self.se_block = SqueezeExcitation(scale_in_ch + rwkv_channels)
+            self.rwkv_layers = RWKVLayers(1, rwkv_channels, mlp_ratio=4.0, drop_path=0.0)
 
     def lock_backbone(self):
         for p in self.backbone.parameters():
@@ -252,7 +287,146 @@ class DPT(nn.Module):
 
         return tuple(features_fp)
 
-    def forward(self, x, comp_drop=False, feature_perturb=None, need_fp=False):
+    def _scalematch_base_forward(self, x, need_fp=False, feature_scale=None):
+        features, patch_h, patch_w = self._extract_features(x)
+        logits, feats = self.head(features, patch_h, patch_w, return_feats=True)
+        logits = F.interpolate(
+            logits,
+            size=x.shape[-2:],
+            mode="bilinear",
+            align_corners=True,
+        ).contiguous()
+        feats = F.interpolate(
+            feats,
+            size=(x.shape[-2] // 4, x.shape[-1] // 4),
+            mode="bilinear",
+            align_corners=True,
+        ).contiguous()
+
+        if not need_fp:
+            return logits, feats
+
+        feats_fp = feats
+        if feature_scale is not None and feature_scale != 1.0:
+            target_h = max(int(round(feats_fp.shape[-2] * feature_scale)), 1)
+            target_w = max(int(round(feats_fp.shape[-1] * feature_scale)), 1)
+            feats_fp = F.interpolate(
+                feats_fp,
+                size=(target_h, target_w),
+                mode="bilinear",
+                align_corners=True,
+            ).contiguous()
+
+        fp_inputs = torch.cat((feats_fp, self.fp_dropout(feats_fp)), dim=0)
+        logits_fp = self.head.scratch.output_conv(fp_inputs)
+        logits_fp = F.interpolate(
+            logits_fp,
+            size=x.shape[-2:],
+            mode="bilinear",
+            align_corners=True,
+        ).contiguous()
+        _, logits_fp = logits_fp.chunk(2)
+        return logits, feats_fp, logits_fp
+
+    def _scalematch_two_scale_forward(self, inputs, scale_factor, feature_scale):
+        resize_stride = getattr(
+            self.backbone,
+            "output_stride",
+            getattr(self.backbone, "patch_size", 14),
+        )
+        if scale_factor is None:
+            logits, _ = self._scalematch_base_forward(inputs, need_fp=False)
+            return logits
+
+        x_1x = inputs
+        if scale_factor > 1.0:
+            x_lo = x_1x
+            x_hi = resize_x(x_1x, scale_factor, patch_size=resize_stride, align_corners=True)
+            p_lo_ori, feats_lo, out_fp = self._scalematch_base_forward(
+                x_lo, need_fp=True, feature_scale=feature_scale
+            )
+            p_hi, feats_hi = self._scalematch_base_forward(x_hi)
+
+            p_hi = scale_as(p_hi, x_1x, align_corners=True).contiguous()
+            feats_hi = scale_as(feats_hi, feats_lo, align_corners=True).contiguous()
+            cat_feats = torch.cat([feats_lo, feats_hi], 1).contiguous()
+
+            global_int_feats, h_f, w_f = self.rwkv_layers(cat_feats)
+            bsz, _, ch = global_int_feats.shape
+            global_int_feats = global_int_feats.permute(0, 2, 1).reshape(
+                bsz, ch, h_f, w_f
+            ).contiguous()
+            channel_attn_feats = self.se_block(
+                torch.cat([cat_feats, global_int_feats], 1).contiguous()
+            )
+            logit_attn = scale_as(
+                self.scale_attn(channel_attn_feats), p_lo_ori, align_corners=True
+            ).contiguous()
+
+            p_lo = logit_attn * p_lo_ori
+            p_lo_up = scale_as(p_lo, p_hi, align_corners=True).contiguous()
+            logit_attn_hi = scale_as(logit_attn, p_hi, align_corners=True).contiguous()
+            joint_pred = (p_lo_up + (1 - logit_attn_hi) * p_hi).contiguous()
+            joint_pred = scale_as(joint_pred, p_lo_ori, align_corners=True).contiguous()
+
+            return {
+                "pred_joint": joint_pred,
+                "pred_ori": p_lo_ori,
+                "pred_fp": out_fp,
+                "pred_size": p_hi,
+            }
+
+        x_lo = resize_x(x_1x, scale_factor, patch_size=resize_stride, align_corners=True)
+        x_hi = x_1x
+        p_lo, feats_lo = self._scalematch_base_forward(x_lo)
+        p_hi, feats_hi, out_fp = self._scalematch_base_forward(
+            x_hi, need_fp=True, feature_scale=feature_scale
+        )
+
+        p_lo_ori = scale_as(p_lo, x_1x, align_corners=True).contiguous()
+        feats_lo = scale_as(feats_lo, feats_hi, align_corners=True).contiguous()
+        cat_feats = torch.cat([feats_lo, feats_hi], 1).contiguous()
+
+        global_int_feats, h_f, w_f = self.rwkv_layers(cat_feats)
+        bsz, _, ch = global_int_feats.shape
+        global_int_feats = global_int_feats.permute(0, 2, 1).reshape(
+            bsz, ch, h_f, w_f
+        ).contiguous()
+        channel_attn_feats = self.se_block(
+            torch.cat([cat_feats, global_int_feats], 1).contiguous()
+        )
+        logit_attn = scale_as(
+            self.scale_attn(channel_attn_feats), p_lo, align_corners=True
+        ).contiguous()
+
+        p_lo_att = (logit_attn * p_lo).contiguous()
+        p_lo_att = scale_as(p_lo_att, p_hi, align_corners=True).contiguous()
+        logit_attn_hi = scale_as(logit_attn, p_hi, align_corners=True).contiguous()
+        joint_pred = (p_lo_att + (1 - logit_attn_hi) * p_hi).contiguous()
+
+        return {
+            "pred_joint": joint_pred,
+            "pred_ori": p_hi,
+            "pred_fp": out_fp,
+            "pred_size": p_lo_ori,
+        }
+
+    def forward(
+        self,
+        x,
+        comp_drop=False,
+        feature_perturb=None,
+        need_fp=False,
+        scale_factor=None,
+        feature_scale=1.0,
+    ):
+        if scale_factor is not None:
+            if not self.enable_scalematch:
+                raise ValueError("ScaleMatch forward requested but enable_scalematch=False.")
+            if need_fp or feature_perturb is not None or comp_drop:
+                raise ValueError("ScaleMatch forward does not support comp_drop/need_fp/feature_perturb.")
+            return self._scalematch_two_scale_forward(x, scale_factor, feature_scale)
+
         batch_size = x.shape[0]
         features, patch_h, patch_w = self._extract_features(x)
 

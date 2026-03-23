@@ -10,6 +10,12 @@ import torch.nn.functional as F
 from model.backbone.dinov2 import DINOv2
 from model.backbone.dinov3 import DINOv3
 from model.backbone.resnet import ResNet101Backbone
+from model.semseg.scalematch_core import (
+    RWKVLayers,
+    SqueezeExcitation,
+    resize_x,
+    scale_as,
+)
 from model.semseg.feature_perturb import apply_structured_feature_perturbation
 
 
@@ -214,6 +220,7 @@ class UperNet(nn.Module):
         fpn_channels=256,
         use_bn=True,  # kept for API compatibility with DPT
         backbone_version="dinov2",
+        enable_scalematch=False,
         **kwargs,  # Ignore DPT-specific params (features, out_channels)
     ):
         super(UperNet, self).__init__()
@@ -237,6 +244,7 @@ class UperNet(nn.Module):
 
         self.encoder_size = encoder_size
         self.backbone_version = backbone_version
+        self.enable_scalematch = enable_scalematch
 
         # Initialize backbone
         if backbone_version == "dinov2":
@@ -272,6 +280,31 @@ class UperNet(nn.Module):
         # For comp_drop support (same as DPT)
         self.binomial = torch.distributions.binomial.Binomial(probs=0.5)
         self.fp_dropout = nn.Dropout2d(0.5)
+        if self.enable_scalematch:
+            scale_in_ch = 2 * fpn_channels
+            rwkv_channels = max(scale_in_ch // 16, 1)
+            self.scale_attn = nn.Sequential(
+                nn.Conv2d(
+                    scale_in_ch + rwkv_channels,
+                    scale_in_ch + rwkv_channels,
+                    kernel_size=3,
+                    padding=1,
+                    groups=scale_in_ch + rwkv_channels,
+                    bias=False,
+                ),
+                nn.BatchNorm2d(scale_in_ch + rwkv_channels),
+                nn.ReLU(inplace=True),
+                nn.Conv2d(scale_in_ch + rwkv_channels, 128, kernel_size=1, bias=False),
+                nn.BatchNorm2d(128),
+                nn.ReLU(inplace=True),
+                nn.Conv2d(128, 128, kernel_size=3, padding=1, groups=128, bias=False),
+                nn.BatchNorm2d(128),
+                nn.ReLU(inplace=True),
+                nn.Conv2d(128, 1, kernel_size=1, bias=False),
+                nn.Sigmoid(),
+            )
+            self.se_block = SqueezeExcitation(scale_in_ch + rwkv_channels)
+            self.rwkv_layers = RWKVLayers(1, rwkv_channels, mlp_ratio=4.0, drop_path=0.0)
 
     @property
     def head(self):
@@ -283,7 +316,142 @@ class UperNet(nn.Module):
         for p in self.backbone.parameters():
             p.requires_grad = False
 
-    def forward(self, x, comp_drop=False, feature_perturb=None, need_fp=False):
+    def _extract_feature_maps(self, x):
+        B, _, H, W = x.shape
+        if self.feature_kind == "token":
+            patch_size = self.backbone.patch_size
+            patch_h, patch_w = H // patch_size, W // patch_size
+            features = self.backbone.get_intermediate_layers(
+                x, self.intermediate_layer_idx[self.encoder_size]
+            )
+            feat_maps = []
+            for feat in features:
+                if feat.dim() == 3:
+                    feat = feat.permute(0, 2, 1).reshape(B, -1, patch_h, patch_w)
+                feat_maps.append(feat.float())
+            return tuple(feat_maps)
+        return tuple(feat.float() for feat in self.backbone.forward_features(x))
+
+    def _scalematch_base_forward(self, x, need_fp=False, feature_scale=None):
+        feat_maps = self._extract_feature_maps(x)
+        pyramid_feats = self.neck(feat_maps)
+        logits, feats = self.decoder(pyramid_feats, return_feats=True)
+        logits = F.interpolate(
+            logits, size=x.shape[-2:], mode="bilinear", align_corners=False
+        ).contiguous()
+
+        if not need_fp:
+            return logits, feats
+
+        feats_fp = feats
+        if feature_scale is not None and feature_scale != 1.0:
+            target_h = max(int(round(feats_fp.shape[-2] * feature_scale)), 1)
+            target_w = max(int(round(feats_fp.shape[-1] * feature_scale)), 1)
+            feats_fp = F.interpolate(
+                feats_fp,
+                size=(target_h, target_w),
+                mode="bilinear",
+                align_corners=False,
+            ).contiguous()
+
+        fp_inputs = torch.cat((feats_fp, self.fp_dropout(feats_fp)), dim=0)
+        logits_fp = self.decoder.classifier(fp_inputs)
+        logits_fp = F.interpolate(
+            logits_fp, size=x.shape[-2:], mode="bilinear", align_corners=False
+        ).contiguous()
+        _, logits_fp = logits_fp.chunk(2)
+        return logits, feats_fp, logits_fp
+
+    def _scalematch_two_scale_forward(self, inputs, scale_factor, feature_scale):
+        resize_stride = getattr(
+            self.backbone, "output_stride", getattr(self.backbone, "patch_size", 14)
+        )
+        if scale_factor is None:
+            logits, _ = self._scalematch_base_forward(inputs, need_fp=False)
+            return logits
+
+        x_1x = inputs
+        if scale_factor > 1.0:
+            x_lo = x_1x
+            x_hi = resize_x(x_1x, scale_factor, patch_size=resize_stride, align_corners=False)
+            p_lo_ori, feats_lo, out_fp = self._scalematch_base_forward(
+                x_lo, need_fp=True, feature_scale=feature_scale
+            )
+            p_hi, feats_hi = self._scalematch_base_forward(x_hi)
+
+            p_hi = scale_as(p_hi, x_1x, align_corners=False).contiguous()
+            feats_hi = scale_as(feats_hi, feats_lo, align_corners=False).contiguous()
+            cat_feats = torch.cat([feats_lo, feats_hi], 1).contiguous()
+
+            global_int_feats, h_f, w_f = self.rwkv_layers(cat_feats)
+            bsz, _, ch = global_int_feats.shape
+            global_int_feats = global_int_feats.permute(0, 2, 1).reshape(
+                bsz, ch, h_f, w_f
+            ).contiguous()
+            channel_attn_feats = self.se_block(
+                torch.cat([cat_feats, global_int_feats], 1).contiguous()
+            )
+            logit_attn = scale_as(
+                self.scale_attn(channel_attn_feats), p_lo_ori, align_corners=False
+            ).contiguous()
+
+            p_lo = logit_attn * p_lo_ori
+            p_lo_up = scale_as(p_lo, p_hi, align_corners=False).contiguous()
+            logit_attn_hi = scale_as(logit_attn, p_hi, align_corners=False).contiguous()
+            joint_pred = (p_lo_up + (1 - logit_attn_hi) * p_hi).contiguous()
+            joint_pred = scale_as(joint_pred, p_lo_ori, align_corners=False).contiguous()
+
+            return {
+                "pred_joint": joint_pred,
+                "pred_ori": p_lo_ori,
+                "pred_fp": out_fp,
+                "pred_size": p_hi,
+            }
+
+        x_lo = resize_x(x_1x, scale_factor, patch_size=resize_stride, align_corners=False)
+        x_hi = x_1x
+        p_lo, feats_lo = self._scalematch_base_forward(x_lo)
+        p_hi, feats_hi, out_fp = self._scalematch_base_forward(
+            x_hi, need_fp=True, feature_scale=feature_scale
+        )
+
+        p_lo_ori = scale_as(p_lo, x_1x, align_corners=False).contiguous()
+        feats_lo = scale_as(feats_lo, feats_hi, align_corners=False).contiguous()
+        cat_feats = torch.cat([feats_lo, feats_hi], 1).contiguous()
+
+        global_int_feats, h_f, w_f = self.rwkv_layers(cat_feats)
+        bsz, _, ch = global_int_feats.shape
+        global_int_feats = global_int_feats.permute(0, 2, 1).reshape(
+            bsz, ch, h_f, w_f
+        ).contiguous()
+        channel_attn_feats = self.se_block(
+            torch.cat([cat_feats, global_int_feats], 1).contiguous()
+        )
+        logit_attn = scale_as(
+            self.scale_attn(channel_attn_feats), p_lo, align_corners=False
+        ).contiguous()
+
+        p_lo_att = (logit_attn * p_lo).contiguous()
+        p_lo_att = scale_as(p_lo_att, p_hi, align_corners=False).contiguous()
+        logit_attn_hi = scale_as(logit_attn, p_hi, align_corners=False).contiguous()
+        joint_pred = (p_lo_att + (1 - logit_attn_hi) * p_hi).contiguous()
+
+        return {
+            "pred_joint": joint_pred,
+            "pred_ori": p_hi,
+            "pred_fp": out_fp,
+            "pred_size": p_lo_ori,
+        }
+
+    def forward(
+        self,
+        x,
+        comp_drop=False,
+        feature_perturb=None,
+        need_fp=False,
+        scale_factor=None,
+        feature_scale=1.0,
+    ):
         """
         Forward pass.
 
@@ -298,6 +466,13 @@ class UperNet(nn.Module):
             If need_fp=False: segmentation logits of shape (B, nclass, H, W)
             If need_fp=True: tuple (out, out_fp), each of shape (B, nclass, H, W)
         """
+        if scale_factor is not None:
+            if not self.enable_scalematch:
+                raise ValueError("ScaleMatch forward requested but enable_scalematch=False.")
+            if need_fp or feature_perturb is not None or comp_drop:
+                raise ValueError("ScaleMatch forward does not support comp_drop/need_fp/feature_perturb.")
+            return self._scalematch_two_scale_forward(x, scale_factor, feature_scale)
+
         if need_fp and comp_drop:
             raise ValueError("UPerNet does not support need_fp=True together with comp_drop=True.")
 

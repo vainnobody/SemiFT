@@ -25,10 +25,8 @@ stub_tb.SummaryWriter = StubSummaryWriter
 sys.modules.setdefault("torch.utils.tensorboard", stub_tb)
 
 from model.semseg import dpt as dpt_mod
-from model.semseg import dpt_scalematch as dpt_scalematch_mod
 from model.semseg import dpt_segmind as dpt_segmind_mod
 from model.semseg import upernet as upernet_mod
-from model.semseg import upernet_scalematch as upernet_scalematch_mod
 from model.backbone.resnet import ResNet101Backbone
 from util import ssl_method_utils as ssl_utils
 
@@ -59,10 +57,8 @@ class FakeResNet101Backbone(torch.nn.Module):
 @pytest.fixture(autouse=True)
 def patch_fake_resnet(monkeypatch):
     monkeypatch.setattr(dpt_mod, "ResNet101Backbone", FakeResNet101Backbone)
-    monkeypatch.setattr(dpt_scalematch_mod, "ResNet101Backbone", FakeResNet101Backbone)
     monkeypatch.setattr(dpt_segmind_mod, "ResNet101Backbone", FakeResNet101Backbone)
     monkeypatch.setattr(upernet_mod, "ResNet101Backbone", FakeResNet101Backbone)
-    monkeypatch.setattr(upernet_scalematch_mod, "ResNet101Backbone", FakeResNet101Backbone)
 
 
 def test_parse_backbone_spec_supports_rn101_aliases():
@@ -180,21 +176,27 @@ def test_dpt_segmind_supports_resnet101_aux_outputs():
 def test_scalematch_models_support_resnet101_backbone():
     x = torch.randn(2, 3, 128, 128)
 
-    dpt_model = dpt_scalematch_mod.DPT_ScaleMatch(
+    dpt_model = dpt_mod.DPT(
         encoder_size="resnet101",
         nclass=3,
         features=64,
         out_channels=[256, 512, 1024, 2048],
         backbone_version="resnet",
+        enable_scalematch=True,
     )
-    y = dpt_model(x, scale_factor=None, feature_scale=1.25)
+    y = dpt_model(x)
     assert y.shape == (2, 3, 128, 128)
+    scale_out = dpt_model(x, scale_factor=1.25, feature_scale=1.25)
+    assert set(scale_out) == {"pred_joint", "pred_ori", "pred_fp", "pred_size"}
 
-    uper_model = upernet_scalematch_mod.UperNet_ScaleMatch(
+    uper_model = upernet_mod.UperNet(
         encoder_size="resnet101",
         nclass=3,
         fpn_channels=64,
         backbone_version="resnet",
+        enable_scalematch=True,
     )
-    y = uper_model(x, scale_factor=None, feature_scale=1.25)
+    y = uper_model(x)
     assert y.shape == (2, 3, 128, 128)
+    scale_out = uper_model(x, scale_factor=1.25, feature_scale=1.25)
+    assert set(scale_out) == {"pred_joint", "pred_ori", "pred_fp", "pred_size"}
