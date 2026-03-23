@@ -846,6 +846,156 @@ class ScaleContextExpertV3(nn.Module):
         return out
 
 
+class ScaleSelectiveKernelExpertV6(nn.Module):
+    def __init__(
+        self,
+        r,
+        scale=1,
+        kernel_size=3,
+        norm_type="layernorm",
+        gate_bias_local=2.0,
+        gate_bias_scale=-1.0,
+        gate_bias_large=-1.0,
+    ):
+        super().__init__()
+        self.r = r
+        self.scale = max(int(scale), 1)
+        self.scale_dilation = max(1, min(self.scale, 4))
+        self.large_kernel_size = min(2 * self.scale + 3, 11)
+        if self.large_kernel_size % 2 == 0:
+            self.large_kernel_size -= 1
+
+        self.local_dwconv = nn.Conv2d(
+            r,
+            r,
+            kernel_size=kernel_size,
+            stride=1,
+            padding=kernel_size // 2,
+            groups=r,
+            bias=True,
+        )
+        self.scale_dwconv = nn.Conv2d(
+            r,
+            r,
+            kernel_size=kernel_size,
+            stride=1,
+            padding=self.scale_dilation,
+            dilation=self.scale_dilation,
+            groups=r,
+            bias=True,
+        )
+        self.large_dwconv_h = nn.Conv2d(
+            r,
+            r,
+            kernel_size=(1, self.large_kernel_size),
+            stride=1,
+            padding=(0, self.large_kernel_size // 2),
+            groups=r,
+            bias=True,
+        )
+        self.large_dwconv_v = nn.Conv2d(
+            r,
+            r,
+            kernel_size=(self.large_kernel_size, 1),
+            stride=1,
+            padding=(self.large_kernel_size // 2, 0),
+            groups=r,
+            bias=True,
+        )
+
+        selector_hidden = max(r // 4, 4)
+        self.selector = nn.Sequential(
+            nn.Linear(r, selector_hidden, bias=True),
+            nn.GELU(),
+            nn.Linear(selector_hidden, 3, bias=True),
+        )
+        if norm_type == "layernorm":
+            self.norm = LayerNorm2d(r)
+        elif norm_type == "groupnorm":
+            self.norm = nn.GroupNorm(1, r)
+        elif norm_type == "batchnorm":
+            self.norm = nn.BatchNorm2d(r)
+        elif norm_type in {"identity", "none"}:
+            self.norm = nn.Identity()
+        else:
+            raise ValueError(f"Unsupported norm_type for ScaleSelectiveKernelExpertV6: {norm_type}")
+        self.act = nn.SiLU()
+        self.last_branch_weight = None
+        self.reset_parameters(gate_bias_local, gate_bias_scale, gate_bias_large)
+
+    def reset_parameters(self, gate_bias_local=2.0, gate_bias_scale=-1.0, gate_bias_large=-1.0):
+        for conv in (self.local_dwconv, self.scale_dwconv, self.large_dwconv_h, self.large_dwconv_v):
+            nn.init.kaiming_uniform_(conv.weight, a=math.sqrt(5))
+            nn.init.zeros_(conv.bias)
+        nn.init.zeros_(self.selector[0].weight)
+        nn.init.zeros_(self.selector[0].bias)
+        nn.init.zeros_(self.selector[2].weight)
+        with torch.no_grad():
+            self.selector[2].bias.copy_(
+                torch.tensor([gate_bias_local, gate_bias_scale, gate_bias_large], dtype=self.selector[2].bias.dtype)
+            )
+
+    def _load_from_state_dict(
+        self,
+        state_dict,
+        prefix,
+        local_metadata,
+        strict,
+        missing_keys,
+        unexpected_keys,
+        error_msgs,
+    ):
+        legacy_candidates = [
+            (prefix + "dwconv.weight", prefix + "dwconv.bias"),
+            (prefix + "context_dwconv.weight", prefix + "context_dwconv.bias"),
+        ]
+        for legacy_weight_key, legacy_bias_key in legacy_candidates:
+            if legacy_weight_key in state_dict:
+                state_dict.setdefault(prefix + "local_dwconv.weight", state_dict[legacy_weight_key])
+                if legacy_bias_key in state_dict:
+                    state_dict.setdefault(prefix + "local_dwconv.bias", state_dict[legacy_bias_key])
+                break
+        super()._load_from_state_dict(
+            state_dict,
+            prefix,
+            local_metadata,
+            strict,
+            missing_keys,
+            unexpected_keys,
+            error_msgs,
+        )
+
+    def _pool(self, x_2d):
+        if self.scale <= 1:
+            return x_2d
+        h, w = x_2d.shape[-2:]
+        return F.adaptive_avg_pool2d(
+            x_2d,
+            output_size=(max(1, h // self.scale), max(1, w // self.scale)),
+        )
+
+    def forward(self, x_2d):
+        pooled = self._pool(x_2d)
+        local = self.local_dwconv(pooled)
+        scale = self.scale_dwconv(pooled)
+        large = self.large_dwconv_v(self.large_dwconv_h(pooled))
+
+        selector_input = pooled.mean(dim=(-2, -1))
+        branch_weight = torch.softmax(self.selector(selector_input), dim=-1).to(pooled.dtype)
+        self.last_branch_weight = branch_weight.detach().clone()
+
+        fused = (
+            local * branch_weight[:, 0].view(-1, 1, 1, 1)
+            + scale * branch_weight[:, 1].view(-1, 1, 1, 1)
+            + large * branch_weight[:, 2].view(-1, 1, 1, 1)
+        )
+        out = self.act(self.norm(fused - pooled))
+
+        if self.scale > 1:
+            out = F.interpolate(out, size=x_2d.shape[-2:], mode="bilinear", align_corners=False)
+        return out
+
+
 class SemiFtSAMoE(nn.Module):
     def __init__(
         self,
@@ -1147,6 +1297,11 @@ class SemiFtSAMoEV5(SemiFtSAMoE):
         prefix_out = self.proj_up(prefix)
         patch_out = self.output_scale(self.proj_up(combined))
         return torch.cat([prefix_out, patch_out], dim=1)
+
+
+class SemiFtSAMoEV6(SemiFtSAMoEV5):
+    def _expert_cls(self):
+        return ScaleSelectiveKernelExpertV6
 
 
 
