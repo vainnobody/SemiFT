@@ -12,6 +12,7 @@ import torch.nn.functional as F
 
 from model.backbone.dinov2 import DINOv2
 from model.backbone.dinov3 import DINOv3
+from model.backbone.resnet import ResNet101Backbone
 from model.util.blocks import FeatureFusionBlock, _make_scratch
 
 
@@ -35,48 +36,54 @@ class DPTHead(nn.Module):
         features=256,
         use_bn=False,
         out_channels=[256, 512, 1024, 1024],
+        feature_kind="token",
     ):
         super(DPTHead, self).__init__()
+        if isinstance(in_channels, int):
+            in_channels = [in_channels] * len(out_channels)
 
         self.projects = nn.ModuleList(
             [
                 nn.Conv2d(
-                    in_channels=in_channels,
+                    in_channels=in_ch,
                     out_channels=out_channel,
                     kernel_size=1,
                     stride=1,
                     padding=0,
                 )
-                for out_channel in out_channels
+                for in_ch, out_channel in zip(in_channels, out_channels)
             ]
         )
 
-        self.resize_layers = nn.ModuleList(
-            [
-                nn.ConvTranspose2d(
-                    in_channels=out_channels[0],
-                    out_channels=out_channels[0],
-                    kernel_size=4,
-                    stride=4,
-                    padding=0,
-                ),
-                nn.ConvTranspose2d(
-                    in_channels=out_channels[1],
-                    out_channels=out_channels[1],
-                    kernel_size=2,
-                    stride=2,
-                    padding=0,
-                ),
-                nn.Identity(),
-                nn.Conv2d(
-                    in_channels=out_channels[3],
-                    out_channels=out_channels[3],
-                    kernel_size=3,
-                    stride=2,
-                    padding=1,
-                ),
-            ]
-        )
+        if feature_kind == "token":
+            self.resize_layers = nn.ModuleList(
+                [
+                    nn.ConvTranspose2d(
+                        in_channels=out_channels[0],
+                        out_channels=out_channels[0],
+                        kernel_size=4,
+                        stride=4,
+                        padding=0,
+                    ),
+                    nn.ConvTranspose2d(
+                        in_channels=out_channels[1],
+                        out_channels=out_channels[1],
+                        kernel_size=2,
+                        stride=2,
+                        padding=0,
+                    ),
+                    nn.Identity(),
+                    nn.Conv2d(
+                        in_channels=out_channels[3],
+                        out_channels=out_channels[3],
+                        kernel_size=3,
+                        stride=2,
+                        padding=1,
+                    ),
+                ]
+            )
+        else:
+            self.resize_layers = nn.ModuleList([nn.Identity() for _ in out_channels])
 
         self.scratch = _make_scratch(
             out_channels,
@@ -101,7 +108,8 @@ class DPTHead(nn.Module):
     def forward(self, out_features, patch_h, patch_w):
         out = []
         for i, x in enumerate(out_features):
-            x = x.permute(0, 2, 1).reshape((x.shape[0], x.shape[-1], patch_h, patch_w))
+            if x.dim() == 3:
+                x = x.permute(0, 2, 1).reshape((x.shape[0], x.shape[-1], patch_h, patch_w))
 
             x = self.projects[i](x)
             x = self.resize_layers[i](x)
@@ -170,13 +178,22 @@ class DPT_UniMatch(nn.Module):
         elif backbone_version == "dinov3":
             self.backbone = DINOv3(model_name=encoder_size)
             self.intermediate_layer_idx = self.intermediate_layer_idx_v3
+        elif backbone_version == "resnet":
+            self.backbone = ResNet101Backbone()
+            self.intermediate_layer_idx = None
         else:
             raise ValueError(
-                f"Unknown backbone version: {backbone_version}. Use 'dinov2' or 'dinov3'."
+                f"Unknown backbone version: {backbone_version}. Use 'dinov2', 'dinov3', or 'resnet'."
             )
+        self.feature_kind = getattr(self.backbone, "feature_kind", "token")
 
         self.head = DPTHead(
-            nclass, self.backbone.embed_dim, features, use_bn, out_channels=out_channels
+            nclass,
+            self.backbone.out_channels if self.feature_kind == "feature_map" else self.backbone.embed_dim,
+            features,
+            use_bn,
+            out_channels=out_channels,
+            feature_kind=self.feature_kind,
         )
 
         # Feature perturbation dropout
@@ -199,13 +216,15 @@ class DPT_UniMatch(nn.Module):
             If need_fp=False: out tensor of shape (B, nclass, H, W)
             If need_fp=True: tuple (out, out_fp) each of shape (B, nclass, H, W)
         """
-        patch_size = self.backbone.patch_size
-        patch_h, patch_w = x.shape[-2] // patch_size, x.shape[-1] // patch_size
-
-        # Get intermediate features from backbone
-        features = self.backbone.get_intermediate_layers(
-            x, self.intermediate_layer_idx[self.encoder_size]
-        )
+        if self.feature_kind == "feature_map":
+            patch_h = patch_w = None
+            features = self.backbone.forward_features(x)
+        else:
+            patch_size = self.backbone.patch_size
+            patch_h, patch_w = x.shape[-2] // patch_size, x.shape[-1] // patch_size
+            features = self.backbone.get_intermediate_layers(
+                x, self.intermediate_layer_idx[self.encoder_size]
+            )
         # features is a tuple of tensors, each of shape (B, num_patches, embed_dim)
 
         if need_fp:
@@ -213,14 +232,18 @@ class DPT_UniMatch(nn.Module):
             # Need to reshape to apply 2D dropout, then reshape back
             features_fp = []
             for feat in features:
-                # feat: (B, num_patches, embed_dim)
-                B, N, D = feat.shape
-                # Reshape to (B, embed_dim, patch_h, patch_w) for Dropout2d
-                feat_2d = feat.permute(0, 2, 1).reshape(B, D, patch_h, patch_w)
+                if feat.dim() == 4:
+                    B, D, _, _ = feat.shape
+                    feat_2d = feat
+                else:
+                    B, N, D = feat.shape
+                    feat_2d = feat.permute(0, 2, 1).reshape(B, D, patch_h, patch_w)
                 # Apply dropout
                 feat_2d_fp = self.fp_dropout(feat_2d)
-                # Reshape back to (B, num_patches, embed_dim)
-                feat_fp = feat_2d_fp.reshape(B, D, N).permute(0, 2, 1)
+                if feat.dim() == 4:
+                    feat_fp = feat_2d_fp
+                else:
+                    feat_fp = feat_2d_fp.reshape(B, D, N).permute(0, 2, 1)
                 features_fp.append(feat_fp)
 
             # Concatenate normal and perturbed features along batch dimension
@@ -232,7 +255,7 @@ class DPT_UniMatch(nn.Module):
             out = self.head(features_combined, patch_h, patch_w)
             out = F.interpolate(
                 out,
-                (patch_h * patch_size, patch_w * patch_size),
+                x.shape[-2:],
                 mode="bilinear",
                 align_corners=True,
             )
@@ -245,7 +268,7 @@ class DPT_UniMatch(nn.Module):
         out = self.head(features, patch_h, patch_w)
         out = F.interpolate(
             out,
-            (patch_h * patch_size, patch_w * patch_size),
+            x.shape[-2:],
             mode="bilinear",
             align_corners=True,
         )

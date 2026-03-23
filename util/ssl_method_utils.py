@@ -44,12 +44,107 @@ MODEL_CONFIGS = {
         "features": 384,
         "out_channels": [1536, 1536, 1536, 1536],
     },
+    "resnet101": {
+        "encoder_size": "resnet101",
+        "features": 128,
+        "out_channels": [256, 512, 1024, 2048],
+    },
 }
 
 
 class NullWriter:
     def add_scalar(self, *args, **kwargs):
         return None
+
+
+def normalize_backbone_name(name):
+    value = str(name).strip()
+    lowered = value.lower().replace("-", "").replace("_", "")
+    if lowered in {"rn101", "resnet101"}:
+        return "resnet101"
+    return value
+
+
+def parse_backbone_spec(backbone_name):
+    canonical = normalize_backbone_name(backbone_name)
+    lowered = canonical.lower()
+    if lowered == "resnet101":
+        return {
+            "canonical_name": "resnet101",
+            "family": "resnet",
+            "version": "resnet",
+            "size": "resnet101",
+        }
+
+    parts = canonical.split("_")
+    if len(parts) < 2:
+        raise ValueError(
+            f"Unsupported backbone '{backbone_name}'. Expected dinov2_*/dinov3_* or resnet101."
+        )
+    return {
+        "canonical_name": canonical,
+        "family": parts[0],
+        "version": parts[0],
+        "size": parts[-1],
+    }
+
+
+def get_model_kwargs(cfg):
+    info = parse_backbone_spec(cfg["backbone"])
+    model_cfg = MODEL_CONFIGS.get(info["size"])
+    if model_cfg is None:
+        raise ValueError(
+            f"Unsupported backbone size '{info['size']}' for backbone '{cfg['backbone']}'."
+        )
+    return {**model_cfg, "nclass": cfg["nclass"]}
+
+
+def get_backbone_checkpoint_path(cfg):
+    info = parse_backbone_spec(cfg["backbone"])
+    if info["family"] == "resnet":
+        ckpt = cfg.get("backbone_ckpt")
+        if not ckpt:
+            raise ValueError(
+                "RN-101 backbone requires 'backbone_ckpt' in config."
+            )
+        return ckpt
+    return str(Path("./pretrained") / f"{normalize_backbone_name(cfg['backbone'])}.pth")
+
+
+def _unwrap_checkpoint_state_dict(state_dict):
+    if not isinstance(state_dict, dict):
+        return state_dict
+    for key in ("state_dict", "model", "module", "backbone"):
+        value = state_dict.get(key)
+        if isinstance(value, dict):
+            state_dict = value
+            break
+
+    if not isinstance(state_dict, dict):
+        return state_dict
+
+    if any(k.startswith("backbone.") for k in state_dict.keys()):
+        return {
+            k[len("backbone.") :]: v
+            for k, v in state_dict.items()
+            if k.startswith("backbone.")
+        }
+    if any(k.startswith("module.backbone.") for k in state_dict.keys()):
+        return {
+            k[len("module.backbone.") :]: v
+            for k, v in state_dict.items()
+            if k.startswith("module.backbone.")
+        }
+    if all(k.startswith("module.") for k in state_dict.keys()):
+        return {k[len("module.") :]: v for k, v in state_dict.items()}
+    return state_dict
+
+
+def load_backbone_checkpoint(model, cfg):
+    ckpt_path = get_backbone_checkpoint_path(cfg)
+    state_dict = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+    state_dict = _unwrap_checkpoint_state_dict(state_dict)
+    return model.backbone.load_state_dict(state_dict, strict=False)
 
 
 def get_local_rank():
@@ -126,14 +221,13 @@ def build_logger_and_runtime(args, cfg):
 
 
 def get_backbone_info(cfg):
-    backbone_size = cfg["backbone"].split("_")[-1]
-    backbone_version = cfg["backbone"].split("_")[0]
-    return backbone_size, backbone_version
+    info = parse_backbone_spec(cfg["backbone"])
+    return info["size"], info["version"]
 
 
 def build_model(cfg, method="fixmatch"):
-    backbone_size, backbone_version = get_backbone_info(cfg)
-    kwargs = {**MODEL_CONFIGS[backbone_size], "nclass": cfg["nclass"]}
+    _, backbone_version = get_backbone_info(cfg)
+    kwargs = get_model_kwargs(cfg)
 
     if cfg["model"] == "upernet":
         model = UperNet(**kwargs, backbone_version=backbone_version)
@@ -149,8 +243,7 @@ def build_model(cfg, method="fixmatch"):
     else:
         model = DPT(**kwargs, backbone_version=backbone_version)
 
-    state_dict = torch.load(f'./pretrained/{cfg["backbone"]}.pth', map_location="cpu", weights_only=False)
-    load_result = model.backbone.load_state_dict(state_dict, strict=False)
+    load_result = load_backbone_checkpoint(model, cfg)
     if cfg.get("lock_backbone"):
         model.lock_backbone()
     return model, load_result

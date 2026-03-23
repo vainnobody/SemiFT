@@ -5,6 +5,7 @@ import torch.nn.functional as F
 
 from model.backbone.dinov2 import DINOv2
 from model.backbone.dinov3 import DINOv3
+from model.backbone.resnet import ResNet101Backbone
 from model.semseg.feature_perturb import apply_structured_feature_perturbation
 from model.util.blocks import FeatureFusionBlock, _make_scratch
 
@@ -29,48 +30,55 @@ class DPTHead(nn.Module):
         features=256,
         use_bn=False,
         out_channels=[256, 512, 1024, 1024],
+        feature_kind="token",
     ):
         super(DPTHead, self).__init__()
+        if isinstance(in_channels, int):
+            in_channels = [in_channels] * len(out_channels)
+        self.feature_kind = feature_kind
 
         self.projects = nn.ModuleList(
             [
                 nn.Conv2d(
-                    in_channels=in_channels,
+                    in_channels=in_ch,
                     out_channels=out_channel,
                     kernel_size=1,
                     stride=1,
                     padding=0,
                 )
-                for out_channel in out_channels
+                for in_ch, out_channel in zip(in_channels, out_channels)
             ]
         )
 
-        self.resize_layers = nn.ModuleList(
-            [
-                nn.ConvTranspose2d(
-                    in_channels=out_channels[0],
-                    out_channels=out_channels[0],
-                    kernel_size=4,
-                    stride=4,
-                    padding=0,
-                ),
-                nn.ConvTranspose2d(
-                    in_channels=out_channels[1],
-                    out_channels=out_channels[1],
-                    kernel_size=2,
-                    stride=2,
-                    padding=0,
-                ),
-                nn.Identity(),
-                nn.Conv2d(
-                    in_channels=out_channels[3],
-                    out_channels=out_channels[3],
-                    kernel_size=3,
-                    stride=2,
-                    padding=1,
-                ),
-            ]
-        )
+        if feature_kind == "token":
+            self.resize_layers = nn.ModuleList(
+                [
+                    nn.ConvTranspose2d(
+                        in_channels=out_channels[0],
+                        out_channels=out_channels[0],
+                        kernel_size=4,
+                        stride=4,
+                        padding=0,
+                    ),
+                    nn.ConvTranspose2d(
+                        in_channels=out_channels[1],
+                        out_channels=out_channels[1],
+                        kernel_size=2,
+                        stride=2,
+                        padding=0,
+                    ),
+                    nn.Identity(),
+                    nn.Conv2d(
+                        in_channels=out_channels[3],
+                        out_channels=out_channels[3],
+                        kernel_size=3,
+                        stride=2,
+                        padding=1,
+                    ),
+                ]
+            )
+        else:
+            self.resize_layers = nn.ModuleList([nn.Identity() for _ in out_channels])
 
         self.scratch = _make_scratch(
             out_channels,
@@ -95,7 +103,12 @@ class DPTHead(nn.Module):
     def forward(self, out_features, patch_h, patch_w):
         out = []
         for i, x in enumerate(out_features):
-            x = x.permute(0, 2, 1).reshape((x.shape[0], x.shape[-1], patch_h, patch_w))
+            if x.dim() == 3:
+                x = x.permute(0, 2, 1).reshape(
+                    (x.shape[0], x.shape[-1], patch_h, patch_w)
+                )
+            elif x.dim() != 4:
+                raise ValueError(f"Unsupported feature rank: {x.dim()}")
 
             x = self.projects[i](x)
             x = self.resize_layers[i](x)
@@ -159,13 +172,22 @@ class DPT(nn.Module):
         elif backbone_version == "dinov3":
             self.backbone = DINOv3(model_name=encoder_size)
             self.intermediate_layer_idx = self.intermediate_layer_idx_v3
+        elif backbone_version == "resnet":
+            self.backbone = ResNet101Backbone()
+            self.intermediate_layer_idx = None
         else:
             raise ValueError(
-                f"Unknown backbone version: {backbone_version}. Use 'dinov2' or 'dinov3'."
+                f"Unknown backbone version: {backbone_version}. Use 'dinov2', 'dinov3', or 'resnet'."
             )
+        self.feature_kind = getattr(self.backbone, "feature_kind", "token")
 
         self.head = DPTHead(
-            nclass, self.backbone.embed_dim, features, use_bn, out_channels=out_channels
+            nclass,
+            self.backbone.out_channels if self.feature_kind == "feature_map" else self.backbone.embed_dim,
+            features,
+            use_bn,
+            out_channels=out_channels,
+            feature_kind=self.feature_kind,
         )
 
         self.binomial = torch.distributions.binomial.Binomial(probs=0.5)
@@ -174,19 +196,51 @@ class DPT(nn.Module):
         for p in self.backbone.parameters():
             p.requires_grad = False
 
-    def forward(self, x, comp_drop=False, feature_perturb=None):
+    def _extract_features(self, x):
+        if self.feature_kind == "feature_map":
+            return self.backbone.forward_features(x), None, None
         patch_size = self.backbone.patch_size
-        batch_size = x.shape[0]
         patch_h, patch_w = x.shape[-2] // patch_size, x.shape[-1] // patch_size
-
         features = self.backbone.get_intermediate_layers(
             x, self.intermediate_layer_idx[self.encoder_size]
         )
+        return features, patch_h, patch_w
+
+    def _apply_feature_perturbation(self, features, patch_h, patch_w, batch_size, feature_perturb):
+        perturbed_features = []
+        for feature in features:
+            if feature.dim() == 4:
+                feat_map = feature
+            else:
+                feat_map = feature.permute(0, 2, 1).reshape(
+                    batch_size, feature.shape[-1], patch_h, patch_w
+                )
+            feat_map = apply_structured_feature_perturbation(
+                feat_map.float(), feature_perturb
+            )
+            if feature.dim() == 4:
+                perturbed_feature = feat_map.to(dtype=feature.dtype)
+            else:
+                perturbed_feature = feat_map.reshape(batch_size, feature.shape[-1], -1)
+                perturbed_feature = perturbed_feature.permute(0, 2, 1).to(
+                    dtype=feature.dtype
+                )
+            perturbed_features.append(perturbed_feature)
+        return tuple(perturbed_features)
+
+    def forward(self, x, comp_drop=False, feature_perturb=None):
+        batch_size = x.shape[0]
+        features, patch_h, patch_w = self._extract_features(x)
 
         if comp_drop:
-            bs, dim = features[0].shape[0], features[0].shape[-1]
-
-            dropout_mask1 = self.binomial.sample((bs // 2, dim)).cuda() * 2.0
+            if features[0].dim() == 4:
+                bs, dim = features[0].shape[0], features[0].shape[1]
+                dropout_mask1 = (
+                    self.binomial.sample((bs // 2, dim)).to(features[0].device).unsqueeze(-1).unsqueeze(-1) * 2.0
+                )
+            else:
+                bs, dim = features[0].shape[0], features[0].shape[-1]
+                dropout_mask1 = self.binomial.sample((bs // 2, dim)).to(features[0].device) * 2.0
             dropout_mask2 = 2.0 - dropout_mask1
             dropout_prob = 0.5
             num_kept = int(bs // 2 * (1 - dropout_prob))
@@ -196,45 +250,28 @@ class DPT(nn.Module):
 
             dropout_mask = torch.cat((dropout_mask1, dropout_mask2))
 
-            features = tuple(
-                feature * dropout_mask.unsqueeze(1).to(feature.device)
-                for feature in features
-            )
+            if features[0].dim() == 4:
+                features = tuple(feature * dropout_mask.to(feature.device) for feature in features)
+            else:
+                features = tuple(
+                    feature * dropout_mask.unsqueeze(1).to(feature.device)
+                    for feature in features
+                )
 
             out = self.head(features, patch_h, patch_w)
-
-            out = F.interpolate(
+            return F.interpolate(
                 out,
-                (patch_h * patch_size, patch_w * patch_size),
+                x.shape[-2:],
                 mode="bilinear",
                 align_corners=True,
             )
 
-            return out
-
         if feature_perturb is not None:
-            perturbed_features = []
-            for feature in features:
-                feat_map = feature.permute(0, 2, 1).reshape(
-                    batch_size, feature.shape[-1], patch_h, patch_w
-                )
-                feat_map = apply_structured_feature_perturbation(
-                    feat_map.float(), feature_perturb
-                )
-                perturbed_feature = feat_map.reshape(batch_size, feature.shape[-1], -1)
-                perturbed_feature = perturbed_feature.permute(0, 2, 1).to(
-                    dtype=feature.dtype
-                )
-                perturbed_features.append(perturbed_feature)
-
-            features = tuple(perturbed_features)
+            features = self._apply_feature_perturbation(
+                features, patch_h, patch_w, batch_size, feature_perturb
+            )
 
         out = self.head(features, patch_h, patch_w)
-        out = F.interpolate(
-            out,
-            (patch_h * patch_size, patch_w * patch_size),
-            mode="bilinear",
-            align_corners=True,
-        )
+        out = F.interpolate(out, x.shape[-2:], mode="bilinear", align_corners=True)
 
         return out

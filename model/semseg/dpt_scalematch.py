@@ -5,6 +5,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from model.backbone.dinov2 import DINOv2
 from model.backbone.dinov3 import DINOv3
+from model.backbone.resnet import ResNet101Backbone
 from model.backbone.dinov2_layers.drop_path import DropPath
 from model.util.blocks import FeatureFusionBlock, _make_scratch
 
@@ -109,22 +110,28 @@ class DPTHead(nn.Module):
         features=256,
         use_bn=False,
         out_channels=[256, 512, 1024, 1024],
+        feature_kind="token",
     ):
         super().__init__()
+        if isinstance(in_channels, int):
+            in_channels = [in_channels] * len(out_channels)
         self.projects = nn.ModuleList(
             [
-                nn.Conv2d(in_channels, out_channel, kernel_size=1, stride=1, padding=0)
-                for out_channel in out_channels
+                nn.Conv2d(in_ch, out_channel, kernel_size=1, stride=1, padding=0)
+                for in_ch, out_channel in zip(in_channels, out_channels)
             ]
         )
-        self.resize_layers = nn.ModuleList(
-            [
-                nn.ConvTranspose2d(out_channels[0], out_channels[0], kernel_size=4, stride=4, padding=0),
-                nn.ConvTranspose2d(out_channels[1], out_channels[1], kernel_size=2, stride=2, padding=0),
-                nn.Identity(),
-                nn.Conv2d(out_channels[3], out_channels[3], kernel_size=3, stride=2, padding=1),
-            ]
-        )
+        if feature_kind == "token":
+            self.resize_layers = nn.ModuleList(
+                [
+                    nn.ConvTranspose2d(out_channels[0], out_channels[0], kernel_size=4, stride=4, padding=0),
+                    nn.ConvTranspose2d(out_channels[1], out_channels[1], kernel_size=2, stride=2, padding=0),
+                    nn.Identity(),
+                    nn.Conv2d(out_channels[3], out_channels[3], kernel_size=3, stride=2, padding=1),
+                ]
+            )
+        else:
+            self.resize_layers = nn.ModuleList([nn.Identity() for _ in out_channels])
         self.scratch = _make_scratch(out_channels, features, groups=1, expand=False)
         self.scratch.stem_transpose = None
         self.scratch.refinenet1 = _make_fusion_block(features, use_bn)
@@ -140,7 +147,8 @@ class DPTHead(nn.Module):
     def forward(self, out_features, patch_h, patch_w, return_feats=False):
         out = []
         for i, x in enumerate(out_features):
-            x = x.permute(0, 2, 1).reshape((x.shape[0], x.shape[-1], patch_h, patch_w))
+            if x.dim() == 3:
+                x = x.permute(0, 2, 1).reshape((x.shape[0], x.shape[-1], patch_h, patch_w))
             x = self.projects[i](x)
             x = self.resize_layers[i](x)
             out.append(x)
@@ -196,13 +204,22 @@ class DPT_ScaleMatch(nn.Module):
         elif backbone_version == "dinov3":
             self.backbone = DINOv3(model_name=encoder_size)
             self.intermediate_layer_idx = self.intermediate_layer_idx_v3
+        elif backbone_version == "resnet":
+            self.backbone = ResNet101Backbone()
+            self.intermediate_layer_idx = None
         else:
             raise ValueError(
-                f"Unknown backbone version: {backbone_version}. Use 'dinov2' or 'dinov3'."
+                f"Unknown backbone version: {backbone_version}. Use 'dinov2', 'dinov3', or 'resnet'."
             )
+        self.feature_kind = getattr(self.backbone, "feature_kind", "token")
 
         self.head = DPTHead(
-            nclass, self.backbone.embed_dim, features, use_bn, out_channels=out_channels
+            nclass,
+            self.backbone.out_channels if self.feature_kind == "feature_map" else self.backbone.embed_dim,
+            features,
+            use_bn,
+            out_channels=out_channels,
+            feature_kind=self.feature_kind,
         )
 
         scale_in_ch = 2 * features
@@ -237,11 +254,15 @@ class DPT_ScaleMatch(nn.Module):
             p.requires_grad = False
 
     def _extract_features(self, x):
-        patch_size = self.backbone.patch_size
-        patch_h, patch_w = x.shape[-2] // patch_size, x.shape[-1] // patch_size
-        features = self.backbone.get_intermediate_layers(
-            x, self.intermediate_layer_idx[self.encoder_size]
-        )
+        if self.feature_kind == "feature_map":
+            patch_h = patch_w = None
+            features = self.backbone.forward_features(x)
+        else:
+            patch_size = self.backbone.patch_size
+            patch_h, patch_w = x.shape[-2] // patch_size, x.shape[-1] // patch_size
+            features = self.backbone.get_intermediate_layers(
+                x, self.intermediate_layer_idx[self.encoder_size]
+            )
         return features, patch_h, patch_w
 
     def _base_forward(self, x, need_fp=False, feature_scale=None):
@@ -285,6 +306,7 @@ class DPT_ScaleMatch(nn.Module):
         return logits.contiguous()
 
     def two_scale_forward(self, inputs, scale_factor, feature_scale):
+        resize_stride = getattr(self.backbone, "output_stride", getattr(self.backbone, "patch_size", 14))
         if scale_factor is None:
             base_forward_out = self._base_forward(
                 inputs, need_fp=self.training, feature_scale=feature_scale
@@ -299,7 +321,7 @@ class DPT_ScaleMatch(nn.Module):
         x_1x = inputs
         if scale_factor > 1.0:
             x_lo = x_1x
-            x_hi = resize_x(x_1x, scale_factor, patch_size=self.backbone.patch_size)
+            x_hi = resize_x(x_1x, scale_factor, patch_size=resize_stride)
             p_lo_ori, feats_lo, out_fp = self._base_forward(
                 x_lo, need_fp=True, feature_scale=feature_scale
             )
@@ -331,7 +353,7 @@ class DPT_ScaleMatch(nn.Module):
                 "pred_size": p_hi,
             }
 
-        x_lo = resize_x(x_1x, scale_factor, patch_size=self.backbone.patch_size)
+        x_lo = resize_x(x_1x, scale_factor, patch_size=resize_stride)
         x_hi = x_1x
         p_lo, feats_lo = self._base_forward(x_lo)
         p_hi, feats_hi, out_fp = self._base_forward(

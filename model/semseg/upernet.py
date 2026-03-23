@@ -9,6 +9,7 @@ import torch.nn.functional as F
 
 from model.backbone.dinov2 import DINOv2
 from model.backbone.dinov3 import DINOv3
+from model.backbone.resnet import ResNet101Backbone
 from model.semseg.feature_perturb import apply_structured_feature_perturbation
 
 
@@ -244,18 +245,24 @@ class UperNet(nn.Module):
         elif backbone_version == "dinov3":
             self.backbone = DINOv3(model_name=encoder_size)
             self.intermediate_layer_idx = self.intermediate_layer_idx_v3
+        elif backbone_version == "resnet":
+            self.backbone = ResNet101Backbone()
+            self.intermediate_layer_idx = None
         else:
             raise ValueError(
-                f"Unknown backbone version: {backbone_version}. Use 'dinov2' or 'dinov3'."
+                f"Unknown backbone version: {backbone_version}. Use 'dinov2', 'dinov3', or 'resnet'."
             )
+        self.feature_kind = getattr(self.backbone, "feature_kind", "token")
 
-        embed_dim = self.backbone.embed_dim
-
-        # Feature pyramid neck
-        self.neck = Feature2Pyramid(embed_dim=embed_dim)
+        if self.feature_kind == "token":
+            embed_dim = self.backbone.embed_dim
+            self.neck = Feature2Pyramid(embed_dim=embed_dim)
+            in_channels = [embed_dim] * 4
+        else:
+            self.neck = nn.Identity()
+            in_channels = list(self.backbone.out_channels)
 
         # UperNet decoder
-        in_channels = [embed_dim] * 4
         self.decoder = UPerNetDecoder(
             in_channels=in_channels,
             fpn_channels=fpn_channels,
@@ -287,20 +294,27 @@ class UperNet(nn.Module):
         Returns:
             Segmentation logits of shape (B, nclass, H, W)
         """
-        patch_size = self.backbone.patch_size
         B, C, H, W = x.shape
-        patch_h, patch_w = H // patch_size, W // patch_size
-
-        # Get intermediate layer features
-        features = self.backbone.get_intermediate_layers(
-            x, self.intermediate_layer_idx[self.encoder_size]
-        )
+        if self.feature_kind == "token":
+            patch_size = self.backbone.patch_size
+            patch_h, patch_w = H // patch_size, W // patch_size
+            features = self.backbone.get_intermediate_layers(
+                x, self.intermediate_layer_idx[self.encoder_size]
+            )
+        else:
+            patch_h = patch_w = None
+            features = self.backbone.forward_features(x)
 
         # Apply complementary dropout if enabled
         if comp_drop:
-            bs, dim = features[0].shape[0], features[0].shape[-1]
-
-            dropout_mask1 = self.binomial.sample((bs // 2, dim)).cuda() * 2.0
+            if features[0].dim() == 4:
+                bs, dim = features[0].shape[0], features[0].shape[1]
+                dropout_mask1 = (
+                    self.binomial.sample((bs // 2, dim)).to(features[0].device).unsqueeze(-1).unsqueeze(-1) * 2.0
+                )
+            else:
+                bs, dim = features[0].shape[0], features[0].shape[-1]
+                dropout_mask1 = self.binomial.sample((bs // 2, dim)).to(features[0].device) * 2.0
             dropout_mask2 = 2.0 - dropout_mask1
             dropout_prob = 0.5
             num_kept = int(bs // 2 * (1 - dropout_prob))
@@ -309,21 +323,23 @@ class UperNet(nn.Module):
             dropout_mask2[kept_indexes, :] = 1.0
 
             dropout_mask = torch.cat((dropout_mask1, dropout_mask2))
-            features = tuple(
-                feature * dropout_mask.unsqueeze(1).to(feature.device)
-                for feature in features
-            )
+            if features[0].dim() == 4:
+                features = tuple(feature * dropout_mask.to(feature.device) for feature in features)
+            else:
+                features = tuple(
+                    feature * dropout_mask.unsqueeze(1).to(feature.device)
+                    for feature in features
+                )
 
-        # Reshape features from (B, N, C) to (B, C, H, W)
         feat_maps = []
         for feat in features:
-            feat = feat.permute(0, 2, 1).reshape(B, -1, patch_h, patch_w)
+            if feat.dim() == 3:
+                feat = feat.permute(0, 2, 1).reshape(B, -1, patch_h, patch_w)
             feat = feat.float()
             if feature_perturb is not None:
                 feat = apply_structured_feature_perturbation(feat, feature_perturb)
             feat_maps.append(feat)
 
-        # Neck: build feature pyramid
         pyramid_feats = self.neck(tuple(feat_maps))
 
         # Decoder: get segmentation logits

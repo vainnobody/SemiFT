@@ -336,3 +336,51 @@ def test_compute_official_scalematch_total_loss_matches_official_weights():
 
     expected = torch.tensor((2.0 + 0.25 * 4.0 + 0.25 * 6.0 + 0.5 * 8.0) / 2.0)
     assert torch.isclose(total, expected)
+
+
+def test_select_pseudo_logits_from_student_out_uses_official_warmup_rule():
+    student_out = {
+        "pred_ori": torch.arange(24, dtype=torch.float32).reshape(4, 3, 2, 1),
+        "pred_joint": torch.arange(24, 48, dtype=torch.float32).reshape(4, 3, 2, 1),
+    }
+
+    warmup_logits = scalematch.select_pseudo_logits_from_student_out(
+        student_out, num_lb=1, epoch=0, warm_up=10
+    )
+    post_warmup_logits = scalematch.select_pseudo_logits_from_student_out(
+        student_out, num_lb=1, epoch=10, warm_up=10
+    )
+
+    assert torch.equal(warmup_logits, student_out["pred_ori"][1:])
+    assert torch.equal(post_warmup_logits, student_out["pred_joint"][1:])
+    assert warmup_logits.requires_grad is False
+    assert post_warmup_logits.requires_grad is False
+
+
+def test_min_epoch_repeat_factor_for_nonempty_loader_matches_ddp_requirement():
+    assert scalematch.min_epoch_repeat_factor_for_nonempty_loader(
+        base_num_ids=1, world_size=8, batch_size=4
+    ) == 32
+    assert scalematch.min_epoch_repeat_factor_for_nonempty_loader(
+        base_num_ids=12, world_size=8, batch_size=4
+    ) == 3
+    assert scalematch.min_epoch_repeat_factor_for_nonempty_loader(
+        base_num_ids=17, world_size=8, batch_size=4
+    ) == 2
+
+
+def test_build_loader_guard_message_surfaces_actionable_fix():
+    message = scalematch.build_loader_guard_message(
+        dataset_name="vaihingen",
+        split_name="train_u",
+        base_num_ids=12,
+        effective_num_ids=12,
+        loader_len=0,
+        world_size=8,
+        batch_size=4,
+        epoch_repeat_factor=1,
+    )
+
+    assert "loader has zero batches under DDP" in message
+    assert "reducing --nproc_per_node" in message
+    assert "increasing epoch_repeat_factor to at least 3" in message

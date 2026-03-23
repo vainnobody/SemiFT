@@ -33,11 +33,7 @@ class DPT_CorrMatch(DPT):
     def forward(self, x, need_fp=False, use_corr=False):
         dict_return = {}
 
-        patch_size = self.backbone.patch_size
-        patch_h, patch_w = x.shape[-2] // patch_size, x.shape[-1] // patch_size
-
-        intermediate_layers = self.intermediate_layer_idx[self.encoder_size]
-        features = self.backbone.get_intermediate_layers(x, intermediate_layers)
+        features, patch_h, patch_w = self._extract_features(x)
 
         # features is a list/tuple of tensors
 
@@ -60,7 +56,7 @@ class DPT_CorrMatch(DPT):
 
             out_expanded = F.interpolate(
                 out_expanded,
-                (patch_h * patch_size, patch_w * patch_size),
+                x.shape[-2:],
                 mode="bilinear",
                 align_corners=True,
             )
@@ -73,7 +69,7 @@ class DPT_CorrMatch(DPT):
             out = self.head(features, patch_h, patch_w)
             out = F.interpolate(
                 out,
-                (patch_h * patch_size, patch_w * patch_size),
+                x.shape[-2:],
                 mode="bilinear",
                 align_corners=True,
             )
@@ -82,9 +78,12 @@ class DPT_CorrMatch(DPT):
         if use_corr:
             # feat_deepest is in ViT token format: (B, N, C) where N = patch_h * patch_w
             # Reshape to CNN format: (B, C, H, W) for Conv2d
-            feat_deepest_reshaped = feat_deepest.permute(0, 2, 1).reshape(
-                feat_deepest.shape[0], feat_deepest.shape[-1], patch_h, patch_w
-            )
+            if feat_deepest.dim() == 4:
+                feat_deepest_reshaped = feat_deepest
+            else:
+                feat_deepest_reshaped = feat_deepest.permute(0, 2, 1).reshape(
+                    feat_deepest.shape[0], feat_deepest.shape[-1], patch_h, patch_w
+                )
             proj_feats = self.proj(feat_deepest_reshaped)
             corr_out_dict = self.corr(proj_feats, dict_return["out"])
 

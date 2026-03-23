@@ -20,7 +20,15 @@ from util.classes import CLASSES
 from util.ohem import ProbOhemCrossEntropy2d
 from util.utils import count_params, init_log, AverageMeter
 from util.dist_helper import setup_distributed
-from util.ssl_method_utils import get_local_rank, load_checkpoint_on_cpu, save_checkpoint_to_disk, log_cuda_memory
+from util.ssl_method_utils import (
+    get_local_rank,
+    load_checkpoint_on_cpu,
+    save_checkpoint_to_disk,
+    log_cuda_memory,
+    get_model_kwargs,
+    get_backbone_info,
+    load_backbone_checkpoint,
+)
 
 from util.viz import Visualizer
 
@@ -56,40 +64,15 @@ def main():
     cudnn.enabled = True
     cudnn.benchmark = True
 
-    model_configs = {
-        "small": {
-            "encoder_size": "small",
-            "features": 64,
-            "out_channels": [48, 96, 192, 384],
-        },
-        "base": {
-            "encoder_size": "base",
-            "features": 128,
-            "out_channels": [96, 192, 384, 768],
-        },
-        "large": {
-            "encoder_size": "large",
-            "features": 256,
-            "out_channels": [256, 512, 1024, 1024],
-        },
-        "giant": {
-            "encoder_size": "giant",
-            "features": 384,
-            "out_channels": [1536, 1536, 1536, 1536],
-        },
-    }
-
-    backbone_size = cfg["backbone"].split("_")[-1]
-    backbone_version = cfg["backbone"].split("_")[0]
-    # DINOv2 uses patch_size=14, DINOv3 uses patch_size=16
-    patch_size = 14 if backbone_version == "dinov2" else 16
+    model_kwargs = get_model_kwargs(cfg)
+    _, backbone_version = get_backbone_info(cfg)
     model = DPT(
-        **{**model_configs[backbone_size], "nclass": cfg["nclass"]},
+        **model_kwargs,
         backbone_version=backbone_version,
     )
 
-    state_dict = torch.load(f'./pretrained/{cfg["backbone"]}.pth', map_location="cpu", weights_only=False)
-    model.backbone.load_state_dict(state_dict)
+    load_backbone_checkpoint(model, cfg)
+    patch_size = getattr(model.backbone, "patch_size", getattr(model.backbone, "output_stride", 32))
 
     if cfg["lock_backbone"]:
         model.lock_backbone()

@@ -6,6 +6,7 @@ import torch.nn.functional as F
 
 from model.backbone.dinov2 import DINOv2
 from model.backbone.dinov3 import DINOv3
+from model.backbone.resnet import ResNet101Backbone
 from model.backbone.dinov2_layers.drop_path import DropPath
 from model.semseg.upernet import Feature2Pyramid, UPerNetDecoder
 
@@ -131,15 +132,24 @@ class UperNet_ScaleMatch(nn.Module):
         elif backbone_version == "dinov3":
             self.backbone = DINOv3(model_name=encoder_size)
             self.intermediate_layer_idx = self.intermediate_layer_idx_v3
+        elif backbone_version == "resnet":
+            self.backbone = ResNet101Backbone()
+            self.intermediate_layer_idx = None
         else:
             raise ValueError(
-                f"Unknown backbone version: {backbone_version}. Use 'dinov2' or 'dinov3'."
+                f"Unknown backbone version: {backbone_version}. Use 'dinov2', 'dinov3', or 'resnet'."
             )
+        self.feature_kind = getattr(self.backbone, "feature_kind", "token")
 
-        embed_dim = self.backbone.embed_dim
-        self.neck = Feature2Pyramid(embed_dim=embed_dim)
+        if self.feature_kind == "token":
+            embed_dim = self.backbone.embed_dim
+            self.neck = Feature2Pyramid(embed_dim=embed_dim)
+            in_channels = [embed_dim] * 4
+        else:
+            self.neck = nn.Identity()
+            in_channels = list(self.backbone.out_channels)
         self.decoder = UPerNetDecoder(
-            in_channels=[embed_dim] * 4,
+            in_channels=in_channels,
             fpn_channels=fpn_channels,
             num_classes=nclass,
         )
@@ -177,6 +187,9 @@ class UperNet_ScaleMatch(nn.Module):
             p.requires_grad = False
 
     def _extract_feature_maps(self, x):
+        if self.feature_kind == "feature_map":
+            feat_maps = [feat.float().contiguous() for feat in self.backbone.forward_features(x)]
+            return tuple(feat_maps)
         patch_size = self.backbone.patch_size
         batch_size, _, h, w = x.shape
         patch_h, patch_w = h // patch_size, w // patch_size
@@ -184,10 +197,7 @@ class UperNet_ScaleMatch(nn.Module):
             x, self.intermediate_layer_idx[self.encoder_size]
         )
         feat_maps = [
-            feat.permute(0, 2, 1)
-            .reshape(batch_size, -1, patch_h, patch_w)
-            .float()
-            .contiguous()
+            feat.permute(0, 2, 1).reshape(batch_size, -1, patch_h, patch_w).float().contiguous()
             for feat in features
         ]
         return tuple(feat_maps)
@@ -227,6 +237,7 @@ class UperNet_ScaleMatch(nn.Module):
         return logits.contiguous()
 
     def two_scale_forward(self, inputs, scale_factor, feature_scale):
+        resize_stride = getattr(self.backbone, "output_stride", getattr(self.backbone, "patch_size", 14))
         if scale_factor is None:
             base_forward_out = self._base_forward(
                 inputs, need_fp=self.training, feature_scale=feature_scale
@@ -241,7 +252,7 @@ class UperNet_ScaleMatch(nn.Module):
         x_1x = inputs
         if scale_factor > 1.0:
             x_lo = x_1x
-            x_hi = resize_x(x_1x, scale_factor, patch_size=self.backbone.patch_size)
+            x_hi = resize_x(x_1x, scale_factor, patch_size=resize_stride)
             p_lo_ori, feats_lo, out_fp = self._base_forward(
                 x_lo, need_fp=True, feature_scale=feature_scale
             )
@@ -279,7 +290,7 @@ class UperNet_ScaleMatch(nn.Module):
                 "pred_size": p_hi,
             }
 
-        x_lo = resize_x(x_1x, scale_factor, patch_size=self.backbone.patch_size)
+        x_lo = resize_x(x_1x, scale_factor, patch_size=resize_stride)
         x_hi = x_1x
         p_lo, feats_lo = self._base_forward(x_lo)
         p_hi, feats_hi, out_fp = self._base_forward(

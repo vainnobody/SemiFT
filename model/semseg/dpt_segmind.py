@@ -10,6 +10,7 @@ import torch.nn.functional as F
 
 from model.backbone.dinov2 import DINOv2
 from model.backbone.dinov3 import DINOv3
+from model.backbone.resnet import ResNet101Backbone
 from model.util.blocks import FeatureFusionBlock, _make_scratch
 
 
@@ -34,22 +35,28 @@ class DPTSegMindHead(nn.Module):
         use_bn=False,
         out_channels=[256, 512, 1024, 1024],
         proj_dim=256,
+        feature_kind="token",
     ):
         super().__init__()
+        if isinstance(in_channels, int):
+            in_channels = [in_channels] * len(out_channels)
         self.projects = nn.ModuleList(
             [
-                nn.Conv2d(in_channels, out_channel, kernel_size=1, stride=1, padding=0)
-                for out_channel in out_channels
+                nn.Conv2d(in_ch, out_channel, kernel_size=1, stride=1, padding=0)
+                for in_ch, out_channel in zip(in_channels, out_channels)
             ]
         )
-        self.resize_layers = nn.ModuleList(
-            [
-                nn.ConvTranspose2d(out_channels[0], out_channels[0], kernel_size=4, stride=4, padding=0),
-                nn.ConvTranspose2d(out_channels[1], out_channels[1], kernel_size=2, stride=2, padding=0),
-                nn.Identity(),
-                nn.Conv2d(out_channels[3], out_channels[3], kernel_size=3, stride=2, padding=1),
-            ]
-        )
+        if feature_kind == "token":
+            self.resize_layers = nn.ModuleList(
+                [
+                    nn.ConvTranspose2d(out_channels[0], out_channels[0], kernel_size=4, stride=4, padding=0),
+                    nn.ConvTranspose2d(out_channels[1], out_channels[1], kernel_size=2, stride=2, padding=0),
+                    nn.Identity(),
+                    nn.Conv2d(out_channels[3], out_channels[3], kernel_size=3, stride=2, padding=1),
+                ]
+            )
+        else:
+            self.resize_layers = nn.ModuleList([nn.Identity() for _ in out_channels])
         self.scratch = _make_scratch(out_channels, features, groups=1, expand=False)
         self.scratch.stem_transpose = None
         self.scratch.refinenet1 = _make_fusion_block(features, use_bn)
@@ -81,7 +88,8 @@ class DPTSegMindHead(nn.Module):
     def forward(self, out_features, patch_h, patch_w):
         out = []
         for i, x in enumerate(out_features):
-            x = x.permute(0, 2, 1).reshape((x.shape[0], x.shape[-1], patch_h, patch_w))
+            if x.dim() == 3:
+                x = x.permute(0, 2, 1).reshape((x.shape[0], x.shape[-1], patch_h, patch_w))
             x = self.projects[i](x)
             x = self.resize_layers[i](x)
             out.append(x)
@@ -137,16 +145,21 @@ class DPT_SegMind(nn.Module):
         elif backbone_version == "dinov3":
             self.backbone = DINOv3(model_name=encoder_size)
             self.intermediate_layer_idx = self.intermediate_layer_idx_v3
+        elif backbone_version == "resnet":
+            self.backbone = ResNet101Backbone()
+            self.intermediate_layer_idx = None
         else:
             raise ValueError(backbone_version)
+        self.feature_kind = getattr(self.backbone, "feature_kind", "token")
 
         self.head = DPTSegMindHead(
             nclass,
-            self.backbone.embed_dim,
+            self.backbone.out_channels if self.feature_kind == "feature_map" else self.backbone.embed_dim,
             features,
             use_bn,
             out_channels=out_channels,
             proj_dim=proj_dim,
+            feature_kind=self.feature_kind,
         )
 
     def lock_backbone(self):
@@ -154,11 +167,15 @@ class DPT_SegMind(nn.Module):
             p.requires_grad = False
 
     def forward(self, x, mode=None, return_aux=False, mask=None):
-        patch_size = self.backbone.patch_size
-        patch_h, patch_w = x.shape[-2] // patch_size, x.shape[-1] // patch_size
-        features = self.backbone.get_intermediate_layers(
-            x, self.intermediate_layer_idx[self.encoder_size]
-        )
+        if self.feature_kind == "feature_map":
+            patch_h = patch_w = None
+            features = self.backbone.forward_features(x)
+        else:
+            patch_size = self.backbone.patch_size
+            patch_h, patch_w = x.shape[-2] // patch_size, x.shape[-1] // patch_size
+            features = self.backbone.get_intermediate_layers(
+                x, self.intermediate_layer_idx[self.encoder_size]
+            )
         logits, proj_feat, recon = self.head(features, patch_h, patch_w)
         logits = F.interpolate(logits, size=x.shape[-2:], mode="bilinear", align_corners=True)
         proj_feat = F.interpolate(

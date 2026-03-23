@@ -40,21 +40,24 @@ class DPT_RankMatch(DPT):
                 out_fp: Feature-perturbed prediction [B, nclass, H, W]
                 feat: Intermediate feature [B, C, h, w]
         """
-        patch_size = self.backbone.patch_size
-        patch_h, patch_w = x.shape[-2] // patch_size, x.shape[-1] // patch_size
-
-        intermediate_layers = self.intermediate_layer_idx[self.encoder_size]
-        features = self.backbone.get_intermediate_layers(x, intermediate_layers)
+        features, patch_h, patch_w = self._extract_features(x)
 
         if need_fp:
             # Feature Perturbation: Dropout and Concatenate along batch dimension
             features_expanded = []
             for f in features:
                 # f is [B, N, C], Dropout2d expects [B, C, H, W]
-                B, N, C = f.shape
-                f_4d = f.permute(0, 2, 1).reshape(B, C, patch_h, patch_w)
+                if f.dim() == 4:
+                    B, C, _, _ = f.shape
+                    f_4d = f
+                else:
+                    B, N, C = f.shape
+                    f_4d = f.permute(0, 2, 1).reshape(B, C, patch_h, patch_w)
                 f_drop_4d = self.fp_dropout(f_4d)
-                f_drop = f_drop_4d.reshape(B, C, N).permute(0, 2, 1).contiguous()
+                if f.dim() == 4:
+                    f_drop = f_drop_4d
+                else:
+                    f_drop = f_drop_4d.reshape(B, C, N).permute(0, 2, 1).contiguous()
                 f_cat = torch.cat((f, f_drop), dim=0)  # [2B, N, C]
                 features_expanded.append(f_cat)
 
@@ -62,7 +65,7 @@ class DPT_RankMatch(DPT):
             out_expanded = self.head(features_expanded, patch_h, patch_w)
             out_expanded = F.interpolate(
                 out_expanded,
-                (patch_h * patch_size, patch_w * patch_size),
+                x.shape[-2:],
                 mode="bilinear",
                 align_corners=True,
             ).contiguous()
@@ -70,9 +73,11 @@ class DPT_RankMatch(DPT):
             out, out_fp = out_expanded.chunk(2, dim=0)
 
             # Get features for corr_loss (from the deepest backbone feature)
-            feat_deepest = features[-1]  # [B, N, C]
+            feat_deepest = features[-1]
             feat = (
-                feat_deepest.permute(0, 2, 1)
+                feat_deepest
+                if feat_deepest.dim() == 4
+                else feat_deepest.permute(0, 2, 1)
                 .reshape(
                     feat_deepest.shape[0], feat_deepest.shape[-1], patch_h, patch_w
                 )
@@ -85,15 +90,17 @@ class DPT_RankMatch(DPT):
             out = self.head(features, patch_h, patch_w)
             out = F.interpolate(
                 out,
-                (patch_h * patch_size, patch_w * patch_size),
+                x.shape[-2:],
                 mode="bilinear",
                 align_corners=True,
             ).contiguous()
 
             # Get features for corr_loss (from the deepest backbone feature)
-            feat_deepest = features[-1]  # [B, N, C]
+            feat_deepest = features[-1]
             feat = (
-                feat_deepest.permute(0, 2, 1)
+                feat_deepest
+                if feat_deepest.dim() == 4
+                else feat_deepest.permute(0, 2, 1)
                 .reshape(
                     feat_deepest.shape[0], feat_deepest.shape[-1], patch_h, patch_w
                 )
