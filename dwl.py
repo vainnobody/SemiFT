@@ -1,5 +1,4 @@
 import argparse
-from copy import deepcopy
 import logging
 import os
 import pprint
@@ -13,10 +12,10 @@ from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
 import yaml
 
-from dataset.semi_rs import SemiDataset
+from dataset.semi_dwl import SemiDataset
 from dataset.val import ValDataset
-from model.semseg.dpt import DPT
-from model.semseg.upernet import UperNet
+from model.semseg.dpt_dwl import DPT_DWL
+from model.semseg.upernet_dwl import UPerNet_DWL
 from util.classes import CLASSES
 from util.ohem import ProbOhemCrossEntropy2d
 from util.focal import FocalLoss
@@ -40,19 +39,37 @@ from util.dwl_utils import (
     downsample_for_memory,
 )
 
-from util.viz import Visualizer
-
 
 @torch.no_grad()
 def validation_cpu(cfg, model, valid_loader):
     return shared_validation_cpu(cfg, model, valid_loader)
 
 
-# ========================= DWL Hardcoded Parameters =========================
-MEMORY_N_BATCHES = 50  # Number of batches to keep in class memory
-MEMORY_DOWNSAMPLE_SIZE = 64  # Spatial size for downsampling before memory update
-ALPHA_HEAD_TRANSFER = 0.5  # Alpha for head parameter transfer (0 = no transfer)
-# =============================================================================
+def infinite_loader(loader):
+    while True:
+        for batch in loader:
+            yield batch
+
+
+def transfer_pseudo_head(model, alpha):
+    if alpha <= 0:
+        return
+
+    module = model.module if hasattr(model, "module") else model
+
+    if hasattr(module, "pseudo_head"):
+        target_module = module.head
+        source_module = module.pseudo_head
+    elif hasattr(module, "pseudo_classifier"):
+        target_module = module.decoder.classifier
+        source_module = module.pseudo_classifier
+    else:
+        raise AttributeError("DWL model is missing a pseudo prediction head")
+
+    for target_param, source_param in zip(
+        target_module.parameters(), source_module.parameters()
+    ):
+        target_param.data.mul_(1 - alpha).add_(source_param.data, alpha=alpha)
 
 
 def get_parser():
@@ -79,7 +96,6 @@ def main(args, cfg):
         logger.info("{}\n".format(pprint.pformat(all_args)))
 
         writer = SummaryWriter(args.save_path)
-
         os.makedirs(args.save_path, exist_ok=True)
 
     cudnn.enabled = True
@@ -89,15 +105,17 @@ def main(args, cfg):
     _, backbone_version = get_backbone_info(cfg)
 
     if cfg["model"] == "dpt":
-        model = DPT(
+        model = DPT_DWL(
             **model_kwargs,
             backbone_version=backbone_version,
         )
     elif cfg["model"] == "upernet":
-        model = UperNet(
+        model = UPerNet_DWL(
             **model_kwargs,
             backbone_version=backbone_version,
         )
+    else:
+        raise ValueError(f"Unsupported DWL model: {cfg['model']}")
 
     load_backbone_checkpoint(model, cfg)
 
@@ -132,7 +150,13 @@ def main(args, cfg):
     local_rank = get_local_rank()
     model = torch.nn.SyncBatchNorm.convert_sync_batchnorm(model)
     model.cuda(local_rank)
-    log_cuda_memory(logger, rank, "after_model_to_cuda", local_rank=local_rank, save_path=args.save_path)
+    log_cuda_memory(
+        logger,
+        rank,
+        "after_model_to_cuda",
+        local_rank=local_rank,
+        save_path=args.save_path,
+    )
 
     model = torch.nn.parallel.DistributedDataParallel(
         model,
@@ -141,12 +165,13 @@ def main(args, cfg):
         output_device=local_rank,
         find_unused_parameters=True,
     )
-    log_cuda_memory(logger, rank, "after_ddp_wrap", local_rank=local_rank, save_path=args.save_path)
-
-    model_ema = deepcopy(model)
-    model_ema.eval()
-    for param in model_ema.parameters():
-        param.requires_grad = False
+    log_cuda_memory(
+        logger,
+        rank,
+        "after_ddp_wrap",
+        local_rank=local_rank,
+        save_path=args.save_path,
+    )
 
     if cfg["criterion"]["name"] == "CELoss":
         criterion_l = nn.CrossEntropyLoss(**cfg["criterion"]["kwargs"]).cuda(local_rank)
@@ -177,7 +202,6 @@ def main(args, cfg):
         "train_l",
         cfg["crop_size"],
         args.labeled_id_path,
-        nsample=len(trainset_u.ids),
         ignore_index=cfg["ignore_index"],
     )
     valset = ValDataset(
@@ -214,12 +238,16 @@ def main(args, cfg):
         sampler=valsampler,
     )
 
+    dwl_cfg = cfg.get("dwl", {})
+    memory_n_batches = int(dwl_cfg.get("memory_n_batches", 50))
+    memory_downsample_size = int(dwl_cfg.get("memory_downsample_size", 64))
+    alpha_head_transfer = float(dwl_cfg.get("alpha", 1.0))
+
     total_iters = len(trainloader_u) * cfg["epochs"]
-    previous_best, previous_best_ema = 0.0, 0.0
-    best_epoch, best_epoch_ema = 0, 0
+    previous_best = 0.0
+    best_epoch = 0
     epoch = -1
 
-    # Initialize DWL class-wise memory banks
     cls_memory_u = init_cls_memory(
         cfg["nclass"], device=torch.device("cuda", local_rank)
     )
@@ -228,32 +256,22 @@ def main(args, cfg):
         log_cuda_memory(logger, rank, "before_resume_load", save_path=args.save_path)
         checkpoint = load_checkpoint_on_cpu(os.path.join(args.save_path, "latest.pth"))
         model.load_state_dict(checkpoint["model"])
-        model_ema.load_state_dict(checkpoint["model_ema"])
         optimizer.load_state_dict(checkpoint["optimizer"])
         log_cuda_memory(logger, rank, "after_resume_load", save_path=args.save_path)
         epoch = checkpoint["epoch"]
         previous_best = checkpoint["previous_best"]
-        previous_best_ema = checkpoint["previous_best_ema"]
         best_epoch = checkpoint["best_epoch"]
-        best_epoch_ema = checkpoint["best_epoch_ema"]
-        # Restore class memory if saved
         if "cls_memory_u" in checkpoint:
             cls_memory_u = checkpoint["cls_memory_u"]
 
         if rank == 0:
             logger.info("************ Load from checkpoint at epoch %i\n" % epoch)
 
-    from datetime import datetime
-
-    filename = datetime.now().strftime("%Y%m%d_%H%M%S")
-    viz = Visualizer(save_dir=f"./viz/{filename}", dataset=cfg["dataset"])
-
     for epoch in range(epoch + 1, cfg["epochs"]):
         if rank == 0:
             logger.info(
-                "===========> Epoch: {:}, Previous best: {:.2f} @epoch-{:}, "
-                "EMA: {:.2f} @epoch-{:}".format(
-                    epoch, previous_best, best_epoch, previous_best_ema, best_epoch_ema
+                "===========> Epoch: {:}, Previous best: {:.2f} @epoch-{:}".format(
+                    epoch, previous_best, best_epoch
                 )
             )
 
@@ -264,157 +282,80 @@ def main(args, cfg):
 
         trainloader_l.sampler.set_epoch(epoch)
         trainloader_u.sampler.set_epoch(epoch)
-
-        loader = zip(trainloader_l, trainloader_u)
+        labeled_loader = infinite_loader(trainloader_l)
+        log_interval = max(1, len(trainloader_u) // 8)
 
         model.train()
 
-        for i, (
-            (img_x, mask_x),
-            (img_u_w, img_u_s, _, ignore_mask, cutmix_box, _),
-        ) in enumerate(loader):
+        for i, (img_u_w, img_u_s, valid_mask, _) in enumerate(trainloader_u):
+            img_x, mask_x = next(labeled_loader)
 
             img_x, mask_x = img_x.cuda(), mask_x.cuda()
             img_u_w, img_u_s = img_u_w.cuda(), img_u_s.cuda()
-            ignore_mask, cutmix_box = ignore_mask.cuda(), cutmix_box.cuda()
+            valid_mask = valid_mask.cuda().bool()
 
             with torch.no_grad():
-                pred_u_w = model_ema(img_u_w).detach()
+                pred_u_w = model(img_u_w).detach()
                 prob_u_w = pred_u_w.softmax(dim=1)
-                conf_u_w = prob_u_w.max(dim=1)[0]
-                mask_u_w = pred_u_w.argmax(dim=1)
+                conf_u_w, mask_u_w = prob_u_w.max(dim=1)
 
-            # ===================== DWL: Update class memory and compute weights =====================
             iters = epoch * len(trainloader_u) + i
-
-            # Downsample for memory efficiency
             prob_uw_bar, pl_uw_bar = downsample_for_memory(
-                prob_u_w, mask_u_w, target_size=MEMORY_DOWNSAMPLE_SIZE
+                prob_u_w, mask_u_w, target_size=memory_downsample_size
             )
-
-            # Update class memory with pseudo-label predictions
             cls_memory_u = update_cls_memory(
-                cls_memory_u, prob_uw_bar.detach(), pl_uw_bar, MEMORY_N_BATCHES
+                cls_memory_u, prob_uw_bar.detach(), pl_uw_bar, memory_n_batches
             )
-
-            # Sample distribution bins and compute weights
             cls_bins_u = sample_cls_bins(cls_memory_u)
 
-            # Flatten confidence and pseudo-labels for weight computation
             conf_u_w_flat = (
                 F.interpolate(
                     conf_u_w.unsqueeze(1),
-                    size=(MEMORY_DOWNSAMPLE_SIZE, MEMORY_DOWNSAMPLE_SIZE),
+                    size=(memory_downsample_size, memory_downsample_size),
                     mode="nearest",
                 )
                 .squeeze(1)
                 .reshape(-1)
             )
-            pl_uw_flat = pl_uw_bar
-
-            # Compute distribution-aware weights
             wgt_u_flat = calc_wgt_bins(
-                cls_bins_u, conf_u_w_flat, pl_uw_flat, iters, total_iters
+                cls_bins_u, conf_u_w_flat, pl_uw_bar, iters, total_iters
             )
 
-            # Reshape weights back to spatial dimensions
-            b = img_u_w.shape[0]
-            wgt_u_spatial = wgt_u_flat.reshape(
-                b, MEMORY_DOWNSAMPLE_SIZE, MEMORY_DOWNSAMPLE_SIZE
-            )
+            batch_size = img_u_w.shape[0]
             wgt_u = F.interpolate(
-                wgt_u_spatial.unsqueeze(1),
-                size=(img_u_w.shape[2], img_u_w.shape[3]),
+                wgt_u_flat.reshape(
+                    batch_size, memory_downsample_size, memory_downsample_size
+                ).unsqueeze(1),
+                size=img_u_w.shape[2:],
                 mode="nearest",
             ).squeeze(1)
 
-            # Apply warmup: no unsupervised loss before memory is populated
-            if iters <= MEMORY_N_BATCHES:
-                wgt_u = wgt_u * 0.0
-            # ==========================================================================================
+            logit_l = model(img_x)
+            _, pseudo_pred_u_s = model(img_u_s, return_pseudo_pred=True)
 
-            # CutMix augmentation
-            img_u_s[cutmix_box.unsqueeze(1).expand(img_u_s.shape) == 1] = img_u_s.flip(
-                0
-            )[cutmix_box.unsqueeze(1).expand(img_u_s.shape) == 1]
-
-            num_lb, num_ulb = img_x.shape[0], img_u_s.shape[0]
-            pred_x, pred_u_s = model(torch.cat((img_x, img_u_s))).split(
-                [num_lb, num_ulb]
+            loss_x = criterion_l(logit_l, mask_x)
+            loss_u_map = criterion_u(pseudo_pred_u_s, mask_u_w)
+            loss_u_s = (loss_u_map * wgt_u * valid_mask.float()).sum() / valid_mask.sum().clamp(
+                min=1.0
             )
+            if iters <= memory_n_batches:
+                loss_u_s = loss_u_s * 0.0
 
-            mask_u_w_cutmixed, wgt_u_cutmixed, ignore_mask_cutmixed = (
-                mask_u_w.clone(),
-                wgt_u.clone(),
-                ignore_mask.clone(),
-            )
-
-            mask_u_w_cutmixed[cutmix_box == 1] = mask_u_w.flip(0)[cutmix_box == 1]
-            wgt_u_cutmixed[cutmix_box == 1] = wgt_u.flip(0)[cutmix_box == 1]
-            ignore_mask_cutmixed[cutmix_box == 1] = ignore_mask.flip(0)[cutmix_box == 1]
-
-            loss_x = criterion_l(pred_x, mask_x)
-
-            # DWL: Use distribution-aware weights instead of confidence threshold
-            loss_u_s = criterion_u(pred_u_s, mask_u_w_cutmixed)
-            loss_mask = ignore_mask_cutmixed != 255
-            # Clamp weights to [0, 1] for loss weighting (sigmoid output is in [-1, 1])
-            wgt_u_positive = (wgt_u_cutmixed + 1) / 2  # Map from [-1, 1] to [0, 1]
-            loss_u_s = (
-                loss_u_s * wgt_u_positive * loss_mask
-            ).sum() / loss_mask.sum().clamp(min=1.0)
-
-            loss = (loss_x + loss_u_s) / 2.0
-
-            torch.distributed.barrier()
+            loss = loss_x + loss_u_s
 
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
 
-            if i < 10:
-                viz.push(
-                    {
-                        "img_x": (img_x[0], Visualizer.TENSOR),
-                        "mask_x": (mask_x[0], Visualizer.SEGMENTATION),
-                        "pred_x": (pred_x.argmax(dim=1)[0], Visualizer.SEGMENTATION),
-                        "img_u_s": (img_u_s[0], Visualizer.TENSOR),
-                        "mask_u_w_cutmixed": (
-                            mask_u_w_cutmixed[0],
-                            Visualizer.SEGMENTATION,
-                        ),
-                        "pred_u_s": (
-                            pred_u_s.argmax(dim=1)[0],
-                            Visualizer.SEGMENTATION,
-                        ),
-                    }
-                )
-                viz.render(f"epoch_{epoch}_iter_{i}")
-                viz.reset()
-
             total_loss.update(loss.item())
             total_loss_x.update(loss_x.item())
             total_loss_s.update(loss_u_s.item())
-            # Track average weight instead of mask ratio
-            wgt_avg = (
-                wgt_u_positive[loss_mask].mean().item() if loss_mask.sum() > 0 else 0.0
-            )
+            wgt_avg = wgt_u[valid_mask].mean().item() if valid_mask.any() else 0.0
             total_wgt_ratio.update(wgt_avg)
 
             lr = cfg["lr"] * (1 - iters / total_iters) ** 0.9
             optimizer.param_groups[0]["lr"] = lr
             optimizer.param_groups[1]["lr"] = lr * cfg["lr_multi"]
-
-            ema_ratio = min(1 - 1 / (iters + 1), 0.996)
-
-            for param, param_ema in zip(model.parameters(), model_ema.parameters()):
-                param_ema.copy_(
-                    param_ema * ema_ratio + param.detach() * (1 - ema_ratio)
-                )
-            for buffer, buffer_ema in zip(model.buffers(), model_ema.buffers()):
-                buffer_ema.copy_(
-                    buffer_ema * ema_ratio + buffer.detach() * (1 - ema_ratio)
-                )
 
             if rank == 0:
                 writer.add_scalar("train/loss_all", loss.item(), iters)
@@ -422,10 +363,9 @@ def main(args, cfg):
                 writer.add_scalar("train/loss_s", loss_u_s.item(), iters)
                 writer.add_scalar("train/wgt_avg", wgt_avg, iters)
 
-            if (i % (len(trainloader_u) // 8) == 0) and (rank == 0):
+            if i % log_interval == 0 and rank == 0:
                 logger.info(
-                    "Iters: {:}, LR: {:.7f}, Total loss: {:.3f}, Loss x: {:.3f}, Loss s: {:.3f}, Wgt avg: "
-                    "{:.3f}".format(
+                    "Iters: {:}, LR: {:.7f}, Total loss: {:.3f}, Loss x: {:.3f}, Loss s: {:.3f}, Wgt avg: {:.3f}".format(
                         i,
                         optimizer.param_groups[0]["lr"],
                         total_loss.avg,
@@ -435,18 +375,6 @@ def main(args, cfg):
                     )
                 )
 
-        # ===================== DWL: Alpha-based head transfer (optional) =====================
-        if ALPHA_HEAD_TRANSFER > 0:
-            # Transfer EMA head parameters to main model head with alpha weighting
-            # This mimics RS-DWL's pseudo_classifier transfer mechanism
-            for param, param_ema in zip(
-                model.module.head.parameters(), model_ema.module.head.parameters()
-            ):
-                param.data = param_ema.data * ALPHA_HEAD_TRANSFER + param.data * (
-                    1 - ALPHA_HEAD_TRANSFER
-                )
-        # ======================================================================================
-
         val_cfg = dict(cfg)
         val_cfg.setdefault(
             "eval_mode", "slide_window" if cfg["dataset"] == "cityscapes" else "original"
@@ -455,57 +383,41 @@ def main(args, cfg):
         eval_mode = val_cfg["eval_mode"]
 
         mIoU, iou_class = validation_cpu(val_cfg, model, valloader)
-        mIoU_ema, iou_class_ema = validation_cpu(val_cfg, model_ema, valloader)
 
         if rank == 0:
             for cls_idx, iou in enumerate(iou_class):
                 logger.info(
-                    "***** Evaluation ***** >>>> Class [{:} {:}] IoU: {:.2f}, "
-                    "EMA: {:.2f}".format(
-                        cls_idx,
-                        CLASSES[cfg["dataset"]][cls_idx],
-                        iou,
-                        iou_class_ema[cls_idx],
+                    "***** Evaluation ***** >>>> Class [{:} {:}] IoU: {:.2f}".format(
+                        cls_idx, CLASSES[cfg["dataset"]][cls_idx], iou
                     )
                 )
             logger.info(
-                "***** Evaluation {} ***** >>>> MeanIoU: {:.2f}, EMA: {:.2f}\n".format(
-                    eval_mode, mIoU, mIoU_ema
+                "***** Evaluation {} ***** >>>> MeanIoU: {:.2f}\n".format(
+                    eval_mode, mIoU
                 )
             )
 
             writer.add_scalar("eval/mIoU", mIoU, epoch)
-            writer.add_scalar("eval/mIoU_ema", mIoU_ema, epoch)
             for i, iou in enumerate(iou_class):
                 writer.add_scalar(
                     "eval/%s_IoU" % (CLASSES[cfg["dataset"]][i]), iou, epoch
                 )
-                writer.add_scalar(
-                    "eval/%s_IoU_ema" % (CLASSES[cfg["dataset"]][i]),
-                    iou_class_ema[i],
-                    epoch,
-                )
 
-        is_best = mIoU >= previous_best
-
+        is_best = mIoU > previous_best
         previous_best = max(mIoU, previous_best)
-        previous_best_ema = max(mIoU_ema, previous_best_ema)
         if mIoU == previous_best:
             best_epoch = epoch
-        if mIoU_ema == previous_best_ema:
-            best_epoch_ema = epoch
+
+        transfer_pseudo_head(model, alpha_head_transfer)
 
         if rank == 0:
             checkpoint = {
                 "model": model.state_dict(),
-                "model_ema": model_ema.state_dict(),
                 "optimizer": optimizer.state_dict(),
                 "epoch": epoch,
                 "previous_best": previous_best,
-                "previous_best_ema": previous_best_ema,
                 "best_epoch": best_epoch,
-                "best_epoch_ema": best_epoch_ema,
-                "cls_memory_u": cls_memory_u,  # Save class memory for resume
+                "cls_memory_u": cls_memory_u,
             }
             save_checkpoint_to_disk(
                 checkpoint,
