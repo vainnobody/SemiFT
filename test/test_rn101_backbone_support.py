@@ -74,9 +74,27 @@ def test_parse_backbone_spec_supports_rn101_aliases():
         assert info["size"] == "resnet101"
 
 
-def test_rn101_requires_explicit_checkpoint_path():
+def test_rn101_uses_default_pretrained_checkpoint(monkeypatch):
     cfg = {"backbone": "resnet101", "nclass": 5}
-    with pytest.raises(ValueError, match="backbone_ckpt"):
+    monkeypatch.setattr(Path, "exists", lambda self: str(self).endswith("pretrained/resnet101.pth"))
+    assert ssl_utils.get_backbone_checkpoint_path(cfg).endswith(
+        "pretrained/resnet101.pth"
+    )
+
+
+def test_rn101_prefers_explicit_checkpoint_path():
+    cfg = {
+        "backbone": "resnet101",
+        "nclass": 5,
+        "backbone_ckpt": "/tmp/custom_resnet101.pth",
+    }
+    assert ssl_utils.get_backbone_checkpoint_path(cfg) == "/tmp/custom_resnet101.pth"
+
+
+def test_rn101_raises_when_no_checkpoint_is_available(monkeypatch):
+    cfg = {"backbone": "resnet101", "nclass": 5}
+    monkeypatch.setattr(Path, "exists", lambda self: False)
+    with pytest.raises(ValueError, match="pretrained/resnet101.pth"):
         ssl_utils.get_backbone_checkpoint_path(cfg)
 
 

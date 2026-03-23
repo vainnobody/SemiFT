@@ -103,11 +103,15 @@ def get_backbone_checkpoint_path(cfg):
     info = parse_backbone_spec(cfg["backbone"])
     if info["family"] == "resnet":
         ckpt = cfg.get("backbone_ckpt")
-        if not ckpt:
-            raise ValueError(
-                "RN-101 backbone requires 'backbone_ckpt' in config."
-            )
-        return ckpt
+        if ckpt:
+            return ckpt
+        default_ckpt = Path("./pretrained") / "resnet101.pth"
+        if default_ckpt.exists():
+            return str(default_ckpt)
+        raise ValueError(
+            "RN-101 backbone checkpoint not found. Set 'backbone_ckpt' in config "
+            "or place the weights at './pretrained/resnet101.pth'."
+        )
     return str(Path("./pretrained") / f"{normalize_backbone_name(cfg['backbone'])}.pth")
 
 
