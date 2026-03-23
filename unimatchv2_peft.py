@@ -13,7 +13,7 @@ import yaml
 
 from util.utils import count_params, init_log, AverageMeter
 from util.dist_helper import setup_distributed
-from util.ssl_method_utils import get_local_rank, load_checkpoint_on_cpu, save_checkpoint_to_disk, log_cuda_memory
+from util.ssl_method_utils import get_local_rank, load_checkpoint_on_cpu, save_checkpoint_to_disk, log_cuda_memory, load_backbone_checkpoint
 
 DEFAULT_PEFT_CFG: Dict[str, Any] = {
     "method": "semift",
@@ -62,6 +62,7 @@ DEFAULT_PEFT_CFG: Dict[str, Any] = {
 METHOD_DEFAULT_TARGETS: Dict[str, List[str]] = {
     "semift": ["mlp"],
     "semift_samoe": ["mlp"],
+    "samoev4": ["mlp"],
     "semift_scalegate": ["mlp"],
     "lora": ["qkv", "proj", "fc1", "fc2"],
     "ssf": ["patch_embed", "norm1", "norm2", "qkv", "proj", "fc1", "fc2"],
@@ -340,8 +341,7 @@ def build_model(cfg, peft_cfg):
     else:
         raise NotImplementedError(f"Unsupported model type: {cfg['model']}")
 
-    state_dict = torch.load(f'./pretrained/{cfg["backbone"]}.pth', map_location="cpu", weights_only=False)
-    model.backbone.load_state_dict(state_dict)
+    load_backbone_checkpoint(model, cfg)
 
     if peft_cfg.get("freeze_backbone", True):
         if hasattr(model, "lock_backbone"):

@@ -110,9 +110,9 @@ def patch_fake_backbones(monkeypatch):
     monkeypatch.setattr(upernet_scalematch, "DINOv2", FakeBackbone)
     monkeypatch.setattr(upernet_scalematch, "DINOv3", FakeBackbone)
     monkeypatch.setattr(
-        scalematch_peft.torch,
-        "load",
-        lambda *args, **kwargs: FakeBackbone().state_dict(),
+        scalematch_peft,
+        "load_backbone_checkpoint",
+        lambda *args, **kwargs: SimpleNamespace(missing_keys=[], unexpected_keys=[]),
     )
 
 

@@ -36,6 +36,7 @@ from scalematch import (
 from util.classes import CLASSES
 from util.dist_helper import setup_distributed
 from util.ssl_method_utils import get_local_rank, load_checkpoint_on_cpu, save_checkpoint_to_disk, log_cuda_memory, checkpoint_to_cpu
+from util.ssl_method_utils import load_backbone_checkpoint
 from util.focal import FocalLoss
 from util.ohem import ProbOhemCrossEntropy2d
 from util.train_utils import DictAverageMeter, confidence_weighted_loss
@@ -84,13 +85,12 @@ def get_parser():
 def build_model(cfg, peft_cfg, logger=None, rank=0):
     model, backbone_version = build_scalematch_model(cfg)
 
-    backbone_ckpt_path = f'./pretrained/{cfg["backbone"]}.pth'
+    backbone_ckpt_path = cfg.get("backbone_ckpt", f'./pretrained/{cfg["backbone"]}.pth')
     if logger is not None and rank == 0:
         logger.info(f"Backbone version: {backbone_version}")
         logger.info(f"Backbone checkpoint: {backbone_ckpt_path}")
 
-    state_dict = torch.load(backbone_ckpt_path, map_location="cpu")
-    load_result = model.backbone.load_state_dict(state_dict)
+    load_result = load_backbone_checkpoint(model, cfg)
     if logger is not None and rank == 0:
         logger.info(
             "Backbone load result | missing_keys=%d unexpected_keys=%d",

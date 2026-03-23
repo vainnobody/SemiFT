@@ -30,6 +30,7 @@ from model.semseg import dpt_unimatch as dpt_unimatch_mod
 from model.semseg import dpt_segmind as dpt_segmind_mod
 from model.semseg import upernet as upernet_mod
 from model.semseg import upernet_scalematch as upernet_scalematch_mod
+from model.backbone.resnet import ResNet101Backbone
 from util import ssl_method_utils as ssl_utils
 
 
@@ -96,6 +97,18 @@ def test_rn101_raises_when_no_checkpoint_is_available(monkeypatch):
     monkeypatch.setattr(Path, "exists", lambda self: False)
     with pytest.raises(ValueError, match="pretrained/resnet101.pth"):
         ssl_utils.get_backbone_checkpoint_path(cfg)
+
+
+def test_resnet_backbone_accepts_official_torchvision_fc_keys():
+    backbone = ResNet101Backbone()
+    state_dict = backbone.state_dict()
+    state_dict["fc.weight"] = torch.randn(1000, 2048)
+    state_dict["fc.bias"] = torch.randn(1000)
+
+    load_result = backbone.load_state_dict(state_dict, strict=False)
+
+    assert load_result.missing_keys == []
+    assert load_result.unexpected_keys == []
 
 
 def test_dpt_supports_resnet101_backbone():

@@ -140,7 +140,13 @@ def _unwrap_checkpoint_state_dict(state_dict):
             if k.startswith("module.backbone.")
         }
     if all(k.startswith("module.") for k in state_dict.keys()):
-        return {k[len("module.") :]: v for k, v in state_dict.items()}
+        state_dict = {k[len("module.") :]: v for k, v in state_dict.items()}
+
+    if "fc.weight" in state_dict or "fc.bias" in state_dict:
+        state_dict = {
+            k: v for k, v in state_dict.items() if k not in {"fc.weight", "fc.bias"}
+        }
+
     return state_dict
 
 

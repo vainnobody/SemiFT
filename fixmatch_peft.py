@@ -12,7 +12,7 @@ import yaml
 
 from util.utils import count_params, init_log, AverageMeter
 from util.dist_helper import setup_distributed
-from util.ssl_method_utils import get_local_rank, load_checkpoint_on_cpu, save_checkpoint_to_disk, log_cuda_memory
+from util.ssl_method_utils import get_local_rank, load_checkpoint_on_cpu, save_checkpoint_to_disk, log_cuda_memory, load_backbone_checkpoint
 from unimatchv2_peft import apply_peft, resolve_peft_cfg, show_trainable_parameters
 
 
@@ -93,8 +93,7 @@ def build_model(cfg, peft_cfg):
     else:
         raise NotImplementedError(f"Unsupported model type: {cfg['model']}")
 
-    state_dict = torch.load(f'./pretrained/{cfg["backbone"]}.pth', map_location="cpu", weights_only=False)
-    model.backbone.load_state_dict(state_dict)
+    load_backbone_checkpoint(model, cfg)
 
     if peft_cfg.get("freeze_backbone", True):
         if hasattr(model, "lock_backbone"):

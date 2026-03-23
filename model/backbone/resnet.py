@@ -27,6 +27,21 @@ class ResNet101Backbone(nn.Module):
         self.layer3 = model.layer3
         self.layer4 = model.layer4
 
+    def load_state_dict(self, state_dict, strict=True):
+        """Load torchvision-style ResNet-101 checkpoints.
+
+        Official torchvision checkpoints include classifier weights (`fc.*`) that are
+        not part of the backbone-only wrapper used by SemiFT. Accept and drop them so
+        callers can pass the raw torchvision state dict directly.
+        """
+        if isinstance(state_dict, dict):
+            state_dict = {
+                k: v
+                for k, v in state_dict.items()
+                if k not in {"fc.weight", "fc.bias"}
+            }
+        return super().load_state_dict(state_dict, strict=strict)
+
     def forward_features(self, x):
         x = self.conv1(x)
         x = self.bn1(x)
