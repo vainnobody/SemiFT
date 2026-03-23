@@ -271,6 +271,7 @@ class UperNet(nn.Module):
 
         # For comp_drop support (same as DPT)
         self.binomial = torch.distributions.binomial.Binomial(probs=0.5)
+        self.fp_dropout = nn.Dropout2d(0.5)
 
     @property
     def head(self):
@@ -282,7 +283,7 @@ class UperNet(nn.Module):
         for p in self.backbone.parameters():
             p.requires_grad = False
 
-    def forward(self, x, comp_drop=False, feature_perturb=None):
+    def forward(self, x, comp_drop=False, feature_perturb=None, need_fp=False):
         """
         Forward pass.
 
@@ -290,10 +291,16 @@ class UperNet(nn.Module):
             x: Input tensor of shape (B, 3, H, W)
             comp_drop: Whether to apply complementary dropout (same as DPT)
             feature_perturb: Optional structured perturbation config
+            need_fp: Whether to return an official-UniMatch style feature-perturbed
+                auxiliary prediction branch.
 
         Returns:
-            Segmentation logits of shape (B, nclass, H, W)
+            If need_fp=False: segmentation logits of shape (B, nclass, H, W)
+            If need_fp=True: tuple (out, out_fp), each of shape (B, nclass, H, W)
         """
+        if need_fp and comp_drop:
+            raise ValueError("UPerNet does not support need_fp=True together with comp_drop=True.")
+
         B, C, H, W = x.shape
         if self.feature_kind == "token":
             patch_size = self.backbone.patch_size
@@ -304,6 +311,32 @@ class UperNet(nn.Module):
         else:
             patch_h = patch_w = None
             features = self.backbone.forward_features(x)
+
+        if need_fp:
+            feat_maps = []
+            feat_maps_fp = []
+            for feat in features:
+                if feat.dim() == 3:
+                    feat = feat.permute(0, 2, 1).reshape(B, -1, patch_h, patch_w)
+                feat = feat.float()
+                feat_fp = self.fp_dropout(feat)
+                if feature_perturb is not None:
+                    feat = apply_structured_feature_perturbation(feat, feature_perturb)
+                    feat_fp = apply_structured_feature_perturbation(
+                        feat_fp, feature_perturb
+                    )
+                feat_maps.append(feat)
+                feat_maps_fp.append(feat_fp)
+
+            pyramid_feats = self.neck(tuple(torch.cat((feat, feat_fp), dim=0) for feat, feat_fp in zip(feat_maps, feat_maps_fp)))
+            logits = self.decoder(pyramid_feats)
+            out = F.interpolate(
+                logits,
+                size=(H, W),
+                mode="bilinear",
+                align_corners=False,
+            )
+            return out.chunk(2, dim=0)
 
         # Apply complementary dropout if enabled
         if comp_drop:

@@ -136,6 +136,19 @@ def test_upernet_supports_resnet101_backbone():
     assert y.shape == (2, 4, 128, 128)
 
 
+def test_upernet_supports_resnet101_need_fp():
+    model = upernet_mod.UperNet(
+        encoder_size="resnet101",
+        nclass=4,
+        fpn_channels=64,
+        backbone_version="resnet",
+    )
+    x = torch.randn(2, 3, 128, 128)
+    y, y_fp = model(x, need_fp=True)
+    assert y.shape == (2, 4, 128, 128)
+    assert y_fp.shape == (2, 4, 128, 128)
+
+
 def test_dpt_unimatch_supports_resnet101_need_fp():
     model = dpt_unimatch_mod.DPT_UniMatch(
         encoder_size="resnet101",

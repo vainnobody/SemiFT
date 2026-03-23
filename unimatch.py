@@ -274,8 +274,8 @@ def main(args, cfg):
 
             num_lb, num_ulb = img_x.shape[0], img_u_w.shape[0]
 
-            # Forward pass for labeled and weak unlabeled data (with feature perturbation)
-            preds, preds_fp = model(torch.cat((img_x, img_u_w)), True)
+            # Forward pass for labeled and weak unlabeled data (with official UniMatch feature perturbation)
+            preds, preds_fp = model(torch.cat((img_x, img_u_w)), need_fp=True)
             pred_x, pred_u_w = preds.split([num_lb, num_ulb])
             pred_u_w_fp = preds_fp[num_lb:]
 
