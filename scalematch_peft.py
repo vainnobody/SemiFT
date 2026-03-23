@@ -20,30 +20,32 @@ from dataset.val import ValDataset
 from fixmatch_peft import apply_peft, resolve_peft_cfg, show_trainable_parameters
 from scalematch import (
     REMOTE_SENSING_DATASETS,
-    ScaleMatchRemoteSemiDataset,
     build_scalematch_model,
+    build_same_batch_cutmix_targets,
     collect_debug_metrics,
     compute_official_scalematch_total_loss,
     enable_ddp_static_graph,
+    flip_batch,
     get_debug_cfg,
     get_scalematch_dataset_cls,
     get_scalematch_recipe,
     grad_norm,
+    select_pseudo_logits_from_student_out,
     write_class_ratios,
 )
-from supervised import evaluate
 from util.classes import CLASSES
 from util.dist_helper import setup_distributed
 from util.ssl_method_utils import get_local_rank, load_checkpoint_on_cpu, save_checkpoint_to_disk, log_cuda_memory, checkpoint_to_cpu
 from util.focal import FocalLoss
 from util.ohem import ProbOhemCrossEntropy2d
-from util.train_utils import (
-    DictAverageMeter,
-    confidence_weighted_loss,
-    cutmix_img_,
-    cutmix_mask,
-)
+from util.train_utils import DictAverageMeter, confidence_weighted_loss
 from util.utils import count_params, init_log
+
+try:
+    from supervised import evaluate
+except ImportError:  # pragma: no cover - test stubs may only expose validation_cpu
+    def evaluate(*args, **kwargs):
+        raise ImportError("supervised.evaluate is unavailable in the current environment")
 
 
 def get_parser():
@@ -228,17 +230,16 @@ def main(args, cfg):
     criterion_u = nn.CrossEntropyLoss(reduction="none").cuda(local_rank)
 
     SemiDataset, dataset_loader_name = get_scalematch_dataset_cls(cfg["dataset"])
-    epoch_repeat_factor = cfg.get("epoch_repeat_factor", 1)
     if rank == 0:
         logger.info(
             f"ScaleMatch dataset loader: {dataset_loader_name} for {cfg['dataset']}"
         )
-        if cfg["dataset"] in REMOTE_SENSING_DATASETS:
-            logger.info(f"ScaleMatch epoch_repeat_factor={epoch_repeat_factor}")
-
-    dataset_kwargs = {}
-    if SemiDataset is ScaleMatchRemoteSemiDataset:
-        dataset_kwargs["epoch_repeat_factor"] = epoch_repeat_factor
+        if "epoch_repeat_factor" in cfg:
+            logger.warning(
+                "ScaleMatch PEFT ignores deprecated config key epoch_repeat_factor=%s; "
+                "the loader length now follows the base dataset semantics.",
+                cfg["epoch_repeat_factor"],
+            )
     trainset_u = SemiDataset(
         cfg["dataset"],
         cfg["data_root"],
@@ -246,7 +247,6 @@ def main(args, cfg):
         cfg["crop_size"],
         args.unlabeled_id_path,
         ignore_index=ignore_index,
-        **dataset_kwargs,
     )
     trainset_l = SemiDataset(
         cfg["dataset"],
@@ -256,7 +256,6 @@ def main(args, cfg):
         args.labeled_id_path,
         nsample=len(trainset_u.ids),
         ignore_index=ignore_index,
-        **dataset_kwargs,
     )
     valset = ValDataset(
         cfg["dataset"],
@@ -344,7 +343,7 @@ def main(args, cfg):
         trainloader_l.sampler.set_epoch(epoch)
         trainloader_u.sampler.set_epoch(epoch)
 
-        loader = zip(trainloader_l, trainloader_u, trainloader_u)
+        loader = zip(trainloader_l, trainloader_u)
         model.train()
 
         log_interval = max(len(trainloader_u) // 8, 1)
@@ -352,7 +351,6 @@ def main(args, cfg):
         for i, (
             (img_x, mask_x),
             (img_u_w, img_u_s1, _, ignore_mask, cutmix_box1, _),
-            (img_u_w_mix, img_u_s1_mix, _, ignore_mask_mix, _, _),
         ) in enumerate(loader):
             random_scale = random.choice(img_scales)
             feature_scale = random.choice(
@@ -363,17 +361,13 @@ def main(args, cfg):
             img_u_w = img_u_w.cuda()
             img_u_s1, ignore_mask = img_u_s1.cuda(), ignore_mask.cuda()
             cutmix_box1 = cutmix_box1.cuda()
-            img_u_w_mix = img_u_w_mix.cuda()
-            img_u_s1_mix = img_u_s1_mix.cuda()
-            ignore_mask_mix = ignore_mask_mix.cuda()
 
             iters = epoch * len(trainloader_u) + i
-            cutmix_img_(img_u_s1, img_u_s1_mix, cutmix_box1)
 
             model.eval()
             with torch.no_grad():
                 with torch.cuda.amp.autocast(enabled=amp):
-                    pred_u_w_mix = model_noddp(img_u_w_mix, scale_factor=None)
+                    pred_u_w_mix = model_noddp(img_u_w, scale_factor=None)
                     if isinstance(pred_u_w_mix, dict):
                         pred_u_w_mix = pred_u_w_mix["pred_ori"]
                     conf_u_w_mix, mask_u_w_mix = pred_u_w_mix.softmax(dim=1).max(dim=1)
@@ -383,19 +377,29 @@ def main(args, cfg):
                         scale_factor=random_scale,
                         feature_scale=feature_scale,
                     )
-                    pred_u_w = (
-                        teacher_out["pred_ori"]
-                        if epoch < warm_up
-                        else teacher_out["pred_joint"]
+                    pred_u_w = select_pseudo_logits_from_student_out(
+                        {
+                            "pred_ori": teacher_out["pred_ori"],
+                            "pred_joint": teacher_out["pred_joint"],
+                        },
+                        num_lb=0,
+                        epoch=epoch,
+                        warm_up=warm_up,
                     )
                     conf_u_w, mask_u_w = pred_u_w.detach().softmax(dim=1).max(dim=1)
             model.train()
             optimizer.zero_grad()
 
-            mask_u_w_cutmixed1 = cutmix_mask(mask_u_w, mask_u_w_mix, cutmix_box1)
-            conf_u_w_cutmixed1 = cutmix_mask(conf_u_w, conf_u_w_mix, cutmix_box1)
-            ignore_mask_cutmixed1 = cutmix_mask(
-                ignore_mask, ignore_mask_mix, cutmix_box1
+            mask_u_w_cutmixed1, conf_u_w_cutmixed1, ignore_mask_cutmixed1 = (
+                build_same_batch_cutmix_targets(
+                    img_u_s=img_u_s1,
+                    cutmix_box=cutmix_box1,
+                    pseudo_mask=mask_u_w,
+                    pseudo_conf=conf_u_w,
+                    ignore_mask=ignore_mask,
+                    pseudo_mask_mix=mask_u_w_mix,
+                    pseudo_conf_mix=conf_u_w_mix,
+                )
             )
 
             with torch.cuda.amp.autocast(enabled=amp):

@@ -7,7 +7,6 @@ Ported from the official ScaleMatch training logic onto the SemiFT framework.
 import argparse
 from datetime import datetime
 import logging
-import math
 import os
 import pprint
 import random
@@ -131,12 +130,6 @@ def select_pseudo_logits_from_student_out(student_out, num_lb, epoch, warm_up):
     return student_out[key][num_lb:].detach()
 
 
-def min_epoch_repeat_factor_for_nonempty_loader(base_num_ids, world_size, batch_size):
-    if base_num_ids <= 0:
-        raise ValueError("base_num_ids must be positive.")
-    return max(1, math.ceil((world_size * batch_size) / base_num_ids))
-
-
 def build_loader_guard_message(
     dataset_name,
     split_name,
@@ -145,20 +138,13 @@ def build_loader_guard_message(
     loader_len,
     world_size,
     batch_size,
-    epoch_repeat_factor,
 ):
-    recommended_repeat = min_epoch_repeat_factor_for_nonempty_loader(
-        base_num_ids=base_num_ids,
-        world_size=world_size,
-        batch_size=batch_size,
-    )
     return (
         f"ScaleMatch {dataset_name} {split_name} loader has zero batches under DDP: "
         f"base_num_ids={base_num_ids}, effective_num_ids={effective_num_ids}, "
-        f"world_size={world_size}, batch_size={batch_size}, loader_len={loader_len}, "
-        f"epoch_repeat_factor={epoch_repeat_factor}. "
-        f"Try reducing --nproc_per_node or batch_size, or increasing "
-        f"epoch_repeat_factor to at least {recommended_repeat}."
+        f"world_size={world_size}, batch_size={batch_size}, loader_len={loader_len}. "
+        "Check that the split file is non-empty and try reducing --nproc_per_node "
+        "or batch_size."
     )
 
 
@@ -242,22 +228,11 @@ def collect_debug_metrics(
     }
 
 
-class ScaleMatchRemoteSemiDataset(RemoteSemiDataset):
-    """Remote-sensing dataset wrapper with configurable epoch repeat factor."""
-
-    def __init__(self, *args, epoch_repeat_factor=1, **kwargs):
-        super().__init__(*args, **kwargs)
-        self.epoch_repeat_factor = max(int(epoch_repeat_factor), 1)
-
-    def __len__(self):
-        return len(self.ids) * self.epoch_repeat_factor
-
-
 def get_scalematch_dataset_cls(dataset_name):
     if dataset_name in NATURAL_IMAGE_DATASETS:
         return NaturalSemiDataset, "semi"
     if dataset_name in REMOTE_SENSING_DATASETS:
-        return ScaleMatchRemoteSemiDataset, "semi_rs"
+        return RemoteSemiDataset, "semi_rs"
     raise ValueError(
         f"Unsupported dataset for scalematch: {dataset_name}. "
         f"Please register it in NATURAL_IMAGE_DATASETS or REMOTE_SENSING_DATASETS."
@@ -282,6 +257,38 @@ def get_scalematch_recipe(cfg):
         ),
         "warm_up": cfg.get("warm_up", OFFICIAL_WARM_UP),
     }
+
+
+def flip_batch(x):
+    return x.flip(0)
+
+
+def build_same_batch_cutmix_targets(
+    img_u_s,
+    cutmix_box,
+    pseudo_mask,
+    pseudo_conf,
+    ignore_mask,
+    pseudo_mask_mix=None,
+    pseudo_conf_mix=None,
+    ignore_mask_mix=None,
+):
+    img_u_s_mix = flip_batch(img_u_s)
+    pseudo_mask_mix = flip_batch(
+        pseudo_mask if pseudo_mask_mix is None else pseudo_mask_mix
+    )
+    pseudo_conf_mix = flip_batch(
+        pseudo_conf if pseudo_conf_mix is None else pseudo_conf_mix
+    )
+    ignore_mask_mix = flip_batch(
+        ignore_mask if ignore_mask_mix is None else ignore_mask_mix
+    )
+
+    cutmix_img_(img_u_s, img_u_s_mix, cutmix_box)
+    pseudo_mask_cutmixed = cutmix_mask(pseudo_mask, pseudo_mask_mix, cutmix_box)
+    pseudo_conf_cutmixed = cutmix_mask(pseudo_conf, pseudo_conf_mix, cutmix_box)
+    ignore_mask_cutmixed = cutmix_mask(ignore_mask, ignore_mask_mix, cutmix_box)
+    return pseudo_mask_cutmixed, pseudo_conf_cutmixed, ignore_mask_cutmixed
 
 
 def build_scalematch_model(cfg):
@@ -439,17 +446,16 @@ def main(args, cfg):
     criterion_u = nn.CrossEntropyLoss(reduction="none").cuda(local_rank)
 
     SemiDataset, dataset_loader_name = get_scalematch_dataset_cls(cfg["dataset"])
-    epoch_repeat_factor = cfg.get("epoch_repeat_factor", 1)
     if rank == 0:
         logger.info(
             "ScaleMatch dataset loader: %s for %s", dataset_loader_name, cfg["dataset"]
         )
-        if cfg["dataset"] in REMOTE_SENSING_DATASETS:
-            logger.info("ScaleMatch epoch_repeat_factor=%s", epoch_repeat_factor)
-
-    dataset_kwargs = {}
-    if SemiDataset is ScaleMatchRemoteSemiDataset:
-        dataset_kwargs["epoch_repeat_factor"] = epoch_repeat_factor
+        if "epoch_repeat_factor" in cfg:
+            logger.warning(
+                "ScaleMatch ignores deprecated config key epoch_repeat_factor=%s; "
+                "the loader length now follows the base dataset semantics.",
+                cfg["epoch_repeat_factor"],
+            )
 
     trainset_u = SemiDataset(
         cfg["dataset"],
@@ -458,7 +464,6 @@ def main(args, cfg):
         cfg["crop_size"],
         args.unlabeled_id_path,
         ignore_index=ignore_index,
-        **dataset_kwargs,
     )
     trainset_l = SemiDataset(
         cfg["dataset"],
@@ -468,7 +473,6 @@ def main(args, cfg):
         args.labeled_id_path,
         nsample=len(trainset_u.ids),
         ignore_index=ignore_index,
-        **dataset_kwargs,
     )
     val_cfg = dict(cfg)
     val_cfg.setdefault("eval_mode", get_eval_mode(cfg))
@@ -521,7 +525,6 @@ def main(args, cfg):
                     loader_len=len(loader),
                     world_size=world_size,
                     batch_size=cfg["batch_size"],
-                    epoch_repeat_factor=epoch_repeat_factor,
                 )
             )
 
@@ -572,14 +575,13 @@ def main(args, cfg):
         trainloader_l.sampler.set_epoch(epoch)
         trainloader_u.sampler.set_epoch(epoch)
 
-        loader = zip(trainloader_l, trainloader_u, trainloader_u)
+        loader = zip(trainloader_l, trainloader_u)
         model.train()
         log_interval = max(len(trainloader_u) // 8, 1)
 
         for i, (
             (img_x, mask_x),
             (img_u_w, img_u_s1, _, ignore_mask, cutmix_box1, _),
-            (img_u_w_mix, img_u_s1_mix, _, ignore_mask_mix, _, _),
         ) in enumerate(loader):
             iter_start = time.time()
 
@@ -592,12 +594,8 @@ def main(args, cfg):
             img_u_w = img_u_w.cuda()
             img_u_s1, ignore_mask = img_u_s1.cuda(), ignore_mask.cuda()
             cutmix_box1 = cutmix_box1.cuda()
-            img_u_w_mix = img_u_w_mix.cuda()
-            img_u_s1_mix = img_u_s1_mix.cuda()
-            ignore_mask_mix = ignore_mask_mix.cuda()
 
             iters = epoch * len(trainloader_u) + i
-            cutmix_img_(img_u_s1, img_u_s1_mix, cutmix_box1)
 
             optimizer.zero_grad()
             with torch.cuda.amp.autocast(enabled=amp):
@@ -615,22 +613,31 @@ def main(args, cfg):
                 )
                 conf_u_w, mask_u_w = pred_u_w.softmax(dim=1).max(dim=1)
 
-                pred_u_w_mix = model(img_u_w_mix, scale_factor=None)
-                if isinstance(pred_u_w_mix, dict):
-                    pred_u_w_mix = pred_u_w_mix["pred_ori"]
-                conf_u_w_mix, mask_u_w_mix = pred_u_w_mix.detach().softmax(dim=1).max(
-                    dim=1
+                with torch.no_grad():
+                    pred_u_w_mix = model(img_u_w, scale_factor=None)
+                    if isinstance(pred_u_w_mix, dict):
+                        pred_u_w_mix = pred_u_w_mix["pred_ori"]
+                    conf_u_w_mix, mask_u_w_mix = pred_u_w_mix.detach().softmax(dim=1).max(
+                        dim=1
+                    )
+
+                (
+                    mask_u_w_cutmixed1,
+                    conf_u_w_cutmixed1,
+                    ignore_mask_cutmixed1,
+                ) = build_same_batch_cutmix_targets(
+                    img_u_s=img_u_s1,
+                    cutmix_box=cutmix_box1,
+                    pseudo_mask=mask_u_w,
+                    pseudo_conf=conf_u_w,
+                    ignore_mask=ignore_mask,
+                    pseudo_mask_mix=mask_u_w_mix,
+                    pseudo_conf_mix=conf_u_w_mix,
                 )
 
                 pred_u_s = model(img_u_s1, scale_factor=None)
                 if isinstance(pred_u_s, dict):
                     pred_u_s = pred_u_s["pred_ori"]
-
-                mask_u_w_cutmixed1 = cutmix_mask(mask_u_w, mask_u_w_mix, cutmix_box1)
-                conf_u_w_cutmixed1 = cutmix_mask(conf_u_w, conf_u_w_mix, cutmix_box1)
-                ignore_mask_cutmixed1 = cutmix_mask(
-                    ignore_mask, ignore_mask_mix, cutmix_box1
-                )
 
                 loss_u_s1 = criterion_u(pred_u_s, mask_u_w_cutmixed1)
                 loss_u_s1 = confidence_weighted_loss(

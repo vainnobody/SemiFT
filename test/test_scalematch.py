@@ -35,6 +35,8 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 import scalematch
+from dataset.semi import SemiDataset as NaturalSemiDataset
+from dataset.semi_rs import SemiDataset as RemoteSemiDataset
 from model.semseg import dpt_scalematch
 from model.semseg import upernet_scalematch
 
@@ -96,13 +98,27 @@ def test_scalematch_recipe_uses_cityscapes_defaults():
     assert recipe["warm_up"] == 10
 
 
-def test_scalematch_remote_dataset_repeat_factor_len():
-    dataset = scalematch.ScaleMatchRemoteSemiDataset.__new__(
-        scalematch.ScaleMatchRemoteSemiDataset
-    )
+@pytest.mark.parametrize(
+    ("dataset_name", "expected_cls"),
+    [
+        ("pascal", NaturalSemiDataset),
+        ("cityscapes", NaturalSemiDataset),
+        ("vaihingen", RemoteSemiDataset),
+        ("potsdam", RemoteSemiDataset),
+        ("iSAID", RemoteSemiDataset),
+    ],
+)
+def test_get_scalematch_dataset_cls_matches_base_dataset_semantics(
+    dataset_name, expected_cls
+):
+    dataset_cls, _ = scalematch.get_scalematch_dataset_cls(dataset_name)
+    assert dataset_cls is expected_cls
+
+
+def test_remote_dataset_keeps_base_length_multiplier():
+    dataset = RemoteSemiDataset.__new__(RemoteSemiDataset)
     dataset.ids = ["a", "b", "c"]
-    dataset.epoch_repeat_factor = 4
-    assert len(dataset) == 12
+    assert len(dataset) == 150
 
 
 def test_build_scalematch_model_rejects_non_dpt():
@@ -357,18 +373,6 @@ def test_select_pseudo_logits_from_student_out_uses_official_warmup_rule():
     assert post_warmup_logits.requires_grad is False
 
 
-def test_min_epoch_repeat_factor_for_nonempty_loader_matches_ddp_requirement():
-    assert scalematch.min_epoch_repeat_factor_for_nonempty_loader(
-        base_num_ids=1, world_size=8, batch_size=4
-    ) == 32
-    assert scalematch.min_epoch_repeat_factor_for_nonempty_loader(
-        base_num_ids=12, world_size=8, batch_size=4
-    ) == 3
-    assert scalematch.min_epoch_repeat_factor_for_nonempty_loader(
-        base_num_ids=17, world_size=8, batch_size=4
-    ) == 2
-
-
 def test_build_loader_guard_message_surfaces_actionable_fix():
     message = scalematch.build_loader_guard_message(
         dataset_name="vaihingen",
@@ -378,9 +382,96 @@ def test_build_loader_guard_message_surfaces_actionable_fix():
         loader_len=0,
         world_size=8,
         batch_size=4,
-        epoch_repeat_factor=1,
     )
 
     assert "loader has zero batches under DDP" in message
+    assert "Check that the split file is non-empty" in message
     assert "reducing --nproc_per_node" in message
-    assert "increasing epoch_repeat_factor to at least 3" in message
+    assert "epoch_repeat_factor" not in message
+
+
+def test_build_same_batch_cutmix_targets_uses_flip_mix_partner():
+    img_u_s = torch.arange(2 * 1 * 2 * 2, dtype=torch.float32).reshape(2, 1, 2, 2)
+    cutmix_box = torch.tensor(
+        [
+            [[1, 0], [0, 1]],
+            [[0, 1], [1, 0]],
+        ]
+    )
+    pseudo_mask = torch.tensor(
+        [
+            [[0, 0], [0, 0]],
+            [[1, 1], [1, 1]],
+        ]
+    )
+    pseudo_conf = torch.tensor(
+        [
+            [[0.9, 0.8], [0.7, 0.6]],
+            [[0.1, 0.2], [0.3, 0.4]],
+        ]
+    )
+    ignore_mask = torch.tensor(
+        [
+            [[0, 0], [0, 255]],
+            [[255, 0], [0, 0]],
+        ]
+    )
+    pseudo_mask_mix = torch.tensor(
+        [
+            [[2, 2], [2, 2]],
+            [[3, 3], [3, 3]],
+        ]
+    )
+    pseudo_conf_mix = torch.tensor(
+        [
+            [[0.95, 0.85], [0.75, 0.65]],
+            [[0.15, 0.25], [0.35, 0.45]],
+        ]
+    )
+
+    mixed_mask, mixed_conf, mixed_ignore = scalematch.build_same_batch_cutmix_targets(
+        img_u_s=img_u_s,
+        cutmix_box=cutmix_box,
+        pseudo_mask=pseudo_mask,
+        pseudo_conf=pseudo_conf,
+        ignore_mask=ignore_mask,
+        pseudo_mask_mix=pseudo_mask_mix,
+        pseudo_conf_mix=pseudo_conf_mix,
+    )
+
+    assert torch.equal(
+        img_u_s,
+        torch.tensor(
+            [
+                [[[4.0, 1.0], [2.0, 7.0]]],
+                [[[4.0, 1.0], [2.0, 7.0]]],
+            ]
+        ),
+    )
+    assert torch.equal(
+        mixed_mask,
+        torch.tensor(
+            [
+                [[3, 0], [0, 3]],
+                [[1, 2], [2, 1]],
+            ]
+        ),
+    )
+    assert torch.equal(
+        mixed_conf,
+        torch.tensor(
+            [
+                [[0.15, 0.8], [0.7, 0.45]],
+                [[0.1, 0.85], [0.75, 0.4]],
+            ]
+        ),
+    )
+    assert torch.equal(
+        mixed_ignore,
+        torch.tensor(
+            [
+                [[255, 0], [0, 0]],
+                [[255, 0], [0, 0]],
+            ]
+        ),
+    )
