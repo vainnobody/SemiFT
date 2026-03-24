@@ -52,7 +52,7 @@ def classmix_batch(*tensors, labels):
     batch_size = labels.shape[0]
 
     for idx in range(batch_size):
-        mix_mask = generate_class_mask(labels[idx]).unsqueeze(0)
+        mix_mask = generate_class_mask(labels[idx])
         mixed_masks.append(mix_mask)
         partner = (idx + 1) % batch_size
         for tensor_list, tensor in zip(mixed_tensors, tensors):
@@ -64,7 +64,7 @@ def classmix_batch(*tensors, labels):
             tensor_list.append(mixed.unsqueeze(0))
 
     outputs = [torch.cat(items, dim=0) for items in mixed_tensors]
-    return (*outputs, torch.cat(mixed_masks, dim=0))
+    return (*outputs, torch.stack(mixed_masks, dim=0))
 
 
 def gather_tensor_if_distributed(tensor):

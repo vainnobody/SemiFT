@@ -30,6 +30,7 @@ from model.semseg.dpt_segmind import DPT_SegMind
 from model.semseg.upernet import UperNet
 from model.semseg.upernet_segmind import UPerNet_SegMind
 from util.segmind_utils import (
+    classmix_batch,
     compute_contrastive_loss,
     get_batch_mask_tensor,
     init_queue_state,
@@ -137,3 +138,27 @@ def test_segmind_block_masks_match_requested_shape():
     assert masks.shape == (3, 1, 16, 16)
     unique_values = set(torch.unique(masks).tolist())
     assert unique_values.issubset({0.0, 1.0})
+
+
+def test_classmix_batch_preserves_batch_tensor_ranks():
+    img_u_w = torch.randn(2, 3, 8, 8)
+    img_u_s = torch.randn(2, 3, 8, 8)
+    pseudo_label = torch.randint(0, 5, (2, 8, 8))
+    pseudo_conf = torch.rand(2, 8, 8)
+    entropy = torch.rand(2, 8, 8)
+    valid = torch.ones(2, 8, 8)
+
+    outputs = classmix_batch(
+        img_u_w,
+        img_u_s,
+        pseudo_label.float(),
+        pseudo_conf,
+        entropy,
+        valid,
+        labels=pseudo_label,
+    )
+
+    assert outputs[0].shape == (2, 3, 8, 8)
+    assert outputs[1].shape == (2, 3, 8, 8)
+    assert outputs[2].shape == (2, 8, 8)
+    assert outputs[6].shape == (2, 8, 8)
