@@ -58,16 +58,56 @@ SemiFT/
 
 ## 3. 环境安装
 
-建议使用 Python 3.10+ 与 CUDA 环境。
+推荐直接使用仓库内的一键 conda 安装脚本。默认会创建 `semift` 环境，并安装主线训练所需依赖（`unimatchv2_peft.py` + DPT + DINO + PEFT）。
+
+### 3.1 一键创建 conda 环境（推荐）
 
 ```bash
-python -m pip install -r requirements.txt
+bash scripts/setup_conda_env.sh
+```
+
+常用变体：
+
+```bash
+# 指定环境名
+bash scripts/setup_conda_env.sh --env-name semift
+
+# 强制安装 CUDA 12.1 版 PyTorch
+bash scripts/setup_conda_env.sh --env-name semift-gpu --cuda 12.1
+
+# 额外安装 xformers（仅 Linux + CUDA）
+bash scripts/setup_conda_env.sh --env-name semift-gpu --cuda 12.1 --with-xformers
+
+# 额外安装 mmseg 生态（用于部分 UPerNet / mmseg 相关实验）
+bash scripts/setup_conda_env.sh --env-name semift-mmseg --with-mmseg
+```
+
+脚本行为说明：
+- 默认 `--cuda auto`：Linux 且检测到 `nvidia-smi` 时安装 CUDA 版 PyTorch，否则安装 CPU 版
+- 默认 Python 版本为 `3.10`
+- 会安装仓库常用依赖，包括 `torch`、`torchvision`、`accelerate`、`transformers`、`huggingface_hub`、`pytest` 等
+- 安装完成后会自动执行一次 import smoke test
+
+### 3.2 手动安装（备用）
+
+如果你不想使用脚本，也可以手动安装：
+
+```bash
+conda create -n semift python=3.10 -y
+conda activate semift
+conda install -c pytorch pytorch torchvision cpuonly -y
+pip install -r requirements.txt
+pip install pillow matplotlib accelerate transformers huggingface_hub pytest
 ```
 
 如果要使用分布式训练，确保本机已经正确安装：
 - PyTorch
 - NCCL / CUDA
 - TensorBoard（训练日志会写入 `SummaryWriter`）
+
+可选依赖说明：
+- `xformers`：DINOv2 中会自动探测；未安装时会回退到普通 attention
+- `mmseg` / `mmengine` / `mmcv-lite`：仅部分 mmseg / UPerNet 相关模块需要，不是主线训练必需依赖
 
 ---
 

@@ -1,0 +1,25 @@
+name: semift
+channels:
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.10
+  - pip
+  - numpy
+  - scipy
+  - scikit-image
+  - scikit-learn
+  - pillow
+  - h5py
+  - pyyaml
+  - matplotlib
+  - opencv
+  - tensorboard
+  - pip:
+      - easydict
+      - einops
+      - tensorboardX
+      - accelerate
+      - transformers
+      - huggingface_hub
+      - pytest
