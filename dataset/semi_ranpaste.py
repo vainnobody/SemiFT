@@ -1,6 +1,7 @@
 from copy import deepcopy
 import math
 import os
+import random
 
 import numpy as np
 from PIL import Image
@@ -71,7 +72,7 @@ class SemiDataset(Dataset):
         )
 
     def __getitem__(self, item):
-        sample_id = self.ids[item]
+        sample_id = self.ids[item] if self.mode == "val" else random.choice(self.ids)
         img, mask = self._load_image_mask(sample_id)
 
         if self.mode == "val":
@@ -99,4 +100,4 @@ class SemiDataset(Dataset):
         return normalize(img_w), img_s, ignore_mask, paste_box
 
     def __len__(self):
-        return len(self.ids)
+        return len(self.ids) * 50
