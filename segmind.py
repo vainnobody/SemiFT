@@ -37,7 +37,6 @@ from util.ssl_method_utils import (
     maybe_load_checkpoint,
     save_checkpoint,
     update_ema,
-    update_lr,
     wrap_ddp,
 )
 from util.utils import AverageMeter
@@ -88,6 +87,13 @@ def build_labeled_criterion(cfg, local_rank):
     if cfg["criterion"]["name"] == "FocalLoss":
         return FocalLoss(**cfg["criterion"]["kwargs"]).cuda(local_rank)
     raise NotImplementedError(cfg["criterion"]["name"])
+
+
+def update_lr_official(optimizer, base_lr, iters, total_iters, power=0.9, min_lr=1e-6):
+    lr = max(base_lr * (1 - iters / total_iters) ** power, min_lr)
+    for group in optimizer.param_groups:
+        group["lr"] = lr
+    return lr
 
 
 def build_dataloaders(args, cfg):
@@ -160,28 +166,15 @@ def main(args, cfg):
     log_model_info(logger, rank, model, load_result=load_result)
 
     optimizer = torch.optim.AdamW(
-        [
-            {
-                "params": [p for p in model.backbone.parameters() if p.requires_grad],
-                "lr": cfg["lr"],
-            },
-            {
-                "params": [
-                    param
-                    for name, param in model.named_parameters()
-                    if "backbone" not in name
-                ],
-                "lr": cfg["lr"] * cfg.get("lr_multi", 1.0),
-            },
-        ],
+        [p for p in model.parameters() if p.requires_grad],
         lr=cfg["lr"],
-        betas=(0.9, 0.999),
-        weight_decay=0.01,
+        betas=tuple(cfg.get("betas", (0.9, 0.99))),
+        weight_decay=cfg.get("weight_decay", cfg.get("weight_delay", 1e-6)),
     )
 
     model, local_rank = wrap_ddp(model, logger=logger, rank=rank, save_path=args.save_path)
     model_ema = deepcopy(model)
-    model_ema.eval()
+    model_ema.train()
     for param in model_ema.parameters():
         param.requires_grad = False
 
@@ -220,7 +213,7 @@ def main(args, cfg):
         if rank == 0:
             logger.info("************ Load from checkpoint at epoch %i\n", start_epoch)
 
-    alpha_ema = cfg.get("alpha_ema", 0.9)
+    alpha_ema = cfg.get("alpha_ema", 0.99)
     epoch_pre = cfg.get("epoch_pre", max(cfg["epochs"] // 2, 1))
     conf_thresh = cfg.get("conf_thresh", 0.7)
     mask_rate = cfg.get("mask_rate", cfg.get("mask_rate_end", 0.25))
@@ -230,6 +223,7 @@ def main(args, cfg):
         trainloader_l.sampler.set_epoch(epoch)
         trainloader_u.sampler.set_epoch(epoch)
         model.train()
+        model_ema.train()
 
         meters = {
             "loss_all": AverageMeter(),
@@ -367,7 +361,14 @@ def main(args, cfg):
             optimizer.step()
 
             iters = epoch * len(trainloader_u) + step
-            lr = update_lr(optimizer, cfg, iters, total_iters)
+            lr = update_lr_official(
+                optimizer,
+                base_lr=cfg["lr"],
+                iters=iters,
+                total_iters=total_iters,
+                power=cfg.get("lr_power", 0.9),
+                min_lr=cfg.get("min_lr", 1e-6),
+            )
             update_ema(model, model_ema, iters, max_decay=alpha_ema)
 
             meters["loss_all"].update(loss.item())
