@@ -30,7 +30,7 @@ DIRECT_ENTRYPOINTS = [
     'scalematch_peft.py',
 ]
 
-HELPER_ENTRYPOINTS = ['wscl.py', 'segmind.py']
+HELPER_ENTRYPOINTS = ['wscl.py']
 
 
 def load_checkpoint_to_cpu_function():
