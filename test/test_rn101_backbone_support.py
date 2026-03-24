@@ -25,6 +25,7 @@ stub_tb.SummaryWriter = StubSummaryWriter
 sys.modules.setdefault("torch.utils.tensorboard", stub_tb)
 
 from model.semseg import dpt as dpt_mod
+from model.semseg import dpt_segmind as dpt_segmind_mod
 from model.semseg import upernet as upernet_mod
 from model.backbone.resnet import ResNet101Backbone
 from util import ssl_method_utils as ssl_utils
@@ -153,6 +154,27 @@ def test_dpt_supports_resnet101_need_fp():
     y, y_fp = model(x, need_fp=True)
     assert y.shape == (2, 3, 128, 128)
     assert y_fp.shape == (2, 3, 128, 128)
+
+
+def test_dpt_segmind_supports_resnet101_aux_outputs():
+    model = dpt_segmind_mod.DPT_SegMind(
+        encoder_size="resnet101",
+        nclass=5,
+        features=64,
+        out_channels=[256, 512, 1024, 2048],
+        backbone_version="resnet",
+        proj_dim=16,
+    )
+    x = torch.randn(2, 3, 128, 128)
+    outputs = model(
+        x,
+        return_proj=True,
+        return_reconstruction=True,
+        reconstruction_mask=torch.ones(2, 1, 128, 128),
+    )
+    assert outputs["out"].shape == (2, 5, 128, 128)
+    assert outputs["proj_feat"].shape[-2:] == (64, 64)
+    assert outputs["recon"].shape == (2, 3, 128, 128)
 
 
 def test_scalematch_models_support_resnet101_backbone():
