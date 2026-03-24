@@ -450,7 +450,9 @@ def load_manifest(
 
 def build_job_command(manifest: BatchManifest, job: BatchJob) -> List[str]:
     return [
-        "torchrun",
+        sys.executable,
+        "-m",
+        "torch.distributed.run",
         f"--nproc_per_node={manifest.global_config.nproc_per_node}",
         f"--master_port={job.port}",
         str(job.script),

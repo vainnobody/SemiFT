@@ -1,6 +1,7 @@
 import contextlib
 import io
 import json
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -79,11 +80,17 @@ class BatchTrainRunnerTest(unittest.TestCase):
 
         command = build_job_command(manifest, manifest.jobs[0])
         self.assertEqual(
-            command[:3],
-            ["torchrun", "--nproc_per_node=1", "--master_port=29600"],
+            command[:5],
+            [
+                sys.executable,
+                "-m",
+                "torch.distributed.run",
+                "--nproc_per_node=1",
+                "--master_port=29600",
+            ],
         )
         self.assertEqual(command[-2:], ["--dummy-flag", "value"])
-        self.assertEqual(command[5], str(effective_config_path(manifest.jobs[0])))
+        self.assertEqual(command[7], str(effective_config_path(manifest.jobs[0])))
         self.assertTrue(str(manifest.jobs[0].save_path).endswith("runs/job_a"))
 
     def test_load_manifest_rejects_missing_required_fields(self):

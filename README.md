@@ -420,7 +420,7 @@ python scripts/batch_train.py \
 
 ### 10.3 批处理行为
 
-- 默认使用 `torchrun` 启动每个任务
+- 默认使用当前 `python` 解释器调用 `torch.distributed.run` 启动每个任务
 - 按 `port_base + job_index` 自动分配端口
 - 每个任务日志写入 `<save_path>/out.log`
 - 运行时终端会输出批处理进度，例如当前是第几个任务、任务开始/结束状态
@@ -428,6 +428,8 @@ python scripts/batch_train.py \
 - 若 `<save_path>/latest.pth` 已存在且没有完成标记，runner 会按同一路径重新启动，让训练脚本自动 resume
 - 单个任务失败后默认**继续后续任务**，并按 `max_retries` 自动重试
 - 批次级汇总会写到 `<save_root>/_batch/`
+
+这样可以确保 `python scripts/batch_train.py ...` 启动出的训练进程与当前激活的 Conda / venv 环境保持一致，避免 `torchrun` 从其他环境的 `PATH` 中被解析出来。
 
 ### 10.4 常用筛选与覆盖
 
