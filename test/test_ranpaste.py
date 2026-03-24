@@ -30,7 +30,7 @@ def test_build_ranpaste_targets_uses_gt_inside_paste_and_pseudo_outside():
     paste_mask[:, :2, :2] = 1
 
     mixed_target, valid_mask = build_ranpaste_targets(
-        mask_u_w, conf_u_w, ignore_mask, mask_x, paste_mask, conf_thresh=0.85
+        mask_u_w, conf_u_w, ignore_mask, mask_x, paste_mask, conf_thresh=0.85, ignore_index=255
     )
 
     assert torch.all(mixed_target[:, :2, :2] == 4)
@@ -40,3 +40,24 @@ def test_build_ranpaste_targets_uses_gt_inside_paste_and_pseudo_outside():
     assert valid_mask[:, 0, 2].item() is True
     assert valid_mask[:, 2, 1].item() is False
     assert valid_mask[:, 3, 0].item() is False
+
+
+def test_build_ranpaste_targets_excludes_ignore_index_in_pasted_region():
+    mask_u_w = torch.zeros(1, 2, 2, dtype=torch.long)
+    conf_u_w = torch.zeros(1, 2, 2)
+    ignore_mask = torch.zeros_like(mask_u_w)
+    mask_x = torch.tensor([[[255, 1], [2, 3]]])
+    paste_mask = torch.tensor([[[1, 0], [0, 0]]])
+
+    mixed_target, valid_mask = build_ranpaste_targets(
+        mask_u_w,
+        conf_u_w,
+        ignore_mask,
+        mask_x,
+        paste_mask,
+        conf_thresh=0.95,
+        ignore_index=255,
+    )
+
+    assert mixed_target[:, 0, 0].item() == 255
+    assert valid_mask[:, 0, 0].item() is False

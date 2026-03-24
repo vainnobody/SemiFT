@@ -3,6 +3,7 @@ import logging
 import os
 
 import torch
+from torch import nn
 from torch.utils.data import DataLoader
 import yaml
 
@@ -44,12 +45,28 @@ def forward_pseudo_labels(model, img_u_w):
 
 
 @torch.no_grad()
-def build_pasted_batches(img_u_w, img_u_s, img_x, mask_x, ignore_mask, paste_mask, conf_thresh, pseudo_model):
+def build_pasted_batches(
+    img_u_w,
+    img_u_s,
+    img_x,
+    mask_x,
+    ignore_mask,
+    paste_mask,
+    conf_thresh,
+    pseudo_model,
+    ignore_index,
+):
     _, conf_u_w, mask_u_w = forward_pseudo_labels(pseudo_model, img_u_w)
     img_u_w_mix = build_ranpaste_images(img_u_w, img_x, paste_mask)
     img_u_s_mix = build_ranpaste_images(img_u_s, img_x, paste_mask)
     target_mix, valid_mask = build_ranpaste_targets(
-        mask_u_w, conf_u_w, ignore_mask, mask_x, paste_mask, conf_thresh
+        mask_u_w,
+        conf_u_w,
+        ignore_mask,
+        mask_x,
+        paste_mask,
+        conf_thresh,
+        ignore_index=ignore_index,
     )
     return img_u_w_mix, img_u_s_mix, target_mix, valid_mask, conf_u_w
 
@@ -132,7 +149,10 @@ def main(args, cfg):
     log_model_info(logger, rank, model, load_result=load_result)
 
     model, local_rank = wrap_ddp(model, logger=logger, rank=rank, save_path=args.save_path)
-    criterion_l, criterion_u = build_criterions(cfg, local_rank)
+    criterion_l, _ = build_criterions(cfg, local_rank)
+    criterion_u = nn.CrossEntropyLoss(
+        reduction="none", ignore_index=cfg["ignore_index"]
+    ).cuda(local_rank)
 
     trainloader_l, trainloader_u, valloader = build_dataloaders(args, cfg)
     total_iters = len(trainloader_u) * cfg["epochs"]
@@ -190,6 +210,7 @@ def main(args, cfg):
                     paste_mask,
                     conf_thresh,
                     model,
+                    cfg["ignore_index"],
                 )
 
             num_lb, num_ulb = img_x.shape[0], img_u_s_mix.shape[0]

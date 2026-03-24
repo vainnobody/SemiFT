@@ -16,12 +16,21 @@ def apply_paste_mask(base, paste, paste_mask):
 
 
 @torch.no_grad()
-def build_ranpaste_targets(mask_u_w, conf_u_w, ignore_mask, mask_x, paste_mask, conf_thresh):
+def build_ranpaste_targets(
+    mask_u_w,
+    conf_u_w,
+    ignore_mask,
+    mask_x,
+    paste_mask,
+    conf_thresh,
+    ignore_index=255,
+):
     mixed_target = apply_paste_mask(mask_u_w, mask_x, paste_mask)
 
     pseudo_valid_mask = (conf_u_w >= conf_thresh) & (ignore_mask != 255)
+    pasted_valid_mask = (paste_mask == 1) & (mask_x != ignore_index)
     valid_mask = pseudo_valid_mask.clone()
-    valid_mask[paste_mask == 1] = True
+    valid_mask[pasted_valid_mask] = True
     return mixed_target, valid_mask
 
 
