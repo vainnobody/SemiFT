@@ -12,6 +12,9 @@ from torchvision import transforms
 from dataset.transform import blur, crop, hflip, normalize, resize
 
 
+TRAIN_LEN_MULTIPLIER = 50
+
+
 class SemiDataset(Dataset):
     def __init__(
         self, name, root, mode, size=None, id_path=None, nsample=None, ignore_index=255
@@ -65,6 +68,6 @@ class SemiDataset(Dataset):
         return normalize(img_w), normalize(img_s), dummy_mask
 
     def __len__(self):
-        if self.mode == "train_u":
-            return len(self.ids) * 50
+        if self.mode in {"train_l", "train_u"}:
+            return len(self.ids) * TRAIN_LEN_MULTIPLIER
         return len(self.ids)
