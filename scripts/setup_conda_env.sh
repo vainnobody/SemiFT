@@ -10,6 +10,9 @@ PYTHON_VERSION="3.10"
 CUDA_VARIANT="auto"
 WITH_XFORMERS=0
 WITH_MMSEG=0
+RECREATE_EXISTING=0
+TORCH_VERSION="2.4.1"
+TORCHVISION_VERSION="0.19.1"
 
 usage() {
   cat <<EOF
@@ -20,6 +23,7 @@ Options:
   --env-name NAME       Conda environment name. Default: semift
   --python VERSION      Python version. Default: 3.10
   --cuda VARIANT        auto | 12.1 | 11.8 | cpu. Default: auto
+  --recreate-existing   Remove and recreate the env if it already exists
   --with-xformers       Install optional xformers (Linux + CUDA only)
   --with-mmseg          Install optional mmseg ecosystem for UPerNet/mmseg paths
   -h, --help            Show this help message
@@ -60,6 +64,10 @@ while [[ $# -gt 0 ]]; do
       [[ $# -ge 2 ]] || die "--cuda requires a value"
       CUDA_VARIANT="$2"
       shift 2
+      ;;
+    --recreate-existing)
+      RECREATE_EXISTING=1
+      shift
       ;;
     --with-xformers)
       WITH_XFORMERS=1
@@ -127,8 +135,13 @@ if [[ "$ENV_EXISTS" -eq 0 ]]; then
   log "Creating conda environment '$ENV_NAME' from base spec"
   conda env create -n "$ENV_NAME" -f "$BASE_ENV_FILE"
 else
-  log "Environment '$ENV_NAME' already exists; updating from base spec"
-  conda env update -n "$ENV_NAME" -f "$BASE_ENV_FILE"
+  if [[ "$RECREATE_EXISTING" -eq 1 ]]; then
+    log "Environment '$ENV_NAME' already exists; recreating it"
+    conda env remove -y -n "$ENV_NAME"
+    conda env create -n "$ENV_NAME" -f "$BASE_ENV_FILE"
+  else
+    die "Environment '$ENV_NAME' already exists. Re-run with --recreate-existing to remove and rebuild it cleanly."
+  fi
 fi
 
 log "Pinning Python to $PYTHON_VERSION"
@@ -136,11 +149,19 @@ conda install -y -n "$ENV_NAME" -c conda-forge "python=$PYTHON_VERSION"
 
 install_torch() {
   if [[ "$CUDA_RESOLVED" == "cpu" ]]; then
-    log "Installing CPU PyTorch"
-    conda install -y -n "$ENV_NAME" -c pytorch pytorch torchvision cpuonly
+    log "Installing CPU PyTorch ($TORCH_VERSION / torchvision $TORCHVISION_VERSION)"
+    conda install -y -n "$ENV_NAME" --strict-channel-priority \
+      -c pytorch \
+      "pytorch=$TORCH_VERSION" \
+      "torchvision=$TORCHVISION_VERSION" \
+      cpuonly
   else
-    log "Installing CUDA PyTorch ($CUDA_RESOLVED)"
-    conda install -y -n "$ENV_NAME" -c pytorch -c nvidia pytorch torchvision "pytorch-cuda=$CUDA_RESOLVED"
+    log "Installing CUDA PyTorch ($TORCH_VERSION / torchvision $TORCHVISION_VERSION, CUDA $CUDA_RESOLVED)"
+    conda install -y -n "$ENV_NAME" --strict-channel-priority \
+      -c pytorch -c nvidia \
+      "pytorch=$TORCH_VERSION" \
+      "torchvision=$TORCHVISION_VERSION" \
+      "pytorch-cuda=$CUDA_RESOLVED"
   fi
 }
 
@@ -159,6 +180,7 @@ fi
 log "Running smoke tests"
 conda run -n "$ENV_NAME" python - <<'PY'
 import importlib
+from pathlib import Path
 mods = [
     'torch', 'torchvision', 'yaml', 'numpy', 'PIL', 'matplotlib', 'sklearn',
     'cv2', 'h5py', 'einops', 'tensorboard', 'accelerate', 'transformers',
@@ -173,9 +195,19 @@ for mod in mods:
 if missing:
     raise SystemExit('Missing imports: ' + '; '.join(f'{m} -> {e}' for m, e in missing))
 import torch
+import torchvision
+from dataset.transform import *  # noqa: F401,F403
 from peft.tuners.semift import SemiFTConfig
+expected = ('2.4.1', '0.19.1')
+actual = (torch.__version__.split('+')[0], torchvision.__version__.split('+')[0])
+if actual != expected:
+    raise SystemExit(f'Unexpected torch tuple: {actual}, expected {expected}')
 print('torch', torch.__version__)
+print('torchvision', torchvision.__version__)
+print('torch_file', Path(torch.__file__).resolve())
+print('torchvision_file', Path(torchvision.__file__).resolve())
 print('cuda_available', torch.cuda.is_available())
+print('dataset_transform_ok', True)
 print('semift_config_ok', SemiFTConfig().__class__.__name__)
 PY
 
@@ -203,7 +235,7 @@ Activate environment:
   conda activate $ENV_NAME
 
 Quick check:
-  conda run -n $ENV_NAME python -c "import torch; from peft.tuners.semift import SemiFTConfig; print(torch.__version__)"
+  conda run -n $ENV_NAME python -c "import torch, torchvision; print(torch.__version__, torchvision.__version__, torch.__file__, torchvision.__file__)"
 
 Recommended tests:
   conda run -n $ENV_NAME python -m pytest test/test_unimatchv2_peft_config.py test/test_batch_train.py

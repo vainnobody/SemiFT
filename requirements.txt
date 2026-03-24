@@ -8,5 +8,3 @@ scikit-learn
 scikit-image
 einops
 h5py
-torch
-torchvision

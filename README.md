@@ -72,6 +72,9 @@ bash scripts/setup_conda_env.sh
 # 指定环境名
 bash scripts/setup_conda_env.sh --env-name semift
 
+# 若环境已存在，显式删除并重建
+bash scripts/setup_conda_env.sh --env-name semift --recreate-existing
+
 # 强制安装 CUDA 12.1 版 PyTorch
 bash scripts/setup_conda_env.sh --env-name semift-gpu --cuda 12.1
 
@@ -85,8 +88,10 @@ bash scripts/setup_conda_env.sh --env-name semift-mmseg --with-mmseg
 脚本行为说明：
 - 默认 `--cuda auto`：Linux 且检测到 `nvidia-smi` 时安装 CUDA 版 PyTorch，否则安装 CPU 版
 - 默认 Python 版本为 `3.10`
-- 会安装仓库常用依赖，包括 `torch`、`torchvision`、`accelerate`、`transformers`、`huggingface_hub`、`pytest` 等
-- 安装完成后会自动执行一次 import smoke test
+- 会安装仓库常用依赖，并将 PyTorch 家族固定为兼容组合：`pytorch 2.4.1` + `torchvision 0.19.1`
+- GPU 环境使用 `--strict-channel-priority` + `pytorch`/`nvidia` channel 安装，避免 `torch` / `torchvision` 混装
+- 若环境已存在，默认直接报错；只有显式传入 `--recreate-existing` 才会删除并重建
+- 安装完成后会自动执行一次 import smoke test，并验证 `dataset.transform` 可正常导入
 
 ### 3.2 手动安装（备用）
 
@@ -95,10 +100,20 @@ bash scripts/setup_conda_env.sh --env-name semift-mmseg --with-mmseg
 ```bash
 conda create -n semift python=3.10 -y
 conda activate semift
-conda install -c pytorch pytorch torchvision cpuonly -y
+conda install -y --strict-channel-priority -c pytorch pytorch=2.4.1 torchvision=0.19.1 cpuonly
 pip install -r requirements.txt
-pip install pillow matplotlib accelerate transformers huggingface_hub pytest
 ```
+
+如果使用 GPU，请改为：
+
+```bash
+conda create -n semift python=3.10 -y
+conda activate semift
+conda install -y --strict-channel-priority -c pytorch -c nvidia pytorch=2.4.1 torchvision=0.19.1 pytorch-cuda=12.1
+pip install -r requirements.txt
+```
+
+> 注意：不要在 conda 安装完 `pytorch` / `torchvision` 后，再用 `pip install torch torchvision` 覆盖它们。`requirements.txt` 已刻意移除了这两个包，避免破坏 conda 环境中的官方匹配组合。
 
 如果要使用分布式训练，确保本机已经正确安装：
 - PyTorch
