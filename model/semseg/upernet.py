@@ -17,7 +17,12 @@ from model.semseg.scalematch_core import (
     scale_as,
 )
 from model.semseg.feature_perturb import apply_structured_feature_perturbation
-from model.semseg.corrmatch_utils import Corr
+try:
+    from model.semseg.corrmatch_utils import Corr
+    _CORR_IMPORT_ERROR = None
+except ModuleNotFoundError as exc:
+    Corr = None
+    _CORR_IMPORT_ERROR = exc
 
 
 class PPM(nn.Module):
@@ -284,6 +289,10 @@ class UperNet(nn.Module):
         self.binomial = torch.distributions.binomial.Binomial(probs=0.5)
         self.fp_dropout = nn.Dropout2d(0.5)
         if self.enable_corrmatch:
+            if Corr is None:
+                raise ModuleNotFoundError(
+                    "CorrMatch support requires optional dependency 'einops'."
+                ) from _CORR_IMPORT_ERROR
             self.corr_proj = nn.Sequential(
                 nn.Conv2d(
                     fpn_channels, 256, kernel_size=3, stride=1, padding=1, bias=True

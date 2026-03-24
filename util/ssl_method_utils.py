@@ -9,7 +9,10 @@ from torch import nn
 import torch.backends.cudnn as cudnn
 from torch.optim import AdamW
 from torch.utils.data import DataLoader
-from torch.utils.tensorboard import SummaryWriter
+try:
+    from torch.utils.tensorboard import SummaryWriter
+except ModuleNotFoundError:
+    SummaryWriter = None
 
 from dataset.semi_rs import SemiDataset as RemoteSemiDataset
 from dataset.val import ValDataset
@@ -219,7 +222,11 @@ def build_logger_and_runtime(args, cfg):
         os.makedirs(args.save_path, exist_ok=True)
         all_args = {**cfg, **vars(args), "ngpus": world_size}
         logger.info("{}\n".format(pprint.pformat(all_args)))
-        writer = SummaryWriter(args.save_path)
+        if SummaryWriter is None:
+            logger.warning("tensorboard is not installed; scalar logging is disabled.")
+            writer = NullWriter()
+        else:
+            writer = SummaryWriter(args.save_path)
     else:
         writer = NullWriter()
 
