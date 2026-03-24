@@ -213,7 +213,6 @@ peft:
 - `corrmatch.py`
 - `wscl.py`
 - `dwl.py`
-- `segmind.py`
 
 例如，`fixmatch_rgcr.py` 是一个较完整的半监督训练入口，包含：
 - 配置读取

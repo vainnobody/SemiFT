@@ -236,22 +236,11 @@ def get_backbone_info(cfg):
 def build_model(cfg, method="fixmatch"):
     _, backbone_version = get_backbone_info(cfg)
     kwargs = get_model_kwargs(cfg)
-    segmind_cfg = cfg.get("segmind", {}) if method == "segmind" else {}
 
     if cfg["model"] == "upernet":
-        model = UperNet(
-            **kwargs,
-            backbone_version=backbone_version,
-            enable_segmind=method == "segmind",
-            proj_dim=segmind_cfg.get("proj_dim", 256),
-        )
+        model = UperNet(**kwargs, backbone_version=backbone_version)
     else:
-        model = DPT(
-            **kwargs,
-            backbone_version=backbone_version,
-            enable_segmind=method == "segmind",
-            proj_dim=segmind_cfg.get("proj_dim", 256),
-        )
+        model = DPT(**kwargs, backbone_version=backbone_version)
 
     load_result = load_backbone_checkpoint(model, cfg)
     if cfg.get("lock_backbone"):
