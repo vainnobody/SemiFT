@@ -1,9 +1,9 @@
 from copy import deepcopy
 import math
-import numpy as np
 import os
 import random
 
+import numpy as np
 from PIL import Image
 import torch
 from torch.utils.data import Dataset
@@ -23,14 +23,14 @@ class SemiDataset(Dataset):
         self.ignore_index = ignore_index
 
         if mode in {"train_l", "train_u"}:
-            with open(id_path, "r") as f:
-                self.ids = f.read().splitlines()
+            with open(id_path, "r", encoding="utf-8") as handle:
+                self.ids = handle.read().splitlines()
             if mode == "train_l" and nsample is not None and nsample > len(self.ids):
                 self.ids *= math.ceil(nsample / len(self.ids))
                 self.ids = self.ids[:nsample]
         else:
-            with open("splits/%s/val.txt" % name, "r") as f:
-                self.ids = f.read().splitlines()
+            with open(f"splits/{name}/val.txt", "r", encoding="utf-8") as handle:
+                self.ids = handle.read().splitlines()
 
     def __getitem__(self, item):
         sample_id = random.choice(self.ids) if self.mode in {"train_l", "train_u"} else self.ids[item]

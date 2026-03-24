@@ -151,6 +151,8 @@ class DPT(nn.Module):
         backbone_version="dinov2",  # 'dinov2' or 'dinov3'
         enable_scalematch=False,
         enable_corrmatch=False,
+        enable_segmind=False,
+        proj_dim=256,
     ):
         super(DPT, self).__init__()
 
@@ -192,6 +194,7 @@ class DPT(nn.Module):
         self.feature_kind = getattr(self.backbone, "feature_kind", "token")
         self.enable_scalematch = enable_scalematch
         self.enable_corrmatch = enable_corrmatch
+        self.enable_segmind = enable_segmind
         self.scalematch_features = features
 
         self.head = DPTHead(
@@ -202,6 +205,24 @@ class DPT(nn.Module):
             out_channels=out_channels,
             feature_kind=self.feature_kind,
         )
+        if self.enable_segmind:
+            self.segmind_projector = nn.Sequential(
+                nn.Conv2d(features, proj_dim, kernel_size=1, bias=False),
+                nn.BatchNorm2d(proj_dim),
+                nn.ReLU(inplace=True),
+                nn.Conv2d(proj_dim, proj_dim, kernel_size=1, bias=False),
+            )
+            recon_hidden = max(features // 2, 32)
+            self.segmind_reconstruction_head = nn.Sequential(
+                nn.Conv2d(features, features, kernel_size=3, padding=1, bias=False),
+                nn.BatchNorm2d(features),
+                nn.ReLU(inplace=True),
+                nn.Conv2d(features, recon_hidden, kernel_size=3, padding=1, bias=False),
+                nn.BatchNorm2d(recon_hidden),
+                nn.ReLU(inplace=True),
+                nn.Conv2d(recon_hidden, 3, kernel_size=1),
+                nn.Tanh(),
+            )
 
         self.binomial = torch.distributions.binomial.Binomial(probs=0.5)
         self.fp_dropout = nn.Dropout2d(0.5)
@@ -465,6 +486,30 @@ class DPT(nn.Module):
 
         return outputs
 
+    def _segmind_forward(self, x, features, patch_h, patch_w):
+        logits, decoder_feats = self.head(features, patch_h, patch_w, return_feats=True)
+        logits = F.interpolate(
+            logits,
+            size=x.shape[-2:],
+            mode="bilinear",
+            align_corners=True,
+        )
+        proj_feat = self.segmind_projector(decoder_feats)
+        proj_feat = F.interpolate(
+            proj_feat,
+            size=(x.shape[-2] // 4, x.shape[-1] // 4),
+            mode="bilinear",
+            align_corners=True,
+        )
+        recon = self.segmind_reconstruction_head(decoder_feats)
+        recon = F.interpolate(
+            recon,
+            size=x.shape[-2:],
+            mode="bilinear",
+            align_corners=True,
+        )
+        return logits, proj_feat, recon
+
     def forward(
         self,
         x,
@@ -474,12 +519,15 @@ class DPT(nn.Module):
         use_corr=False,
         scale_factor=None,
         feature_scale=1.0,
+        return_aux=False,
+        mode=None,
+        mask=None,
     ):
         if scale_factor is not None:
             if not self.enable_scalematch:
                 raise ValueError("ScaleMatch forward requested but enable_scalematch=False.")
-            if need_fp or feature_perturb is not None or comp_drop or use_corr:
-                raise ValueError("ScaleMatch forward does not support comp_drop/need_fp/feature_perturb/use_corr.")
+            if need_fp or feature_perturb is not None or comp_drop or use_corr or return_aux or mode is not None:
+                raise ValueError("ScaleMatch forward does not support comp_drop/need_fp/feature_perturb/use_corr/return_aux/mode.")
             return self._scalematch_two_scale_forward(x, scale_factor, feature_scale)
 
         batch_size = x.shape[0]
@@ -489,6 +537,12 @@ class DPT(nn.Module):
             raise ValueError("DPT does not support need_fp=True together with comp_drop=True.")
         if use_corr and not self.enable_corrmatch:
             raise ValueError("CorrMatch forward requested but enable_corrmatch=False.")
+        if mode is not None and mode != "r":
+            raise ValueError(f"Unsupported DPT mode: {mode}")
+        if (return_aux or mode == "r") and not self.enable_segmind:
+            raise ValueError("SegMind auxiliary outputs requested but enable_segmind=False.")
+        if (return_aux or mode == "r") and (need_fp or comp_drop or use_corr):
+            raise ValueError("SegMind auxiliary outputs do not support need_fp/comp_drop/use_corr.")
 
         if comp_drop:
             if features[0].dim() == 4:
@@ -528,6 +582,9 @@ class DPT(nn.Module):
             features = self._apply_feature_perturbation(
                 features, patch_h, patch_w, batch_size, feature_perturb
             )
+
+        if return_aux or mode == "r":
+            return self._segmind_forward(x, features, patch_h, patch_w)
 
         if use_corr:
             return self._corrmatch_forward(

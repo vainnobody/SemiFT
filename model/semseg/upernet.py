@@ -223,6 +223,8 @@ class UperNet(nn.Module):
         backbone_version="dinov2",
         enable_scalematch=False,
         enable_corrmatch=False,
+        enable_segmind=False,
+        proj_dim=256,
         **kwargs,  # Ignore DPT-specific params (features, out_channels)
     ):
         super(UperNet, self).__init__()
@@ -248,6 +250,7 @@ class UperNet(nn.Module):
         self.backbone_version = backbone_version
         self.enable_scalematch = enable_scalematch
         self.enable_corrmatch = enable_corrmatch
+        self.enable_segmind = enable_segmind
 
         # Initialize backbone
         if backbone_version == "dinov2":
@@ -279,6 +282,24 @@ class UperNet(nn.Module):
             fpn_channels=fpn_channels,
             num_classes=nclass,
         )
+        if self.enable_segmind:
+            self.segmind_projector = nn.Sequential(
+                nn.Conv2d(fpn_channels, proj_dim, kernel_size=1, bias=False),
+                nn.BatchNorm2d(proj_dim),
+                nn.ReLU(inplace=True),
+                nn.Conv2d(proj_dim, proj_dim, kernel_size=1, bias=False),
+            )
+            recon_hidden = max(fpn_channels // 2, 32)
+            self.segmind_reconstruction_head = nn.Sequential(
+                nn.Conv2d(fpn_channels, fpn_channels, kernel_size=3, padding=1, bias=False),
+                nn.BatchNorm2d(fpn_channels),
+                nn.ReLU(inplace=True),
+                nn.Conv2d(fpn_channels, recon_hidden, kernel_size=3, padding=1, bias=False),
+                nn.BatchNorm2d(recon_hidden),
+                nn.ReLU(inplace=True),
+                nn.Conv2d(recon_hidden, 3, kernel_size=1),
+                nn.Tanh(),
+            )
 
         # For comp_drop support (same as DPT)
         self.binomial = torch.distributions.binomial.Binomial(probs=0.5)
@@ -503,6 +524,31 @@ class UperNet(nn.Module):
         )
         return outputs
 
+    def _segmind_forward(self, x, feat_maps):
+        pyramid_feats = self.neck(tuple(feat_maps))
+        logits, decoder_feats = self.decoder(pyramid_feats, return_feats=True)
+        logits = F.interpolate(
+            logits,
+            size=x.shape[-2:],
+            mode="bilinear",
+            align_corners=False,
+        )
+        proj_feat = self.segmind_projector(decoder_feats)
+        proj_feat = F.interpolate(
+            proj_feat,
+            size=(x.shape[-2] // 4, x.shape[-1] // 4),
+            mode="bilinear",
+            align_corners=False,
+        )
+        recon = self.segmind_reconstruction_head(decoder_feats)
+        recon = F.interpolate(
+            recon,
+            size=x.shape[-2:],
+            mode="bilinear",
+            align_corners=False,
+        )
+        return logits, proj_feat, recon
+
     def forward(
         self,
         x,
@@ -512,6 +558,9 @@ class UperNet(nn.Module):
         use_corr=False,
         scale_factor=None,
         feature_scale=1.0,
+        return_aux=False,
+        mode=None,
+        mask=None,
     ):
         """
         Forward pass.
@@ -530,14 +579,20 @@ class UperNet(nn.Module):
         if scale_factor is not None:
             if not self.enable_scalematch:
                 raise ValueError("ScaleMatch forward requested but enable_scalematch=False.")
-            if need_fp or feature_perturb is not None or comp_drop or use_corr:
-                raise ValueError("ScaleMatch forward does not support comp_drop/need_fp/feature_perturb/use_corr.")
+            if need_fp or feature_perturb is not None or comp_drop or use_corr or return_aux or mode is not None:
+                raise ValueError("ScaleMatch forward does not support comp_drop/need_fp/feature_perturb/use_corr/return_aux/mode.")
             return self._scalematch_two_scale_forward(x, scale_factor, feature_scale)
 
         if need_fp and comp_drop:
             raise ValueError("UPerNet does not support need_fp=True together with comp_drop=True.")
         if use_corr and not self.enable_corrmatch:
             raise ValueError("CorrMatch forward requested but enable_corrmatch=False.")
+        if mode is not None and mode != "r":
+            raise ValueError(f"Unsupported UPerNet mode: {mode}")
+        if (return_aux or mode == "r") and not self.enable_segmind:
+            raise ValueError("SegMind auxiliary outputs requested but enable_segmind=False.")
+        if (return_aux or mode == "r") and (need_fp or comp_drop or use_corr):
+            raise ValueError("SegMind auxiliary outputs do not support need_fp/comp_drop/use_corr.")
 
         B, C, H, W = x.shape
         if self.feature_kind == "token":
@@ -618,6 +673,9 @@ class UperNet(nn.Module):
             if feature_perturb is not None:
                 feat = apply_structured_feature_perturbation(feat, feature_perturb)
             feat_maps.append(feat)
+
+        if return_aux or mode == "r":
+            return self._segmind_forward(x, feat_maps)
 
         pyramid_feats = self.neck(tuple(feat_maps))
 

@@ -1,4 +1,5 @@
 import argparse
+import logging
 
 import torch
 import torch.nn.functional as F
@@ -32,7 +33,7 @@ def validation_cpu(cfg, model, valid_loader):
 
 
 def get_parser():
-    parser = argparse.ArgumentParser(description="SegMind with DPT/DINO backbone")
+    parser = argparse.ArgumentParser(description="SegMind with SemiFT DPT/UPerNet scaffold")
     parser.add_argument("--config", type=str, required=True)
     parser.add_argument("--labeled-id-path", type=str, required=True)
     parser.add_argument("--unlabeled-id-path", type=str, required=True)
@@ -74,6 +75,7 @@ def get_cfg(cfg):
         "mask_rate": 0.25,
         "mask_gap": 4,
         "proj_dim": 256,
+        "ema_decay": 0.99,
     }
     seg_cfg.update(cfg.get("segmind", {}))
     seg_cfg["class_num"] = cfg["nclass"]
@@ -88,7 +90,7 @@ def main(args, cfg):
     log_model_info(logger, rank, model, load_result)
     model, local_rank = wrap_ddp(model, logger=logger, rank=rank, save_path=args.save_path)
     model_ema = build_ema_model(model)
-    criterion_l, criterion_u = build_criterions(cfg, local_rank)
+    criterion_l, _ = build_criterions(cfg, local_rank)
     trainloader_l, trainloader_u, valloader = build_dataloaders(args, cfg)
     total_iters = len(trainloader_u) * cfg["epochs"]
     memory_bank = MemoryBank(cfg["nclass"], seg_cfg["bank_size"], seg_cfg["proj_dim"])
@@ -151,7 +153,11 @@ def main(args, cfg):
                     loss_r = F.mse_loss(r_recon[masked_pixels], rs_all_w[masked_pixels])
                 masked_seg_pixels = (~mask_tensor.bool()).squeeze(1)
                 if masked_seg_pixels.any():
-                    loss_rsc = F.cross_entropy(r_logits.permute(0, 2, 3, 1)[masked_seg_pixels], lab_all[masked_seg_pixels], ignore_index=cfg["ignore_index"])
+                    loss_rsc = F.cross_entropy(
+                        r_logits.permute(0, 2, 3, 1)[masked_seg_pixels],
+                        lab_all[masked_seg_pixels],
+                        ignore_index=cfg["ignore_index"],
+                    )
 
             feat_hw = s_feat_all.shape[-2:]
             lab_small = F.interpolate(lab_all.float().unsqueeze(1), size=feat_hw, mode="nearest").long().squeeze(1)
@@ -171,7 +177,7 @@ def main(args, cfg):
             optimizer.step()
             iters = epoch * len(trainloader_u) + i
             lr = update_lr(optimizer, cfg, iters, total_iters)
-            update_ema(model, model_ema, iters, max_decay=cfg.get("segmind", {}).get("ema_decay", 0.99))
+            update_ema(model, model_ema, iters, max_decay=seg_cfg["ema_decay"])
 
             loss_meters["loss"].update(loss.item())
             loss_meters["l"].update(loss_l.item())
@@ -201,9 +207,7 @@ def main(args, cfg):
                     )
 
         val_cfg = dict(cfg)
-        val_cfg.setdefault(
-            "eval_mode", "slide_window" if cfg["dataset"] == "cityscapes" else "original"
-        )
+        val_cfg.setdefault("eval_mode", "slide_window" if cfg["dataset"] == "cityscapes" else "original")
         val_cfg.setdefault("ignore_index", cfg.get("ignore_index", 255))
         mIoU, iou_class = validation_cpu(val_cfg, model, valloader)
         mIoU_ema, iou_class_ema = validation_cpu(val_cfg, model_ema, valloader)
