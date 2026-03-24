@@ -8,7 +8,7 @@ SemiFT 是一个基于 PyTorch 的半监督语义分割研究仓库，核心目�
 - 支持 Mixture-of-Experts / prefix / conv expert 等配置；
 - 已集成到 `unimatchv2_peft.py` 训练入口中。
 
-除了 SemiFT，本仓库也保留了多种半监督分割方法与实验入口，例如 `fixmatch.py`、`fixmatch_rgcr.py`、`unimatch.py`、`unimatch_v2.py`、`rankmatch.py`、`corrmatch.py` 等，方便做对比实验。
+除了 SemiFT，本仓库也保留了多种半监督分割方法与实验入口，例如 `fixmatch.py`、`fixmatch_rgcr.py`、`unimatch.py`、`unimatch_v2.py`、`rankmatch.py`、`corrmatch.py`、`segmind.py` 等，方便做对比实验。
 
 ---
 
@@ -268,6 +268,7 @@ peft:
 - `corrmatch.py`
 - `wscl.py`
 - `dwl.py`
+- `segmind.py`
 
 例如，`fixmatch_rgcr.py` 是一个较完整的半监督训练入口，包含：
 - 配置读取

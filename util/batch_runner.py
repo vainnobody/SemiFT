@@ -41,6 +41,7 @@ TRAINING_ENTRYPOINTS = {
     "rankmatch.py",
     "scalematch.py",
     "scalematch_peft.py",
+    "segmind.py",
     "supervised.py",
     "unimatch.py",
     "unimatch_v2.py",

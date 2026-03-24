@@ -30,6 +30,7 @@ def test_all_validation_wrappers_use_shared_impl_in_source():
         "fixmatch_rgcrv5.py",
         "fixmatch_rgcrv6.py",
         "fixmatch_rvsc.py",
+        "segmind.py",
     ]
 
     for name in files:
