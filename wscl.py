@@ -38,6 +38,20 @@ def validation_cpu(cfg, model, valid_loader):
     return shared_validation_cpu(cfg, model, valid_loader)
 
 
+@torch.no_grad()
+def forward_pseudo_labels(model, img_u_w):
+    was_training = model.training
+    model.eval()
+    try:
+        pred_u_w = model(img_u_w).detach()
+    finally:
+        if was_training:
+            model.train()
+    prob_u_w = pred_u_w.softmax(dim=1)
+    conf_u_w, mask_u_w = prob_u_w.max(dim=1)
+    return pred_u_w, conf_u_w, mask_u_w
+
+
 AUG_HANDLERS = {
     "SC": lambda conf, mask, s1, s2: generate_unsup_aug_sc(conf, mask, s1),
     "DS": lambda conf, mask, s1, s2: (conf, mask, generate_unsup_aug_ds(s1, s2)),
@@ -167,9 +181,7 @@ def main(args, cfg):
             ignore_mask = ignore_mask.cuda(local_rank)
 
             with torch.no_grad():
-                pred_u_w = model(img_u_w).detach()
-                prob_u_w = pred_u_w.softmax(dim=1)
-                conf_u_w, mask_u_w = prob_u_w.max(dim=1)
+                _, conf_u_w, mask_u_w = forward_pseudo_labels(model, img_u_w)
 
             if aug_mode not in AUG_HANDLERS:
                 raise ValueError(f"Unknown wscl aug_mode: {aug_mode}")
