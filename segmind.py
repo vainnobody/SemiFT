@@ -2,6 +2,7 @@ import argparse
 import logging
 
 import torch
+import torch.nn.functional as F
 from torch import nn
 from torch.utils.data import DataLoader
 import yaml
