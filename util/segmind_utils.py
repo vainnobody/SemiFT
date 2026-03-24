@@ -1,14 +1,14 @@
 from dataclasses import dataclass
 
-import numpy as np
 import torch
 import torch.nn.functional as F
 
 
 @dataclass
 class SegMindQueueState:
-    banks: list
-    ptrs: list
+    banks: torch.Tensor
+    ptrs: torch.Tensor
+    counts: torch.Tensor
     bank_size: int
 
 
@@ -30,7 +30,13 @@ def generate_block_mask(height, width, mask_gap=16, mask_rate=0.75, device=None)
 def get_batch_mask_tensor(shape, mask_gap=16, mask_rate=0.75, device=None):
     batch_size, _, height, width = shape
     masks = [
-        generate_block_mask(height, width, mask_gap=mask_gap, mask_rate=mask_rate, device=device)
+        generate_block_mask(
+            height,
+            width,
+            mask_gap=mask_gap,
+            mask_rate=mask_rate,
+            device=device,
+        )
         for _ in range(batch_size)
     ]
     return torch.stack(masks, dim=0)
@@ -40,7 +46,9 @@ def generate_class_mask(pseudo_labels):
     labels = torch.unique(pseudo_labels)
     if labels.numel() <= 1:
         return torch.ones_like(pseudo_labels, dtype=torch.float32)
-    selected = labels[torch.randperm(labels.numel(), device=labels.device)[: labels.numel() // 2]]
+    selected = labels[
+        torch.randperm(labels.numel(), device=labels.device)[: labels.numel() // 2]
+    ]
     return (pseudo_labels.unsqueeze(-1) == selected).any(dim=-1).float()
 
 
@@ -76,38 +84,92 @@ def resize_labels_to_shape(labels, target_shape):
 
 def init_queue_state(num_classes, feat_dim, bank_size):
     return SegMindQueueState(
-        banks=[torch.zeros((0, feat_dim), dtype=torch.float32) for _ in range(num_classes)],
-        ptrs=[torch.zeros(1, dtype=torch.long) for _ in range(num_classes)],
+        banks=torch.zeros((num_classes, bank_size, feat_dim), dtype=torch.float32),
+        ptrs=torch.zeros(num_classes, dtype=torch.long),
+        counts=torch.zeros(num_classes, dtype=torch.long),
         bank_size=bank_size,
     )
+
+
+def _ensure_queue_device(queue_state, device):
+    if queue_state.banks.device != device:
+        queue_state.banks = queue_state.banks.to(device=device, non_blocking=True)
+        queue_state.ptrs = queue_state.ptrs.to(device=device, non_blocking=True)
+        queue_state.counts = queue_state.counts.to(device=device, non_blocking=True)
+    return queue_state
 
 
 def _enqueue_class_features(queue_state, class_idx, class_feats):
     if class_feats.numel() == 0:
         return
-    bank = queue_state.banks[class_idx]
-    bank = torch.cat((bank, class_feats.detach().cpu().float()), dim=0)
-    if bank.shape[0] >= queue_state.bank_size:
-        bank = bank[-queue_state.bank_size :]
-        ptr = queue_state.bank_size
+
+    class_feats = class_feats.detach().float()
+    _ensure_queue_device(queue_state, class_feats.device)
+
+    num_new = class_feats.shape[0]
+    feat_dim = class_feats.shape[1]
+    bank_size = queue_state.bank_size
+
+    if num_new >= bank_size:
+        queue_state.banks[class_idx].copy_(class_feats[-bank_size:])
+        queue_state.ptrs[class_idx] = 0
+        queue_state.counts[class_idx] = bank_size
+        return
+
+    ptr = int(queue_state.ptrs[class_idx].item())
+    end = ptr + num_new
+    if end <= bank_size:
+        queue_state.banks[class_idx, ptr:end].copy_(class_feats)
     else:
-        ptr = min(int(queue_state.ptrs[class_idx].item()) + class_feats.shape[0], queue_state.bank_size)
-    queue_state.banks[class_idx] = bank
-    queue_state.ptrs[class_idx][0] = ptr
+        first = bank_size - ptr
+        queue_state.banks[class_idx, ptr:].copy_(class_feats[:first])
+        queue_state.banks[class_idx, : end - bank_size].copy_(class_feats[first:])
+
+    queue_state.ptrs[class_idx] = end % bank_size
+    queue_state.counts[class_idx] = min(
+        int(queue_state.counts[class_idx].item()) + num_new,
+        bank_size,
+    )
 
 
 def serialize_queue_state(queue_state):
     return {
-        "banks": [bank.clone() for bank in queue_state.banks],
-        "ptrs": [ptr.clone() for ptr in queue_state.ptrs],
-        "bank_size": queue_state.bank_size,
+        "format_version": 2,
+        "banks": queue_state.banks.detach().cpu().clone(),
+        "ptrs": queue_state.ptrs.detach().cpu().clone(),
+        "counts": queue_state.counts.detach().cpu().clone(),
+        "bank_size": int(queue_state.bank_size),
     }
 
 
 def load_queue_state(payload):
+    if isinstance(payload.get("banks"), list):
+        num_classes = len(payload["banks"])
+        feat_dim = (
+            payload["banks"][0].shape[1]
+            if num_classes > 0 and payload["banks"][0].numel() > 0
+            else 0
+        )
+        state = init_queue_state(
+            num_classes=num_classes,
+            feat_dim=feat_dim,
+            bank_size=int(payload["bank_size"]),
+        )
+        for class_idx, bank in enumerate(payload["banks"]):
+            if bank.numel() == 0:
+                continue
+            _enqueue_class_features(state, class_idx, bank.clone().float())
+        if "ptrs" in payload:
+            ptrs = [int(ptr.reshape(-1)[0].item()) for ptr in payload["ptrs"]]
+            state.ptrs[: len(ptrs)] = torch.tensor(ptrs, dtype=torch.long)
+        return state
+
     return SegMindQueueState(
-        banks=[bank.clone().float() for bank in payload["banks"]],
-        ptrs=[ptr.clone().long() for ptr in payload["ptrs"]],
+        banks=payload["banks"].clone().float(),
+        ptrs=payload["ptrs"].clone().long(),
+        counts=payload.get("counts", torch.full_like(payload["ptrs"], payload["bank_size"]))
+        .clone()
+        .long(),
         bank_size=int(payload["bank_size"]),
     )
 
@@ -125,6 +187,29 @@ def compute_masked_segmentation_loss(logits, labels, mask, ignore_index):
     masked_labels = labels.clone()
     masked_labels[mask.bool()] = ignore_index
     return F.cross_entropy(logits, masked_labels, ignore_index=ignore_index)
+
+
+def _sample_negative_features(queue_state, class_ids, sampled_classes, feat_dim, dtype):
+    sampled_actual_classes = class_ids[sampled_classes]
+    negative_feat = torch.empty(
+        (*sampled_actual_classes.shape, feat_dim),
+        device=queue_state.banks.device,
+        dtype=dtype,
+    )
+    unique_classes = torch.unique(sampled_actual_classes)
+    for neg_class in unique_classes.tolist():
+        mask = sampled_actual_classes == neg_class
+        count = int(queue_state.counts[neg_class].item())
+        if count <= 0:
+            continue
+        sample_count = int(mask.sum().item())
+        neg_idx = torch.randint(
+            count,
+            size=(sample_count,),
+            device=queue_state.banks.device,
+        )
+        negative_feat[mask] = queue_state.banks[neg_class, neg_idx].to(dtype=dtype)
+    return negative_feat
 
 
 def compute_contrastive_loss(
@@ -158,12 +243,15 @@ def compute_contrastive_loss(
     if feat.numel() == 0:
         return proj_feat.new_zeros(())
 
+    _ensure_queue_device(queue_state, proj_feat.device)
+
     feat_dim = feat.shape[1]
     device = proj_feat.device
     losses = []
     class_means = {}
 
-    for class_idx in range(len(queue_state.banks)):
+    num_classes = queue_state.banks.shape[0]
+    for class_idx in range(num_classes):
         class_mask = labels == class_idx
         if not class_mask.any():
             continue
@@ -189,11 +277,11 @@ def compute_contrastive_loss(
         negative_classes = []
         negative_scores = []
         for other_idx, other_mean in class_means.items():
-            if other_idx == class_idx or queue_state.banks[other_idx].shape[0] == 0:
+            if other_idx == class_idx or int(queue_state.counts[other_idx].item()) == 0:
                 continue
             negative_classes.append(other_idx)
             negative_scores.append(
-                F.cosine_similarity(class_mean.to(device), other_mean.to(device), dim=1)
+                F.cosine_similarity(class_mean, other_mean.to(device), dim=1)
             )
         if not negative_classes:
             continue
@@ -206,19 +294,20 @@ def compute_contrastive_loss(
             replacement=True,
         ).view(num_query, num_negative)
 
-        negative_feat = torch.zeros(
-            (num_query, num_negative, feat_dim),
+        negative_class_tensor = torch.tensor(
+            negative_classes,
             device=device,
-            dtype=query_feat.dtype,
+            dtype=torch.long,
         )
-        for row in range(num_query):
-            for col in range(num_negative):
-                neg_class = negative_classes[int(sampled_class_indices[row, col].item())]
-                bank = queue_state.banks[neg_class]
-                neg_idx = torch.randint(bank.shape[0], size=(1,)).item()
-                negative_feat[row, col] = bank[neg_idx].to(device)
+        negative_feat = _sample_negative_features(
+            queue_state,
+            negative_class_tensor,
+            sampled_class_indices,
+            feat_dim,
+            query_feat.dtype,
+        )
 
-        positive_feat = class_mean.to(device).expand(num_query, 1, feat_dim)
+        positive_feat = class_mean.expand(num_query, 1, feat_dim).to(dtype=query_feat.dtype)
         all_feat = torch.cat((positive_feat, negative_feat), dim=1)
         logits = F.cosine_similarity(query_feat.unsqueeze(1), all_feat, dim=2)
         targets = torch.zeros(num_query, dtype=torch.long, device=device)
