@@ -16,6 +16,20 @@ def apply_paste_mask(base, paste, paste_mask):
 
 
 @torch.no_grad()
+def forward_pseudo_labels(model, img_u_w):
+    was_training = model.training
+    model.eval()
+    try:
+        pred_u_w = model(img_u_w).detach()
+    finally:
+        if was_training:
+            model.train()
+    conf_u_w = pred_u_w.softmax(dim=1).max(dim=1)[0]
+    mask_u_w = pred_u_w.argmax(dim=1)
+    return pred_u_w, conf_u_w, mask_u_w
+
+
+@torch.no_grad()
 def build_ranpaste_targets(
     mask_u_w,
     conf_u_w,

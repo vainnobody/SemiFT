@@ -1,10 +1,15 @@
 import sys
 
 import torch
+from torch import nn
 
 sys.path.insert(0, "/Users/lanjie/Proj/SSL/SemiFT")
 
-from util.ranpaste_utils import build_ranpaste_images, build_ranpaste_targets
+from util.ranpaste_utils import (
+    build_ranpaste_images,
+    build_ranpaste_targets,
+    forward_pseudo_labels,
+)
 
 
 def test_build_ranpaste_images_pastes_labeled_region_into_unlabeled_image():
@@ -61,3 +66,23 @@ def test_build_ranpaste_targets_excludes_ignore_index_in_pasted_region():
 
     assert mixed_target[:, 0, 0].item() == 255
     assert valid_mask[:, 0, 0].item() is False
+
+
+def test_forward_pseudo_labels_restores_training_mode():
+    class TinyModel(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.conv = nn.Conv2d(3, 5, kernel_size=1)
+
+        def forward(self, x):
+            return self.conv(x)
+
+    model = TinyModel()
+    model.train()
+
+    logits, conf, mask = forward_pseudo_labels(model, torch.randn(2, 3, 4, 4))
+
+    assert logits.shape == (2, 5, 4, 4)
+    assert conf.shape == (2, 4, 4)
+    assert mask.shape == (2, 4, 4)
+    assert model.training is True

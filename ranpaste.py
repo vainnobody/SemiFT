@@ -13,6 +13,7 @@ from util.classes import CLASSES
 from util.ranpaste_utils import (
     build_ranpaste_images,
     build_ranpaste_targets,
+    forward_pseudo_labels,
 )
 from util.ssl_method_utils import (
     build_criterions,
@@ -34,15 +35,6 @@ from util.viz import Visualizer
 @torch.no_grad()
 def validation_cpu(cfg, model, valid_loader):
     return shared_validation_cpu(cfg, model, valid_loader)
-
-
-@torch.no_grad()
-def forward_pseudo_labels(model, img_u_w):
-    pred_u_w = model(img_u_w).detach()
-    conf_u_w = pred_u_w.softmax(dim=1).max(dim=1)[0]
-    mask_u_w = pred_u_w.argmax(dim=1)
-    return pred_u_w, conf_u_w, mask_u_w
-
 
 @torch.no_grad()
 def build_pasted_batches(
@@ -129,7 +121,9 @@ def build_dataloaders(args, cfg):
         sampler=trainsampler_u,
     )
 
-    valsampler = torch.utils.data.distributed.DistributedSampler(valset)
+    valsampler = torch.utils.data.distributed.DistributedSampler(
+        valset, shuffle=False
+    )
     valloader = DataLoader(
         valset,
         batch_size=1,
@@ -139,6 +133,20 @@ def build_dataloaders(args, cfg):
         sampler=valsampler,
     )
     return trainloader_l, trainloader_u, valloader
+
+
+def summarize_confidence(conf_u_w, ignore_mask):
+    valid_region = ignore_mask != 255
+    if valid_region.any():
+        valid_conf = conf_u_w[valid_region]
+    else:
+        valid_conf = conf_u_w.reshape(-1)
+
+    return {
+        "conf_mean": valid_conf.mean(),
+        "conf_p75": torch.quantile(valid_conf, 0.75),
+        "conf_p90": torch.quantile(valid_conf, 0.90),
+    }
 
 
 def main(args, cfg):
@@ -180,6 +188,11 @@ def main(args, cfg):
         total_loss_x = AverageMeter()
         total_loss_u = AverageMeter()
         total_mask_ratio = AverageMeter()
+        total_paste_ratio = AverageMeter()
+        total_pseudo_ratio = AverageMeter()
+        total_conf_mean = AverageMeter()
+        total_conf_p75 = AverageMeter()
+        total_conf_p90 = AverageMeter()
 
         trainloader_l.sampler.set_epoch(epoch)
         trainloader_u.sampler.set_epoch(epoch)
@@ -231,6 +244,16 @@ def main(args, cfg):
             total_loss_u.update(loss_u.item())
             mask_ratio = valid_mask.float().mean()
             total_mask_ratio.update(mask_ratio.item())
+            paste_area_ratio = paste_mask.float().mean()
+            total_paste_ratio.update(paste_area_ratio.item())
+            pseudo_valid_ratio = (
+                ((conf_u_w >= conf_thresh) & (ignore_mask != 255)).float().mean()
+            )
+            total_pseudo_ratio.update(pseudo_valid_ratio.item())
+            conf_stats = summarize_confidence(conf_u_w, ignore_mask)
+            total_conf_mean.update(conf_stats["conf_mean"].item())
+            total_conf_p75.update(conf_stats["conf_p75"].item())
+            total_conf_p90.update(conf_stats["conf_p90"].item())
 
             iters = epoch * len(trainloader_u) + i
             lr = update_lr(optimizer, cfg, iters, total_iters)
@@ -240,6 +263,15 @@ def main(args, cfg):
                 writer.add_scalar("train/loss_x", loss_x.item(), iters)
                 writer.add_scalar("train/loss_u", loss_u.item(), iters)
                 writer.add_scalar("train/mask_ratio", mask_ratio.item(), iters)
+                writer.add_scalar("train/paste_area_ratio", paste_area_ratio.item(), iters)
+                writer.add_scalar(
+                    "train/pseudo_valid_ratio", pseudo_valid_ratio.item(), iters
+                )
+                writer.add_scalar(
+                    "train/conf_mean", conf_stats["conf_mean"].item(), iters
+                )
+                writer.add_scalar("train/conf_p75", conf_stats["conf_p75"].item(), iters)
+                writer.add_scalar("train/conf_p90", conf_stats["conf_p90"].item(), iters)
                 writer.add_scalar("train/lr", lr, iters)
 
             if i < 10:
@@ -249,6 +281,8 @@ def main(args, cfg):
                         "mask_x": (mask_x[0], Visualizer.SEGMENTATION),
                         "img_u_w_mix": (img_u_w_mix[0], Visualizer.TENSOR),
                         "img_u_s_mix": (img_u_s_mix[0], Visualizer.TENSOR),
+                        "paste_mask": (paste_mask[0], Visualizer.TENSOR),
+                        "valid_mask": (valid_mask[0], Visualizer.TENSOR),
                         "target_mix": (target_mix[0], Visualizer.SEGMENTATION),
                         "pred_u": (pred_u.argmax(dim=1)[0], Visualizer.SEGMENTATION),
                     }
@@ -267,6 +301,14 @@ def main(args, cfg):
                         total_loss_u.avg,
                         total_mask_ratio.avg,
                     )
+                )
+                logger.info(
+                    "RanPaste stats: paste_area=%.3f, pseudo_valid=%.3f, conf_mean=%.3f, conf_p75=%.3f, conf_p90=%.3f",
+                    total_paste_ratio.avg,
+                    total_pseudo_ratio.avg,
+                    total_conf_mean.avg,
+                    total_conf_p75.avg,
+                    total_conf_p90.avg,
                 )
 
         val_cfg = dict(cfg)

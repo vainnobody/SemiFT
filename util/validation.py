@@ -1,5 +1,6 @@
 import numpy as np
 import torch
+import torch.distributed as dist
 import torch.nn.functional as F
 
 from util.utils import AverageMeter, intersectionAndUnion
@@ -17,6 +18,18 @@ def extract_validation_logits(output):
             raise TypeError("Validation output list/tuple is empty.")
         return output[0]
     raise TypeError(f"Unsupported validation output type: {type(output)!r}")
+
+
+def sync_histograms(intersection, union, target_area, device):
+    if not dist.is_available() or not dist.is_initialized():
+        return intersection, union, target_area
+
+    reduced = []
+    for value in (intersection, union, target_area):
+        tensor = torch.as_tensor(value, device=device, dtype=torch.float64)
+        dist.all_reduce(tensor, op=dist.ReduceOp.SUM)
+        reduced.append(tensor.cpu().numpy())
+    return tuple(reduced)
 
 
 @torch.no_grad()
@@ -90,6 +103,9 @@ def validation_cpu(cfg, model, valid_loader):
         target = np.array(y, dtype=np.int32)
         intersection, union, target_area = intersectionAndUnion(
             gray, target, cfg["nclass"], cfg["ignore_index"]
+        )
+        intersection, union, target_area = sync_histograms(
+            intersection, union, target_area, x.device
         )
         intersection_meter.update(intersection)
         union_meter.update(union)
