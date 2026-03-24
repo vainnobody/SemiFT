@@ -47,6 +47,7 @@ TRAINING_ENTRYPOINTS = {
     "unimatch_v2.py",
     "unimatch_v2_rgcr.py",
     "unimatchv2_peft.py",
+    "wscl.py",
 }
 
 

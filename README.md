@@ -211,6 +211,7 @@ peft:
 - `unimatch_v2.py`
 - `rankmatch.py`
 - `corrmatch.py`
+- `wscl.py`
 - `dwl.py`
 - `segmind.py`
 
