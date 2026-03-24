@@ -64,14 +64,21 @@ def generate_class_mask(pseudo_labels: torch.Tensor, ignore_index: int = 255) ->
 
 
 def class_mix_batch(
-    img_w: torch.Tensor,
-    img_s: torch.Tensor,
-    pseudo_label: torch.Tensor,
-    pseudo_logit: torch.Tensor,
-    entropy: torch.Tensor,
+    img_w: torch.Tensor | None = None,
+    img_s: torch.Tensor | None = None,
+    pseudo_label: torch.Tensor | None = None,
+    pseudo_logit: torch.Tensor | None = None,
+    entropy: torch.Tensor | None = None,
     ignore_mask: torch.Tensor | None = None,
     ignore_index: int = 255,
+    img_u_w: torch.Tensor | None = None,
 ):
+    if img_w is None:
+        img_w = img_u_w
+    if img_w is None:
+        raise TypeError("class_mix_batch() missing required argument: 'img_w'")
+    if img_s is None or pseudo_label is None or pseudo_logit is None or entropy is None:
+        raise TypeError("class_mix_batch() requires img_s, pseudo_label, pseudo_logit, and entropy")
     batch = img_w.shape[0]
     mix_masks = []
     out_img_w, out_img_s = [], []
