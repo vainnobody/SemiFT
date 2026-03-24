@@ -249,16 +249,31 @@ def compute_contrastive_loss(
     device = proj_feat.device
     losses = []
     class_means = {}
+    valid_class_ids = []
 
     num_classes = queue_state.banks.shape[0]
     for class_idx in range(num_classes):
         class_mask = labels == class_idx
         if not class_mask.any():
             continue
+        valid_class_ids.append(class_idx)
         class_feats = feat[class_mask]
         class_feats_detached = class_feats.detach()
         _enqueue_class_features(queue_state, class_idx, class_feats_detached)
         class_means[class_idx] = class_feats_detached.mean(dim=0, keepdim=True)
+
+    if not valid_class_ids:
+        return proj_feat.new_zeros(())
+
+    global_class_means = torch.zeros(
+        (num_classes, feat_dim),
+        device=device,
+        dtype=feat.dtype,
+    )
+    non_empty_bank_mask = queue_state.counts > 0
+    for class_idx in torch.nonzero(non_empty_bank_mask, as_tuple=False).flatten().tolist():
+        count = int(queue_state.counts[class_idx].item())
+        global_class_means[class_idx] = queue_state.banks[class_idx, :count].mean(dim=0)
 
     for class_idx, class_mean in class_means.items():
         class_mask = labels == class_idx
@@ -274,19 +289,17 @@ def compute_contrastive_loss(
         )
         query_feat = hard_feats[query_idx]
 
-        negative_classes = []
-        negative_scores = []
-        for other_idx, other_mean in class_means.items():
-            if other_idx == class_idx or int(queue_state.counts[other_idx].item()) == 0:
-                continue
-            negative_classes.append(other_idx)
-            negative_scores.append(
-                F.cosine_similarity(class_mean, other_mean.to(device), dim=1)
-            )
-        if not negative_classes:
+        candidate_mask = non_empty_bank_mask.clone()
+        candidate_mask[class_idx] = False
+        if not candidate_mask.any():
             continue
 
-        negative_scores = torch.stack(negative_scores).squeeze(1)
+        negative_classes = torch.nonzero(candidate_mask, as_tuple=False).flatten()
+        negative_scores = F.cosine_similarity(
+            class_mean,
+            global_class_means[negative_classes],
+            dim=1,
+        )
         negative_probs = torch.softmax(negative_scores, dim=0)
         sampled_class_indices = torch.multinomial(
             negative_probs,
@@ -294,14 +307,9 @@ def compute_contrastive_loss(
             replacement=True,
         ).view(num_query, num_negative)
 
-        negative_class_tensor = torch.tensor(
-            negative_classes,
-            device=device,
-            dtype=torch.long,
-        )
         negative_feat = _sample_negative_features(
             queue_state,
-            negative_class_tensor,
+            negative_classes,
             sampled_class_indices,
             feat_dim,
             query_feat.dtype,
@@ -315,4 +323,4 @@ def compute_contrastive_loss(
 
     if not losses:
         return proj_feat.new_zeros(())
-    return torch.stack(losses).mean()
+    return torch.stack(losses).sum() / len(valid_class_ids)

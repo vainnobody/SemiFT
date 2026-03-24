@@ -220,11 +220,11 @@ def main(args, cfg):
         if rank == 0:
             logger.info("************ Load from checkpoint at epoch %i\n", start_epoch)
 
-    alpha_ema = cfg.get("alpha_ema", 0.99)
-    epoch_pre = cfg.get("epoch_pre", cfg["epochs"])
+    alpha_ema = cfg.get("alpha_ema", 0.9)
+    epoch_pre = cfg.get("epoch_pre", max(cfg["epochs"] // 2, 1))
     conf_thresh = cfg.get("conf_thresh", 0.7)
     mask_rate = cfg.get("mask_rate", cfg.get("mask_rate_end", 0.25))
-    mask_gap = cfg.get("mask_gap", 16)
+    mask_gap = cfg.get("mask_gap", 4)
 
     for epoch in range(start_epoch + 1, cfg["epochs"]):
         trainloader_l.sampler.set_epoch(epoch)
