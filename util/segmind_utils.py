@@ -2,7 +2,6 @@ from dataclasses import dataclass
 
 import numpy as np
 import torch
-import torch.distributed as dist
 import torch.nn.functional as F
 
 
@@ -65,14 +64,6 @@ def classmix_batch(*tensors, labels):
 
     outputs = [torch.cat(items, dim=0) for items in mixed_tensors]
     return (*outputs, torch.stack(mixed_masks, dim=0))
-
-
-def gather_tensor_if_distributed(tensor):
-    if not dist.is_available() or not dist.is_initialized():
-        return tensor
-    gathered = [torch.zeros_like(tensor) for _ in range(dist.get_world_size())]
-    dist.all_gather(gathered, tensor.contiguous())
-    return torch.cat(gathered, dim=0)
 
 
 def resize_labels_to_shape(labels, target_shape):
@@ -147,15 +138,13 @@ def compute_contrastive_loss(
     num_negative,
     ignore_index,
 ):
-    proj_feat = gather_tensor_if_distributed(proj_feat.detach())
-    labels = gather_tensor_if_distributed(labels.detach())
-    probs = gather_tensor_if_distributed(probs.detach())
-
+    # Keep gradients on current-batch query features so loss_c updates the
+    # projection branch, matching SegMind's contrastive objective.
     feat = F.normalize(proj_feat.float(), dim=1)
     feat = feat.permute(0, 2, 3, 1).reshape(-1, feat.shape[1])
-    labels = resize_labels_to_shape(labels, proj_feat.shape[-2:]).reshape(-1)
+    labels = resize_labels_to_shape(labels.detach(), proj_feat.shape[-2:]).reshape(-1)
     probs = F.interpolate(
-        probs.float(),
+        probs.detach().float(),
         size=proj_feat.shape[-2:],
         mode="bilinear",
         align_corners=True,
@@ -179,8 +168,9 @@ def compute_contrastive_loss(
         if not class_mask.any():
             continue
         class_feats = feat[class_mask]
-        _enqueue_class_features(queue_state, class_idx, class_feats)
-        class_means[class_idx] = class_feats.mean(dim=0, keepdim=True)
+        class_feats_detached = class_feats.detach()
+        _enqueue_class_features(queue_state, class_idx, class_feats_detached)
+        class_means[class_idx] = class_feats_detached.mean(dim=0, keepdim=True)
 
     for class_idx, class_mean in class_means.items():
         class_mask = labels == class_idx

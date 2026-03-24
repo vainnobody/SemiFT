@@ -256,7 +256,7 @@ def main(args, cfg):
 
             with torch.no_grad():
                 teacher_inputs = torch.cat((img_l_w, img_u_w), dim=0)
-                teacher_logits = model_ema(teacher_inputs)["out"].detach()
+                teacher_logits = model_ema(teacher_inputs, return_proj=False)["out"].detach()
                 teacher_probs = torch.softmax(teacher_logits, dim=1)
                 teacher_entropy = torch.sum(
                     -teacher_probs * torch.log(teacher_probs.clamp_min(1e-8)),
@@ -288,7 +288,10 @@ def main(args, cfg):
                 pseudo_label_mix[valid_mask_mix < 0.5] = cfg["ignore_index"]
 
             strong_inputs = torch.cat((img_l_s, img_u_s_mix), dim=0)
-            student_outputs = model(strong_inputs)
+            student_outputs = model(
+                strong_inputs,
+                return_proj=cfg.get("lambda_c", 1.0) != 0,
+            )
             student_logits = student_outputs["out"]
             student_probs = torch.softmax(student_logits, dim=1)
             student_entropy = torch.sum(
@@ -314,6 +317,7 @@ def main(args, cfg):
                 masked_inputs = weak_inputs * mask_tensor
                 recon_outputs = model(
                     masked_inputs,
+                    return_proj=False,
                     return_reconstruction=True,
                     reconstruction_mask=mask_tensor,
                 )

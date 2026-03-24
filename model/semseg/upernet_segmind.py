@@ -21,7 +21,13 @@ class UPerNet_SegMind(UperNet):
             out_channels=3,
         )
 
-    def forward(self, x, return_reconstruction=False, reconstruction_mask=None):
+    def forward(
+        self,
+        x,
+        return_proj=True,
+        return_reconstruction=False,
+        reconstruction_mask=None,
+    ):
         feat_maps = self._extract_feature_maps(x)
         pyramid_feats = self.neck(feat_maps)
         logits, decoder_feats = self.decoder(pyramid_feats, return_feats=True)
@@ -34,8 +40,9 @@ class UPerNet_SegMind(UperNet):
 
         outputs = {
             "out": logits,
-            "proj_feat": self.proj_head(decoder_feats),
         }
+        if return_proj:
+            outputs["proj_feat"] = self.proj_head(decoder_feats)
         if return_reconstruction:
             if reconstruction_mask is None:
                 raise ValueError("reconstruction_mask is required when return_reconstruction=True")

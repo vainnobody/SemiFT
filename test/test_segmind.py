@@ -87,6 +87,8 @@ def test_dpt_segmind_wrapper_returns_expected_keys():
     assert outputs["proj_feat"].shape == (2, 4, 4, 4)
     assert "recon" in recon_outputs
     assert recon_outputs["recon"].shape == (2, 3, 16, 16)
+    outputs_no_proj = model(torch.randn(2, 3, 16, 16), return_proj=False)
+    assert set(outputs_no_proj.keys()) == {"out"}
 
 
 def test_upernet_segmind_wrapper_returns_expected_keys():
@@ -106,6 +108,8 @@ def test_upernet_segmind_wrapper_returns_expected_keys():
     assert outputs["proj_feat"].shape == (2, 4, 4, 4)
     assert "recon" in recon_outputs
     assert recon_outputs["recon"].shape == (2, 3, 16, 16)
+    outputs_no_proj = model(torch.randn(2, 3, 16, 16), return_proj=False)
+    assert set(outputs_no_proj.keys()) == {"out"}
 
 
 def test_segmind_queue_state_roundtrip_and_contrastive_loss():
@@ -162,3 +166,26 @@ def test_classmix_batch_preserves_batch_tensor_ranks():
     assert outputs[1].shape == (2, 3, 8, 8)
     assert outputs[2].shape == (2, 8, 8)
     assert outputs[6].shape == (2, 8, 8)
+
+
+def test_contrastive_loss_keeps_gradient_on_query_features():
+    queue_state = init_queue_state(num_classes=3, feat_dim=4, bank_size=16)
+    proj_feat = torch.randn(2, 4, 4, 4, requires_grad=True)
+    labels = torch.randint(0, 3, (2, 8, 8))
+    probs = torch.softmax(torch.randn(2, 3, 8, 8), dim=1)
+
+    loss = compute_contrastive_loss(
+        proj_feat,
+        labels,
+        probs,
+        queue_state,
+        query_threshold=0.95,
+        temperature=0.5,
+        num_query=4,
+        num_negative=4,
+        ignore_index=255,
+    )
+    loss.backward()
+
+    assert proj_feat.grad is not None
+    assert torch.isfinite(proj_feat.grad).all()
