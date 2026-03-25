@@ -131,6 +131,10 @@ def test_validate_loss_weights_rejects_all_zero_weights():
         raise AssertionError("validate_loss_weights should reject all-zero SegMind loss weights")
 
 
+def test_needs_pseudo_branch_uses_official_default_weights():
+    assert needs_pseudo_branch({})
+
+
 def test_generate_grid_mask_matches_requested_ratio_and_shape():
     mask = generate_grid_mask(2, 32, 32, mask_gap=8, mask_rate=0.25, device=torch.device("cpu"))
     assert mask.shape == (2, 1, 32, 32)

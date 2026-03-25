@@ -47,7 +47,7 @@ def build_entropy_targets(teacher_entropy_l, mixed_entropy):
 
 def needs_pseudo_branch(segmind_cfg):
     return any(
-        float(segmind_cfg.get(key, 0.0)) != 0.0
+        float(segmind_cfg.get(key, 1.0)) != 0.0
         for key in ("lambda_l", "lambda_e", "lambda_r", "lambda_rsc", "lambda_c")
     )
 
