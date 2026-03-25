@@ -197,8 +197,14 @@ class Visualizer:
         if tensor.ndim == 3 and tensor.shape[-1] == 1:
             tensor = tensor.squeeze(-1)
 
+        # numpy bool arrays do not support subtraction; cast masks before normalization.
+        if tensor.dtype == np.bool_:
+            tensor = tensor.astype(np.float32)
+
         # 归一化到 [0, 1]
-        tensor = (tensor - tensor.min()) / (tensor.max() - tensor.min() + 1e-8)
+        tensor_min = tensor.min()
+        tensor_max = tensor.max()
+        tensor = (tensor - tensor_min) / (tensor_max - tensor_min + 1e-8)
         return tensor
 
     def _add_legend(self, ax, img):
