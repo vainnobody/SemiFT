@@ -25,7 +25,7 @@ if str(REPO_ROOT) not in sys.path:
 from model.semseg import dpt as dpt_mod
 from model.semseg import upernet as upernet_mod
 from model.semseg.segmind import SegMindModel
-from segmind import build_entropy_targets, needs_pseudo_branch
+from segmind import build_entropy_targets, needs_pseudo_branch, validate_loss_weights
 from util.segmind_utils import class_mix_batch, create_memory_bank, generate_class_mask, generate_grid_mask, segmind_contrastive_loss
 
 
@@ -120,6 +120,15 @@ def test_needs_pseudo_branch_depends_on_pseudo_or_auxiliary_losses():
     assert needs_pseudo_branch(
         {"lambda_l": 0.0, "lambda_e": 0.0, "lambda_r": 0.0, "lambda_rsc": 0.0, "lambda_c": 1.0}
     )
+
+
+def test_validate_loss_weights_rejects_all_zero_weights():
+    try:
+        validate_loss_weights({"lambda_l": 0.0, "lambda_e": 0.0, "lambda_r": 0.0, "lambda_rsc": 0.0, "lambda_c": 0.0})
+    except ValueError as exc:
+        assert "must be non-zero" in str(exc)
+    else:
+        raise AssertionError("validate_loss_weights should reject all-zero SegMind loss weights")
 
 
 def test_generate_grid_mask_matches_requested_ratio_and_shape():

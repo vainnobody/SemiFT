@@ -51,6 +51,11 @@ def needs_pseudo_branch(segmind_cfg):
         for key in ("lambda_l", "lambda_e", "lambda_r", "lambda_rsc", "lambda_c")
     )
 
+
+def validate_loss_weights(segmind_cfg):
+    if not needs_pseudo_branch(segmind_cfg):
+        raise ValueError("At least one SegMind loss weight must be non-zero.")
+
 def get_parser():
     parser = argparse.ArgumentParser(
         description="SegMind training adapted to the SemiFT training scaffold"
@@ -97,6 +102,7 @@ def build_dataloaders(args, cfg):
 
 def main(args, cfg):
     segmind_cfg = cfg.setdefault("segmind", {})
+    validate_loss_weights(segmind_cfg)
     use_pseudo_branch = needs_pseudo_branch(segmind_cfg)
 
     logger, rank, _, writer = build_logger_and_runtime(args, cfg)
