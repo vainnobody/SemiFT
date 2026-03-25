@@ -48,7 +48,7 @@ def build_entropy_targets(teacher_entropy_l, mixed_entropy):
 def needs_pseudo_branch(segmind_cfg):
     return any(
         float(segmind_cfg.get(key, 0.0)) != 0.0
-        for key in ("lambda_pseudo", "lambda_e", "lambda_r", "lambda_rsc", "lambda_c")
+        for key in ("lambda_l", "lambda_e", "lambda_r", "lambda_rsc", "lambda_c")
     )
 
 def get_parser():
@@ -161,7 +161,6 @@ def main(args, cfg):
     mask_rate = segmind_cfg.get("mask_rate", 0.25)
     epoch_pre = segmind_cfg.get("epoch_pre", max(cfg["epochs"] // 2, 1))
     lambda_l = segmind_cfg.get("lambda_l", 1.0)
-    lambda_pseudo = segmind_cfg.get("lambda_pseudo", 1.0)
     lambda_e = segmind_cfg.get("lambda_e", 1.0)
     lambda_r = segmind_cfg.get("lambda_r", 1.0)
     lambda_rsc = segmind_cfg.get("lambda_rsc", 1.0)
@@ -192,13 +191,13 @@ def main(args, cfg):
             ignore_u = ignore_u.cuda(local_rank)
             del ignore_u
 
-            logits_l = model(img_l_w)
-            loss_x = criterion_l(logits_l, mask_l)
-            loss_pseudo = logits_l.sum() * 0.0
-            loss_e = logits_l.sum() * 0.0
-            loss_c = logits_l.sum() * 0.0
-            loss_r = logits_l.sum() * 0.0
-            loss_rsc = logits_l.sum() * 0.0
+            zero = img_l_w.sum() * 0.0
+            loss_x = zero
+            loss_e = zero
+            loss_c = zero
+            loss_r = zero
+            loss_rsc = zero
+            logits_l = None
 
             if use_pseudo_branch:
                 teacher_logits, pseudo_logit, pseudo_label, teacher_entropy_u = gather_pseudo_from_teacher(model_ema, img_l_w, img_u_w)
@@ -222,8 +221,8 @@ def main(args, cfg):
                 strong_outputs = model(strong_inputs, return_aux=True)
                 seg_logits = strong_outputs["seg_logits"]
                 prob_all = seg_logits.softmax(dim=1)
-                _, pred_u = seg_logits.split([img_l_s.shape[0], mixed_u["img_s"].shape[0]], dim=0)
-                loss_pseudo = criterion_l(pred_u, mixed_u["pseudo_label"])
+                logits_l, _ = seg_logits.split([img_l_s.shape[0], mixed_u["img_s"].shape[0]], dim=0)
+                loss_x = criterion_l(seg_logits, label_all)
 
                 if lambda_e != 0.0:
                     student_entropy = torch.sum(-prob_all * torch.log(prob_all.clamp_min(1e-8)), dim=1)
@@ -273,14 +272,7 @@ def main(args, cfg):
                     else:
                         loss_rsc = loss_rsc_map.sum() * 0.0
 
-            loss = (
-                lambda_l * loss_x
-                + lambda_pseudo * loss_pseudo
-                + lambda_e * loss_e
-                + lambda_c * loss_c
-                + lambda_r * loss_r
-                + lambda_rsc * loss_rsc
-            )
+            loss = lambda_l * loss_x + lambda_e * loss_e + lambda_c * loss_c + lambda_r * loss_r + lambda_rsc * loss_rsc
 
             optimizer.zero_grad()
             loss.backward()
@@ -296,7 +288,6 @@ def main(args, cfg):
                 {
                     "loss": loss.item(),
                     "loss_x": loss_x.item(),
-                    "loss_pseudo": loss_pseudo.item(),
                     "loss_e": loss_e.item(),
                     "loss_c": loss_c.item(),
                     "loss_r": loss_r.item(),
@@ -307,7 +298,6 @@ def main(args, cfg):
             if rank == 0:
                 writer.add_scalar("train/loss_all", loss.item(), iters)
                 writer.add_scalar("train/loss_x", loss_x.item(), iters)
-                writer.add_scalar("train/loss_pseudo", loss_pseudo.item(), iters)
                 if use_pseudo_branch:
                     writer.add_scalar("train/pseudo_conf", mixed_u["pseudo_logit"].mean().item(), iters)
                 writer.add_scalar("train/loss_e", loss_e.item(), iters)
@@ -321,7 +311,7 @@ def main(args, cfg):
                         {
                             "img_l_w": (img_l_w[0], Visualizer.TENSOR),
                             "mask_l": (mask_l[0], Visualizer.SEGMENTATION),
-                            "pred_l_w": (logits_l.argmax(dim=1)[0], Visualizer.SEGMENTATION),
+                            "pred_l_w": (logits_l.argmax(dim=1)[0], Visualizer.SEGMENTATION) if logits_l is not None else (mask_l[0], Visualizer.SEGMENTATION),
                         }
                     )
                     if use_pseudo_branch:

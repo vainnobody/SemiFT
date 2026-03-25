@@ -112,13 +112,13 @@ def test_build_entropy_targets_is_plain_concatenation():
 
 def test_needs_pseudo_branch_depends_on_pseudo_or_auxiliary_losses():
     assert not needs_pseudo_branch(
-        {"lambda_pseudo": 0.0, "lambda_e": 0.0, "lambda_r": 0.0, "lambda_rsc": 0.0, "lambda_c": 0.0}
+        {"lambda_l": 0.0, "lambda_e": 0.0, "lambda_r": 0.0, "lambda_rsc": 0.0, "lambda_c": 0.0}
     )
     assert needs_pseudo_branch(
-        {"lambda_pseudo": 1.0, "lambda_e": 0.0, "lambda_r": 0.0, "lambda_rsc": 0.0, "lambda_c": 0.0}
+        {"lambda_l": 1.0, "lambda_e": 0.0, "lambda_r": 0.0, "lambda_rsc": 0.0, "lambda_c": 0.0}
     )
     assert needs_pseudo_branch(
-        {"lambda_pseudo": 0.0, "lambda_e": 0.0, "lambda_r": 0.0, "lambda_rsc": 0.0, "lambda_c": 1.0}
+        {"lambda_l": 0.0, "lambda_e": 0.0, "lambda_r": 0.0, "lambda_rsc": 0.0, "lambda_c": 1.0}
     )
 
 
@@ -190,16 +190,14 @@ def test_segmind_source_uses_shared_helpers_and_validation_wrapper():
     assert 'return shared_validation_cpu(cfg, model, valid_loader)' in text
     assert 'criterion_l, _ = build_criterions(cfg, local_rank)' in text
     assert 'model = SegMindModel(' in text
-    assert 'logits_l = model(img_l_w)' in text
-    assert 'loss_x = criterion_l(logits_l, mask_l)' in text
-    assert 'loss_pseudo = criterion_l(pred_u, mixed_u["pseudo_label"])' in text
-    assert 'lambda_pseudo = segmind_cfg.get("lambda_pseudo", 1.0)' in text
+    assert 'loss_x = criterion_l(seg_logits, label_all)' in text
     assert 'teacher_entropy_l' in text
     assert 'strong_outputs = model(strong_inputs, return_aux=True)' in text
     assert 'masked_weak_inputs = weak_inputs * mim_mask' in text
     assert 'recon_outputs = model(masked_weak_inputs, mim_mask=mim_mask, return_aux=True)' in text
     assert 'feat=strong_outputs["proj_feat"]' in text
     assert 'writer.add_scalar("train/pseudo_conf", mixed_u["pseudo_logit"].mean().item(), iters)' in text
-    assert 'train/loss_pseudo' in text
+    assert 'lambda_pseudo' not in text
+    assert 'loss_pseudo' not in text
     assert 'build_labeled_only_dataloaders' not in text
     assert 'runtime_cfg' not in text
