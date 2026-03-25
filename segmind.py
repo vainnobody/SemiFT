@@ -1,7 +1,9 @@
 import argparse
 import logging
+import time
 
 import torch
+import torch.distributed as dist
 import torch.nn.functional as F
 from torch import nn
 from torch.utils.data import DataLoader
@@ -26,7 +28,6 @@ from util.ssl_method_utils import (
 )
 from util.train_utils import DictAverageMeter
 from util.validation import validation_cpu as shared_validation_cpu
-from util.viz import Visualizer
 from util.segmind_utils import (
     class_mix_batch,
     create_memory_bank,
@@ -55,6 +56,12 @@ def needs_pseudo_branch(segmind_cfg):
 def validate_loss_weights(segmind_cfg):
     if not needs_pseudo_branch(segmind_cfg):
         raise ValueError("At least one SegMind loss weight must be non-zero.")
+
+
+def maybe_barrier():
+    if dist.is_available() and dist.is_initialized() and dist.get_world_size() > 1:
+        dist.barrier()
+
 
 def get_parser():
     parser = argparse.ArgumentParser(
@@ -90,12 +97,22 @@ def build_dataloaders(args, cfg):
     valset = ValDataset(cfg["dataset"], cfg["data_root"], "val", ignore_value=cfg["ignore_index"])
 
     workers = cfg.get("workers", 4)
+    persistent_workers = workers > 0
+    loader_kwargs = {
+        "batch_size": cfg["batch_size"],
+        "pin_memory": True,
+        "num_workers": workers,
+        "persistent_workers": persistent_workers,
+        "drop_last": True,
+    }
+    if workers > 0:
+        loader_kwargs["prefetch_factor"] = cfg.get("prefetch_factor", 2)
     trainsampler_l = torch.utils.data.distributed.DistributedSampler(trainset_l)
     trainsampler_u = torch.utils.data.distributed.DistributedSampler(trainset_u)
     valsampler = torch.utils.data.distributed.DistributedSampler(valset)
 
-    trainloader_l = DataLoader(trainset_l, batch_size=cfg["batch_size"], pin_memory=True, num_workers=workers, drop_last=True, sampler=trainsampler_l)
-    trainloader_u = DataLoader(trainset_u, batch_size=cfg["batch_size"], pin_memory=True, num_workers=workers, drop_last=True, sampler=trainsampler_u)
+    trainloader_l = DataLoader(trainset_l, sampler=trainsampler_l, **loader_kwargs)
+    trainloader_u = DataLoader(trainset_u, sampler=trainsampler_u, **loader_kwargs)
     valloader = DataLoader(valset, batch_size=1, pin_memory=True, num_workers=1, drop_last=False, sampler=valsampler)
     return trainloader_l, trainloader_u, valloader
 
@@ -154,9 +171,7 @@ def main(args, cfg):
     if latest_extra is not None:
         memory_bank.load_state_dict(latest_extra, device)
 
-    from datetime import datetime
-
-    viz = Visualizer(save_dir=f"./viz/{datetime.now().strftime('%Y%m%d_%H%M%S')}", dataset=cfg["dataset"])
+    viz = None
 
     ema_decay = segmind_cfg.get("ema_decay", 0.99)
     query_threshold = segmind_cfg.get("query_threshold", 0.97)
@@ -171,6 +186,9 @@ def main(args, cfg):
     lambda_r = segmind_cfg.get("lambda_r", 1.0)
     lambda_rsc = segmind_cfg.get("lambda_rsc", 1.0)
     lambda_c = segmind_cfg.get("lambda_c", 1.0)
+    log_interval = max(1, len(trainloader_u) // 8)
+    tb_interval = log_interval
+    timing_debug = False
 
     for epoch in range(start_epoch, cfg["epochs"]):
         if rank == 0:
@@ -188,7 +206,10 @@ def main(args, cfg):
         model.train()
         model_ema.train()
         meter = DictAverageMeter()
+        data_end = time.perf_counter()
         for i, ((img_l_w, img_l_s, mask_l), (img_u_w, img_u_s, ignore_u)) in enumerate(zip(trainloader_l, trainloader_u)):
+            iter_start = time.perf_counter()
+            data_time = iter_start - data_end
             img_l_w = img_l_w.cuda(local_rank)
             img_l_s = img_l_s.cuda(local_rank)
             mask_l = mask_l.cuda(local_rank)
@@ -206,6 +227,7 @@ def main(args, cfg):
             logits_l = None
 
             if use_pseudo_branch:
+                forward_start = time.perf_counter()
                 teacher_logits, pseudo_logit, pseudo_label, teacher_entropy_u = gather_pseudo_from_teacher(model_ema, img_l_w, img_u_w)
                 teacher_prob = teacher_logits.softmax(dim=1)
                 teacher_entropy_l = torch.sum(
@@ -277,12 +299,17 @@ def main(args, cfg):
                         loss_rsc = loss_rsc_map[valid_hidden].mean()
                     else:
                         loss_rsc = loss_rsc_map.sum() * 0.0
+                forward_time = time.perf_counter() - forward_start
+            else:
+                forward_time = 0.0
 
             loss = lambda_l * loss_x + lambda_e * loss_e + lambda_c * loss_c + lambda_r * loss_r + lambda_rsc * loss_rsc
 
+            backward_start = time.perf_counter()
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
+            backward_time = time.perf_counter() - backward_start
 
             current_loader_len = len(trainloader_u)
             iters = epoch * current_loader_len + i
@@ -302,17 +329,18 @@ def main(args, cfg):
             )
 
             if rank == 0:
-                writer.add_scalar("train/loss_all", loss.item(), iters)
-                writer.add_scalar("train/loss_x", loss_x.item(), iters)
-                if use_pseudo_branch:
-                    writer.add_scalar("train/pseudo_conf", mixed_u["pseudo_logit"].mean().item(), iters)
-                writer.add_scalar("train/loss_e", loss_e.item(), iters)
-                writer.add_scalar("train/loss_c", loss_c.item(), iters)
-                writer.add_scalar("train/loss_r", loss_r.item(), iters)
-                writer.add_scalar("train/loss_rsc", loss_rsc.item(), iters)
-                writer.add_scalar("train/lr", lr, iters)
+                if iters % tb_interval == 0:
+                    writer.add_scalar("train/loss_all", loss.item(), iters)
+                    writer.add_scalar("train/loss_x", loss_x.item(), iters)
+                    if use_pseudo_branch:
+                        writer.add_scalar("train/pseudo_conf", mixed_u["pseudo_logit"].mean().item(), iters)
+                    writer.add_scalar("train/loss_e", loss_e.item(), iters)
+                    writer.add_scalar("train/loss_c", loss_c.item(), iters)
+                    writer.add_scalar("train/loss_r", loss_r.item(), iters)
+                    writer.add_scalar("train/loss_rsc", loss_rsc.item(), iters)
+                    writer.add_scalar("train/lr", lr, iters)
 
-                if i < 5:
+                if viz is not None and i < 5:
                     viz.push(
                         {
                             "img_l_w": (img_l_w[0], Visualizer.TENSOR),
@@ -333,13 +361,27 @@ def main(args, cfg):
                     viz.render(f"epoch_{epoch}_iter_{i}")
                     viz.reset()
 
-            log_interval = max(1, current_loader_len // 8)
             if rank == 0 and i % log_interval == 0:
-                logger.info("Iters: %d, LR: %.7f, %s", i, lr, meter)
+                if timing_debug:
+                    iter_time = time.perf_counter() - iter_start
+                    logger.info(
+                        "Iters: %d, LR: %.7f, %s, t_data: %.3f, t_fwd: %.3f, t_bwd: %.3f, t_iter: %.3f",
+                        i,
+                        lr,
+                        meter,
+                        data_time,
+                        forward_time,
+                        backward_time,
+                        iter_time,
+                    )
+                else:
+                    logger.info("Iters: %d, LR: %.7f, %s", i, lr, meter)
+            data_end = time.perf_counter()
 
         val_cfg = dict(cfg)
         val_cfg.setdefault("eval_mode", "slide_window" if cfg["dataset"] == "cityscapes" else "original")
         val_cfg.setdefault("ignore_index", cfg.get("ignore_index", 255))
+        maybe_barrier()
         mIoU, iou_class = validation_cpu(val_cfg, model, valloader)
         mIoU_ema, iou_class_ema = validation_cpu(val_cfg, model_ema, valloader)
 
@@ -378,6 +420,7 @@ def main(args, cfg):
             extra={"segmind_bank": memory_bank.state_dict()},
             is_best=is_best,
         )
+        maybe_barrier()
 
 
 if __name__ == "__main__":

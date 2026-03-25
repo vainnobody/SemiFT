@@ -3,7 +3,7 @@ import torch
 import torch.distributed as dist
 import torch.nn.functional as F
 
-from util.utils import AverageMeter, intersectionAndUnion
+from util.utils import intersectionAndUnion
 
 
 def extract_validation_logits(output):
@@ -24,21 +24,29 @@ def sync_histograms(intersection, union, target_area, device):
     if not dist.is_available() or not dist.is_initialized():
         return intersection, union, target_area
 
-    reduced = []
-    for value in (intersection, union, target_area):
-        tensor = torch.as_tensor(value, device=device, dtype=torch.float64)
-        dist.all_reduce(tensor, op=dist.ReduceOp.SUM)
-        reduced.append(tensor.cpu().numpy())
-    return tuple(reduced)
+    chunks = [
+        torch.as_tensor(intersection, device=device, dtype=torch.float64),
+        torch.as_tensor(union, device=device, dtype=torch.float64),
+        torch.as_tensor(target_area, device=device, dtype=torch.float64),
+    ]
+    sizes = [chunk.numel() for chunk in chunks]
+    fused = torch.cat([chunk.reshape(-1) for chunk in chunks], dim=0)
+    dist.all_reduce(fused, op=dist.ReduceOp.SUM)
+
+    outputs = []
+    offset = 0
+    for size, chunk in zip(sizes, chunks):
+        outputs.append(fused[offset : offset + size].reshape(chunk.shape).cpu().numpy())
+        offset += size
+    return tuple(outputs)
 
 
 @torch.no_grad()
 def validation_cpu(cfg, model, valid_loader):
-    intersection_meter = AverageMeter()
-    union_meter = AverageMeter()
-    target_meter = AverageMeter()
-
     model.eval()
+    local_intersection = None
+    local_union = None
+    local_target = None
 
     for x, y, _ in valid_loader:
         x = x.cuda()
@@ -104,14 +112,26 @@ def validation_cpu(cfg, model, valid_loader):
         intersection, union, target_area = intersectionAndUnion(
             gray, target, cfg["nclass"], cfg["ignore_index"]
         )
-        intersection, union, target_area = sync_histograms(
-            intersection, union, target_area, x.device
-        )
-        intersection_meter.update(intersection)
-        union_meter.update(union)
-        target_meter.update(target_area)
+        if local_intersection is None:
+            local_intersection = np.array(intersection, dtype=np.float64, copy=True)
+            local_union = np.array(union, dtype=np.float64, copy=True)
+            local_target = np.array(target_area, dtype=np.float64, copy=True)
+        else:
+            local_intersection += intersection
+            local_union += union
+            local_target += target_area
 
-    iou_class = intersection_meter.sum / (union_meter.sum + 1e-10)
+    if local_intersection is None:
+        local_intersection = np.zeros(cfg["nclass"], dtype=np.float64)
+        local_union = np.zeros(cfg["nclass"], dtype=np.float64)
+        local_target = np.zeros(cfg["nclass"], dtype=np.float64)
+
+    device = torch.device("cuda", torch.cuda.current_device())
+    intersection, union, target_area = sync_histograms(
+        local_intersection, local_union, local_target, device
+    )
+
+    iou_class = intersection / (union + 1e-10)
     if cfg["dataset"] == "iSAID":
         mIoU = np.mean(iou_class[1:]) * 100.0
     else:

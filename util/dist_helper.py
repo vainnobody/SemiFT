@@ -1,11 +1,12 @@
 import os
 import subprocess
+from datetime import timedelta
 
 import torch
 import torch.distributed as dist
 
 
-def setup_distributed(backend="nccl", port=None):
+def setup_distributed(backend="nccl", port=None, timeout_min=None):
     """AdaHessian Optimizer
     Lifted from https://github.com/BIGBALLON/distribuuuu/blob/master/distribuuuu/utils.py
     Originally licensed MIT, Copyright (c) 2020 Wei Li
@@ -40,9 +41,13 @@ def setup_distributed(backend="nccl", port=None):
             flush=True,
         )
 
+    if timeout_min is None:
+        timeout_min = float(os.environ.get("SEMIFT_DDP_TIMEOUT_MIN", "30"))
+
     dist.init_process_group(
         backend=backend,
         world_size=world_size,
         rank=rank,
+        timeout=timedelta(minutes=float(timeout_min)),
     )
     return rank, world_size

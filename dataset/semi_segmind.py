@@ -1,7 +1,6 @@
 from copy import deepcopy
 import math
 import os
-import random
 
 import numpy as np
 import torch
@@ -82,7 +81,7 @@ class SegMindDataset(Dataset):
         return strong
 
     def __getitem__(self, item):
-        sample_id = self.ids[item % len(self.ids)] if self.mode == "val" else random.choice(self.ids)
+        sample_id = self.ids[item % len(self.ids)]
         img, mask = self._load_pair(sample_id)
 
         if self.mode == "val":
