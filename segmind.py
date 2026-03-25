@@ -42,6 +42,30 @@ def validation_cpu(cfg, model, valid_loader):
     return shared_validation_cpu(cfg, model, valid_loader)
 
 
+def apply_ignore_mask_to_labels(labels, ignore_mask, ignore_index):
+    if ignore_mask is None:
+        return labels
+    return labels.masked_fill(ignore_mask == 255, ignore_index)
+
+
+def build_entropy_targets(mask_l, mixed_entropy, student_entropy, ignore_mask, ignore_index):
+    teacher_entropy_all = torch.cat(
+        (
+            torch.zeros_like(mask_l, dtype=student_entropy.dtype),
+            mixed_entropy,
+        ),
+        dim=0,
+    )
+    valid_entropy = torch.cat(
+        (
+            mask_l != ignore_index,
+            ignore_mask != 255,
+        ),
+        dim=0,
+    )
+    return teacher_entropy_all, valid_entropy
+
+
 def get_parser():
     parser = argparse.ArgumentParser(
         description="SegMind training adapted to the SemiFT training scaffold"
@@ -180,39 +204,27 @@ def main(args, cfg):
                 ignore_index=cfg["ignore_index"],
             )
 
-            img_all_s = torch.cat((img_l_s, mixed_u["img_s"]), dim=0)
-            label_all = torch.cat((mask_l, mixed_u["pseudo_label"]), dim=0)
-            ignore_all = torch.cat((mask_l.ne(cfg["ignore_index"]).long() * 0, mixed_u["ignore_mask"]), dim=0)
-
-            mim_mask = generate_grid_mask(
-                batch=img_all_s.shape[0],
-                height=img_all_s.shape[-2],
-                width=img_all_s.shape[-1],
-                mask_gap=mask_gap,
-                mask_rate=mask_rate,
-                device=img_all_s.device,
+            strong_inputs = torch.cat((img_l_s, mixed_u["img_s"]), dim=0)
+            weak_inputs = torch.cat((img_l_w, mixed_u["img_w"]), dim=0)
+            pseudo_label = apply_ignore_mask_to_labels(
+                mixed_u["pseudo_label"],
+                mixed_u["ignore_mask"],
+                cfg["ignore_index"],
             )
-            masked_input = img_all_s * mim_mask
-            outputs = model(masked_input, mim_mask=mim_mask, return_aux=True)
-            seg_logits = outputs["seg_logits"]
-            prob_all = seg_logits.softmax(dim=1)
+            label_all = torch.cat((mask_l, pseudo_label), dim=0)
 
+            strong_outputs = model(strong_inputs, return_aux=True)
+            seg_logits = strong_outputs["seg_logits"]
+            prob_all = seg_logits.softmax(dim=1)
             loss_l = criterion_l(seg_logits, label_all)
 
             student_entropy = torch.sum(-prob_all * torch.log(prob_all.clamp_min(1e-8)), dim=1)
-            teacher_entropy_all = torch.cat(
-                (
-                    torch.zeros_like(mask_l, dtype=student_entropy.dtype),
-                    mixed_u["entropy"],
-                ),
-                dim=0,
-            )
-            valid_entropy = torch.cat(
-                (
-                    mask_l != cfg["ignore_index"],
-                    mixed_u["ignore_mask"] != 255,
-                ),
-                dim=0,
+            teacher_entropy_all, valid_entropy = build_entropy_targets(
+                mask_l,
+                mixed_u["entropy"],
+                student_entropy,
+                mixed_u["ignore_mask"],
+                cfg["ignore_index"],
             )
             if entropy_percent < 100:
                 entropy_mask = percentile_entropy_mask(student_entropy, valid_entropy, entropy_percent)
@@ -224,7 +236,7 @@ def main(args, cfg):
                 loss_e = student_entropy.sum() * 0.0
 
             loss_c = segmind_contrastive_loss(
-                feat=outputs["proj_feat"],
+                feat=strong_outputs["proj_feat"],
                 labels=label_all,
                 prob=prob_all,
                 bank=memory_bank,
@@ -236,17 +248,27 @@ def main(args, cfg):
             )
 
             if epoch < recon_warmup_epochs:
-                recon_target = F.interpolate(img_all_s, size=outputs["recon_img"].shape[-2:], mode="bilinear", align_corners=False)
-                low_mask = F.interpolate(mim_mask, size=outputs["recon_img"].shape[-2:], mode="nearest").bool().expand_as(outputs["recon_img"])
+                mim_mask = generate_grid_mask(
+                    batch=weak_inputs.shape[0],
+                    height=weak_inputs.shape[-2],
+                    width=weak_inputs.shape[-1],
+                    mask_gap=mask_gap,
+                    mask_rate=mask_rate,
+                    device=weak_inputs.device,
+                )
+                masked_weak_inputs = weak_inputs * mim_mask
+                recon_outputs = model(masked_weak_inputs, mim_mask=mim_mask, return_aux=True)
+                recon_target = F.interpolate(weak_inputs, size=recon_outputs["recon_img"].shape[-2:], mode="bilinear", align_corners=False)
+                low_mask = F.interpolate(mim_mask, size=recon_outputs["recon_img"].shape[-2:], mode="nearest").bool().expand_as(recon_outputs["recon_img"])
                 hidden_region = ~low_mask
                 if hidden_region.any():
-                    loss_r = criterion_r(outputs["recon_img"][hidden_region], recon_target[hidden_region])
+                    loss_r = criterion_r(recon_outputs["recon_img"][hidden_region], recon_target[hidden_region])
                 else:
-                    loss_r = outputs["recon_img"].sum() * 0.0
-                small_labels = F.interpolate(label_all.float().unsqueeze(1), size=outputs["mask_logits"].shape[-2:], mode="nearest").squeeze(1).long()
-                small_mask = (~F.interpolate(mim_mask.float(), size=outputs["mask_logits"].shape[-2:], mode="nearest").squeeze(1).bool())
+                    loss_r = recon_outputs["recon_img"].sum() * 0.0
+                small_labels = F.interpolate(label_all.float().unsqueeze(1), size=recon_outputs["mask_logits"].shape[-2:], mode="nearest").squeeze(1).long()
+                small_mask = (~F.interpolate(mim_mask.float(), size=recon_outputs["mask_logits"].shape[-2:], mode="nearest").squeeze(1).bool())
                 small_labels = small_labels.masked_fill(~small_mask, cfg["ignore_index"])
-                loss_rsc = criterion_rsc(outputs["mask_logits"], small_labels)
+                loss_rsc = criterion_rsc(recon_outputs["mask_logits"], small_labels)
             else:
                 loss_r = seg_logits.sum() * 0.0
                 loss_rsc = seg_logits.sum() * 0.0
