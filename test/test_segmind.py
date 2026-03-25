@@ -169,6 +169,11 @@ def test_segmind_model_wraps_dpt_and_upernet(monkeypatch):
     assert out["proj_feat"].shape[1] == 16
 
 
+def test_build_criterions_sets_ignore_index_for_unlabeled_ce():
+    text = (REPO_ROOT / "util" / "ssl_method_utils.py").read_text(encoding="utf-8")
+    assert 'criterion_u = nn.CrossEntropyLoss(reduction="none", ignore_index=cfg["ignore_index"]).cuda(local_rank)' in text
+
+
 def test_segmind_source_uses_shared_helpers_and_validation_wrapper():
     text = (REPO_ROOT / "segmind.py").read_text(encoding="utf-8")
     assert 'wrap_ddp(model, logger=logger, rank=rank, save_path=args.save_path)' in text

@@ -327,7 +327,7 @@ def build_criterions(cfg, local_rank):
         criterion_l = FocalLoss(**cfg["criterion"]["kwargs"]).cuda(local_rank)
     else:
         raise NotImplementedError(cfg["criterion"]["name"])
-    criterion_u = nn.CrossEntropyLoss(reduction="none").cuda(local_rank)
+    criterion_u = nn.CrossEntropyLoss(reduction="none", ignore_index=cfg["ignore_index"]).cuda(local_rank)
     return criterion_l, criterion_u
 
 
