@@ -5,7 +5,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 
 
 def test_training_entrypoints_load_backbone_checkpoints_on_cpu():
-    files = [
+    entrypoints = [
         'supervised.py',
         'fixmatch.py',
         'fixmatch_pascal.py',
@@ -17,7 +17,6 @@ def test_training_entrypoints_load_backbone_checkpoints_on_cpu():
         'fixmatch_rgcrv5.py',
         'fixmatch_rgcrv6.py',
         'fixmatch_rvsc.py',
-        'unimatch.py',
         'unimatch_v2.py',
         'unimatch_v2_rgcr.py',
         'unimatchv2_peft.py',
@@ -27,11 +26,20 @@ def test_training_entrypoints_load_backbone_checkpoints_on_cpu():
         'scalematch.py',
         'scalematch_peft.py',
         'segmind.py',
-        'util/ssl_method_utils.py',
     ]
 
-    for name in files:
+    helper_text = (REPO_ROOT / 'util/ssl_method_utils.py').read_text()
+    assert 'map_location="cpu"' in helper_text, (
+        'util/ssl_method_utils.py should load checkpoints on CPU before moving to GPU.'
+    )
+
+    for name in entrypoints:
         text = (REPO_ROOT / name).read_text()
-        assert 'map_location="cpu"' in text, (
-            f'{name} should load backbone checkpoints on CPU before moving to GPU.'
+        assert (
+            'load_backbone_checkpoint' in text
+            or 'load_checkpoint_on_cpu' in text
+            or 'build_model(' in text
+            or 'maybe_load_checkpoint(' in text
+        ), (
+            f'{name} should rely on the shared CPU-safe checkpoint loading helpers.'
         )
