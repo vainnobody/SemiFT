@@ -53,8 +53,15 @@ def generate_grid_mask(batch: int, height: int, width: int, mask_gap: int, mask_
     return torch.cat(masks, dim=0)
 
 
-def generate_class_mask(pseudo_labels: torch.Tensor, ignore_index: int = 255) -> torch.Tensor:
+def generate_class_mask(
+    pseudo_labels: torch.Tensor,
+    pseudo_conf: torch.Tensor | None = None,
+    conf_thresh: float = 0.0,
+    ignore_index: int = 255,
+) -> torch.Tensor:
     valid = pseudo_labels != ignore_index
+    if pseudo_conf is not None:
+        valid = valid & (pseudo_conf >= conf_thresh)
     labels = torch.unique(pseudo_labels[valid])
     if labels.numel() == 0:
         return torch.zeros_like(pseudo_labels, dtype=torch.float32)
@@ -71,6 +78,7 @@ def class_mix_batch(
     entropy: torch.Tensor | None = None,
     ignore_mask: torch.Tensor | None = None,
     ignore_index: int = 255,
+    conf_thresh: float = 0.0,
     img_u_w: torch.Tensor | None = None,
 ):
     if img_w is None:
@@ -86,7 +94,12 @@ def class_mix_batch(
     out_ignore = [] if ignore_mask is not None else None
 
     for i in range(batch):
-        mix_mask = generate_class_mask(pseudo_label[i], ignore_index=ignore_index)
+        mix_mask = generate_class_mask(
+            pseudo_label[i],
+            pseudo_conf=None if pseudo_logit is None else pseudo_logit[i],
+            conf_thresh=conf_thresh,
+            ignore_index=ignore_index,
+        )
         mix_masks.append(mix_mask.unsqueeze(0))
         j = (i + 1) % batch
         mix = mix_mask.unsqueeze(0)

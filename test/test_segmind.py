@@ -26,7 +26,7 @@ from model.semseg import dpt as dpt_mod
 from model.semseg import upernet as upernet_mod
 from model.semseg.segmind import SegMindModel
 from segmind import apply_ignore_mask_to_labels, build_entropy_targets, build_pseudo_mask, filter_pseudo_labels
-from util.segmind_utils import class_mix_batch, create_memory_bank, generate_grid_mask, segmind_contrastive_loss
+from util.segmind_utils import class_mix_batch, create_memory_bank, generate_class_mask, generate_grid_mask, segmind_contrastive_loss
 
 
 class FakeResNet101Backbone(torch.nn.Module):
@@ -70,6 +70,35 @@ def test_class_mix_batch_preserves_shapes_and_types():
 
 
 
+
+
+
+def test_generate_class_mask_only_uses_high_confidence_pixels():
+    pseudo_label = torch.tensor([[1, 1, 2, 2]])
+    pseudo_conf = torch.tensor([[0.99, 0.20, 0.97, 0.10]])
+    mask = generate_class_mask(pseudo_label, pseudo_conf=pseudo_conf, conf_thresh=0.95, ignore_index=255)
+    assert mask[0, 1].item() == 0.0
+    assert mask[0, 3].item() == 0.0
+    assert set(torch.unique(mask).tolist()).issubset({0.0, 1.0})
+
+
+def test_class_mix_batch_masks_out_low_confidence_regions_from_paste():
+    img_w = torch.arange(2 * 3 * 2 * 2, dtype=torch.float32).reshape(2, 3, 2, 2)
+    img_s = img_w.clone()
+    pseudo_label = torch.tensor([[[1, 1], [2, 2]], [[3, 3], [4, 4]]])
+    pseudo_logit = torch.tensor([[[0.99, 0.10], [0.98, 0.20]], [[0.99, 0.99], [0.99, 0.99]]])
+    entropy = torch.rand(2, 2, 2)
+    out = class_mix_batch(
+        img_w=img_w,
+        img_s=img_s,
+        pseudo_label=pseudo_label,
+        pseudo_logit=pseudo_logit,
+        entropy=entropy,
+        ignore_mask=torch.zeros(2, 2, 2, dtype=torch.long),
+        conf_thresh=0.95,
+    )
+    low_conf_pos = (0, 0, 1)
+    assert out["mix_mask"][low_conf_pos].item() == 0.0
 
 def test_apply_ignore_mask_to_labels_replaces_invalid_pseudo_pixels():
     labels = torch.tensor([[[1, 2], [3, 4]]])
@@ -185,6 +214,7 @@ def test_segmind_source_uses_shared_helpers_and_validation_wrapper():
     assert 'conf_thresh = cfg.get("conf_thresh", 0.95)' in text
     assert 'teacher_entropy_l' in text
     assert 'filtered_pseudo_label, pseudo_mask = filter_pseudo_labels(' in text
+    assert 'conf_thresh=conf_thresh' in text
     assert 'strong_outputs = model(strong_inputs, return_aux=True)' in text
     assert 'masked_weak_inputs = weak_inputs * mim_mask' in text
     assert 'recon_outputs = model(masked_weak_inputs, mim_mask=mim_mask, return_aux=True)' in text

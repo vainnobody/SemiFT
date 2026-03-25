@@ -212,6 +212,7 @@ def main(args, cfg):
                 entropy=teacher_entropy_u,
                 ignore_mask=ignore_u,
                 ignore_index=cfg["ignore_index"],
+                conf_thresh=conf_thresh,
             )
 
             strong_inputs = torch.cat((img_l_s, mixed_u["img_s"]), dim=0)
