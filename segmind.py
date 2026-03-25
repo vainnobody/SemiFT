@@ -48,22 +48,25 @@ def apply_ignore_mask_to_labels(labels, ignore_mask, ignore_index):
     return labels.masked_fill(ignore_mask == 255, ignore_index)
 
 
-def build_entropy_targets(mask_l, mixed_entropy, student_entropy, ignore_mask, ignore_index):
-    teacher_entropy_all = torch.cat(
-        (
-            torch.zeros_like(mask_l, dtype=student_entropy.dtype),
-            mixed_entropy,
-        ),
-        dim=0,
-    )
+def build_entropy_targets(teacher_entropy_l, mixed_entropy, ignore_mask, ignore_index):
+    teacher_entropy_all = torch.cat((teacher_entropy_l, mixed_entropy), dim=0)
     valid_entropy = torch.cat(
         (
-            mask_l != ignore_index,
+            torch.ones_like(teacher_entropy_l, dtype=torch.bool),
             ignore_mask != 255,
         ),
         dim=0,
     )
     return teacher_entropy_all, valid_entropy
+
+
+def build_pseudo_mask(pseudo_conf, ignore_mask, conf_thresh):
+    return (pseudo_conf >= conf_thresh) & (ignore_mask != 255)
+
+
+def filter_pseudo_labels(pseudo_label, pseudo_conf, ignore_mask, conf_thresh, ignore_index):
+    valid_mask = build_pseudo_mask(pseudo_conf, ignore_mask, conf_thresh)
+    return pseudo_label.masked_fill(~valid_mask, ignore_index), valid_mask
 
 
 def get_parser():
@@ -123,7 +126,7 @@ def main(args, cfg):
     log_model_info(logger, rank, model, load_result=load_result)
     model, local_rank = wrap_ddp(model, logger=logger, rank=rank, save_path=args.save_path)
     model_ema = build_ema_model(model)
-    criterion_l, _ = build_criterions(cfg, local_rank)
+    criterion_l, criterion_u = build_criterions(cfg, local_rank)
     criterion_r = nn.MSELoss().cuda(local_rank)
     criterion_rsc = nn.CrossEntropyLoss(ignore_index=cfg["ignore_index"]).cuda(local_rank)
 
@@ -163,7 +166,9 @@ def main(args, cfg):
     mask_rate = segmind_cfg.get("mim_mask_rate", 0.25)
     recon_warmup_epochs = segmind_cfg.get("recon_warmup_epochs", max(cfg["epochs"] // 2, 1))
     entropy_percent = segmind_cfg.get("entropy_percent", 100)
+    conf_thresh = cfg.get("conf_thresh", 0.95)
     lambda_l = segmind_cfg.get("lambda_l", 1.0)
+    lambda_u = segmind_cfg.get("lambda_u", 1.0)
     lambda_e = segmind_cfg.get("lambda_e", 1.0)
     lambda_r = segmind_cfg.get("lambda_r", 1.0)
     lambda_rsc = segmind_cfg.get("lambda_rsc", 1.0)
@@ -193,21 +198,33 @@ def main(args, cfg):
             img_u_s = img_u_s.cuda(local_rank)
             ignore_u = ignore_u.cuda(local_rank)
 
-            _, pseudo_logit, pseudo_label, teacher_entropy = gather_pseudo_from_teacher(model_ema, img_l_w, img_u_w)
+            teacher_logits, pseudo_logit, pseudo_label, teacher_entropy_u = gather_pseudo_from_teacher(model_ema, img_l_w, img_u_w)
+            teacher_prob = teacher_logits.softmax(dim=1)
+            teacher_entropy_l = torch.sum(
+                -teacher_prob[: img_l_w.shape[0]] * torch.log(teacher_prob[: img_l_w.shape[0]].clamp_min(1e-8)),
+                dim=1,
+            )
             mixed_u = class_mix_batch(
                 img_u_w=img_u_w,
                 img_s=img_u_s,
                 pseudo_label=pseudo_label,
                 pseudo_logit=pseudo_logit,
-                entropy=teacher_entropy,
+                entropy=teacher_entropy_u,
                 ignore_mask=ignore_u,
                 ignore_index=cfg["ignore_index"],
             )
 
             strong_inputs = torch.cat((img_l_s, mixed_u["img_s"]), dim=0)
             weak_inputs = torch.cat((img_l_w, mixed_u["img_w"]), dim=0)
-            pseudo_label = apply_ignore_mask_to_labels(
+            filtered_pseudo_label, pseudo_mask = filter_pseudo_labels(
                 mixed_u["pseudo_label"],
+                mixed_u["pseudo_logit"],
+                mixed_u["ignore_mask"],
+                conf_thresh,
+                cfg["ignore_index"],
+            )
+            pseudo_label = apply_ignore_mask_to_labels(
+                filtered_pseudo_label,
                 mixed_u["ignore_mask"],
                 cfg["ignore_index"],
             )
@@ -216,16 +233,22 @@ def main(args, cfg):
             strong_outputs = model(strong_inputs, return_aux=True)
             seg_logits = strong_outputs["seg_logits"]
             prob_all = seg_logits.softmax(dim=1)
-            loss_l = criterion_l(seg_logits, label_all)
+            pred_l, pred_u = seg_logits.split([img_l_s.shape[0], mixed_u["img_s"].shape[0]], dim=0)
+            loss_x = criterion_l(pred_l, mask_l)
+            loss_u_map = criterion_u(pred_u, pseudo_label)
+            if pseudo_mask.any():
+                loss_u = loss_u_map[pseudo_mask].mean()
+            else:
+                loss_u = loss_u_map.sum() * 0.0
 
             student_entropy = torch.sum(-prob_all * torch.log(prob_all.clamp_min(1e-8)), dim=1)
             teacher_entropy_all, valid_entropy = build_entropy_targets(
-                mask_l,
+                teacher_entropy_l,
                 mixed_u["entropy"],
-                student_entropy,
                 mixed_u["ignore_mask"],
                 cfg["ignore_index"],
             )
+            valid_entropy[img_l_s.shape[0]:] &= pseudo_mask
             if entropy_percent < 100:
                 entropy_mask = percentile_entropy_mask(student_entropy, valid_entropy, entropy_percent)
             else:
@@ -274,7 +297,8 @@ def main(args, cfg):
                 loss_rsc = seg_logits.sum() * 0.0
 
             loss = (
-                lambda_l * loss_l
+                lambda_l * loss_x
+                + lambda_u * loss_u
                 + lambda_e * loss_e
                 + lambda_c * loss_c
                 + lambda_r * loss_r
@@ -292,7 +316,8 @@ def main(args, cfg):
             meter.update(
                 {
                     "loss": loss.item(),
-                    "loss_l": loss_l.item(),
+                    "loss_x": loss_x.item(),
+                    "loss_u": loss_u.item(),
                     "loss_e": loss_e.item(),
                     "loss_c": loss_c.item(),
                     "loss_r": loss_r.item(),
@@ -302,7 +327,10 @@ def main(args, cfg):
 
             if rank == 0:
                 writer.add_scalar("train/loss_all", loss.item(), iters)
-                writer.add_scalar("train/loss_l", loss_l.item(), iters)
+                writer.add_scalar("train/loss_x", loss_x.item(), iters)
+                writer.add_scalar("train/loss_u", loss_u.item(), iters)
+                writer.add_scalar("train/pseudo_conf", mixed_u["pseudo_logit"][pseudo_mask].mean().item() if pseudo_mask.any() else 0.0, iters)
+                writer.add_scalar("train/mask_ratio", pseudo_mask.float().mean().item(), iters)
                 writer.add_scalar("train/loss_e", loss_e.item(), iters)
                 writer.add_scalar("train/loss_c", loss_c.item(), iters)
                 writer.add_scalar("train/loss_r", loss_r.item(), iters)

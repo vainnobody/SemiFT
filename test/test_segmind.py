@@ -25,7 +25,7 @@ if str(REPO_ROOT) not in sys.path:
 from model.semseg import dpt as dpt_mod
 from model.semseg import upernet as upernet_mod
 from model.semseg.segmind import SegMindModel
-from segmind import apply_ignore_mask_to_labels, build_entropy_targets
+from segmind import apply_ignore_mask_to_labels, build_entropy_targets, build_pseudo_mask, filter_pseudo_labels
 from util.segmind_utils import class_mix_batch, create_memory_bank, generate_grid_mask, segmind_contrastive_loss
 
 
@@ -78,21 +78,42 @@ def test_apply_ignore_mask_to_labels_replaces_invalid_pseudo_pixels():
     assert torch.equal(masked, torch.tensor([[[1, 99], [99, 4]]]))
 
 
-def test_build_entropy_targets_marks_unlabeled_ignore_pixels_invalid():
-    mask_l = torch.tensor([[[0, 255], [1, 2]]])
-    mixed_entropy = torch.tensor([[[0.3, 0.4], [0.5, 0.6]]])
-    student_entropy = torch.zeros(2, 2, 2)
+def test_build_entropy_targets_uses_teacher_labeled_entropy_and_unlabeled_ignore_mask():
+    teacher_entropy_l = torch.tensor([[[0.1, 0.2], [0.3, 0.4]]])
+    mixed_entropy = torch.tensor([[[0.5, 0.6], [0.7, 0.8]]])
     ignore_mask = torch.tensor([[[0, 255], [0, 255]]])
     teacher_entropy_all, valid_entropy = build_entropy_targets(
-        mask_l,
+        teacher_entropy_l,
         mixed_entropy,
-        student_entropy,
         ignore_mask,
         ignore_index=255,
     )
-    assert teacher_entropy_all.shape == (2, 2, 2)
-    assert torch.equal(valid_entropy[0], torch.tensor([[True, False], [True, True]]))
+    assert torch.equal(teacher_entropy_all[0], teacher_entropy_l[0])
+    assert torch.equal(teacher_entropy_all[1], mixed_entropy[0])
+    assert torch.equal(valid_entropy[0], torch.tensor([[True, True], [True, True]]))
     assert torch.equal(valid_entropy[1], torch.tensor([[True, False], [True, False]]))
+
+
+def test_filter_pseudo_labels_rejects_low_confidence_or_invalid_pixels():
+    pseudo_label = torch.tensor([[[1, 2], [3, 4]]])
+    pseudo_conf = torch.tensor([[[0.99, 0.60], [0.96, 0.98]]])
+    ignore_mask = torch.tensor([[[0, 0], [255, 0]]])
+    filtered, valid_mask = filter_pseudo_labels(
+        pseudo_label,
+        pseudo_conf,
+        ignore_mask,
+        conf_thresh=0.95,
+        ignore_index=255,
+    )
+    assert torch.equal(valid_mask, torch.tensor([[[True, False], [False, True]]]))
+    assert torch.equal(filtered, torch.tensor([[[1, 255], [255, 4]]]))
+
+
+def test_build_pseudo_mask_combines_confidence_and_ignore_mask():
+    pseudo_conf = torch.tensor([[[0.9, 0.96]]])
+    ignore_mask = torch.tensor([[[0, 255]]])
+    valid_mask = build_pseudo_mask(pseudo_conf, ignore_mask, conf_thresh=0.95)
+    assert torch.equal(valid_mask, torch.tensor([[[False, False]]]))
 def test_generate_grid_mask_matches_requested_ratio_and_shape():
     mask = generate_grid_mask(2, 32, 32, mask_gap=8, mask_rate=0.25, device=torch.device("cpu"))
     assert mask.shape == (2, 1, 32, 32)
@@ -154,6 +175,11 @@ def test_segmind_source_uses_shared_helpers_and_validation_wrapper():
     assert 'maybe_load_checkpoint(args, model, optimizer, model_ema=model_ema, logger=logger, rank=rank)' in text
     assert 'from util.validation import validation_cpu as shared_validation_cpu' in text
     assert 'return shared_validation_cpu(cfg, model, valid_loader)' in text
+    assert 'criterion_l, criterion_u = build_criterions(cfg, local_rank)' in text
+    assert 'loss_u_map = criterion_u(pred_u, pseudo_label)' in text
+    assert 'conf_thresh = cfg.get("conf_thresh", 0.95)' in text
+    assert 'teacher_entropy_l' in text
+    assert 'filtered_pseudo_label, pseudo_mask = filter_pseudo_labels(' in text
     assert 'strong_outputs = model(strong_inputs, return_aux=True)' in text
     assert 'masked_weak_inputs = weak_inputs * mim_mask' in text
     assert 'recon_outputs = model(masked_weak_inputs, mim_mask=mim_mask, return_aux=True)' in text
