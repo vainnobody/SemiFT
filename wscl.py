@@ -74,6 +74,8 @@ def get_parser():
 
 
 def build_dataloaders(args, cfg):
+    per_loader_batch = max(1, int(cfg["batch_size"] // 2))
+
     trainset_u = SemiDataset(
         cfg["dataset"],
         cfg["data_root"],
@@ -99,7 +101,7 @@ def build_dataloaders(args, cfg):
     trainsampler_l = torch.utils.data.distributed.DistributedSampler(trainset_l)
     trainloader_l = DataLoader(
         trainset_l,
-        batch_size=cfg["batch_size"],
+        batch_size=per_loader_batch,
         pin_memory=True,
         num_workers=workers,
         drop_last=True,
@@ -108,7 +110,7 @@ def build_dataloaders(args, cfg):
     trainsampler_u = torch.utils.data.distributed.DistributedSampler(trainset_u)
     trainloader_u = DataLoader(
         trainset_u,
-        batch_size=cfg["batch_size"],
+        batch_size=per_loader_batch,
         pin_memory=True,
         num_workers=workers,
         drop_last=True,
@@ -185,13 +187,18 @@ def main(args, cfg):
 
             if aug_mode not in AUG_HANDLERS:
                 raise ValueError(f"Unknown wscl aug_mode: {aug_mode}")
-            conf_mix, mask_mix, img_u_s = AUG_HANDLERS[aug_mode](conf_u_w, mask_u_w, img_u_s1, img_u_s2)
+            if np.random.uniform(0, 1) < 0.5:
+                conf_mix, mask_mix, img_u_s = AUG_HANDLERS[aug_mode](
+                    conf_u_w, mask_u_w, img_u_s1, img_u_s2
+                )
+            else:
+                conf_mix, mask_mix, img_u_s = conf_u_w, mask_u_w, img_u_s1
 
             preds = model(torch.cat((img_x, img_u_s)))
             pred_x, pred_u_s = preds.split([img_x.shape[0], img_u_s.shape[0]])
 
             loss_x = criterion_l(pred_x, mask_x)
-            loss_u = criterion_u(pred_u_s, mask_mix)
+            loss_u_map = criterion_u(pred_u_s, mask_mix)
 
             entropy_u = entropy_map(pred_u_s.softmax(dim=1), 1)
             valid_region = ignore_mask != 255
@@ -201,10 +208,15 @@ def main(args, cfg):
                     entropy_valid.detach().cpu().numpy().flatten(), low_entropy_percent
                 )
                 mask_valid = (entropy_u <= threshold) & valid_region
-                loss_u = (loss_u * mask_valid.float()).sum() / mask_valid.sum().clamp(min=1).float()
                 mask_ratio = mask_valid.sum().float() / valid_region.sum().clamp(min=1).float()
+                unsup_valid = (loss_u_map * valid_region.float()).sum() / valid_region.sum().clamp(
+                    min=1
+                ).float()
+                # Match official WSCL behavior more closely: compute the CE on the
+                # strong view, then reweight it by the retained low-entropy region ratio.
+                loss_u = unsup_valid * mask_ratio
             else:
-                loss_u = loss_u.sum() * 0.0
+                loss_u = loss_u_map.sum() * 0.0
                 mask_ratio = torch.tensor(0.0, device=loss_u.device)
 
             loss = loss_x + unsup_weight * loss_u
