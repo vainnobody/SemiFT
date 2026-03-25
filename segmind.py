@@ -32,7 +32,6 @@ from util.segmind_utils import (
     create_memory_bank,
     gather_pseudo_from_teacher,
     generate_grid_mask,
-    percentile_entropy_mask,
     segmind_contrastive_loss,
 )
 
@@ -42,32 +41,15 @@ def validation_cpu(cfg, model, valid_loader):
     return shared_validation_cpu(cfg, model, valid_loader)
 
 
-def apply_ignore_mask_to_labels(labels, ignore_mask, ignore_index):
-    if ignore_mask is None:
-        return labels
-    return labels.masked_fill(ignore_mask == 255, ignore_index)
+def build_entropy_targets(teacher_entropy_l, mixed_entropy):
+    return torch.cat((teacher_entropy_l, mixed_entropy), dim=0)
 
 
-def build_entropy_targets(teacher_entropy_l, mixed_entropy, ignore_mask, ignore_index):
-    teacher_entropy_all = torch.cat((teacher_entropy_l, mixed_entropy), dim=0)
-    valid_entropy = torch.cat(
-        (
-            torch.ones_like(teacher_entropy_l, dtype=torch.bool),
-            ignore_mask != 255,
-        ),
-        dim=0,
+def needs_pseudo_branch(segmind_cfg):
+    return any(
+        float(segmind_cfg.get(key, 0.0)) != 0.0
+        for key in ("lambda_pseudo", "lambda_e", "lambda_r", "lambda_rsc", "lambda_c")
     )
-    return teacher_entropy_all, valid_entropy
-
-
-def build_pseudo_mask(pseudo_conf, ignore_mask, conf_thresh):
-    return (pseudo_conf >= conf_thresh) & (ignore_mask != 255)
-
-
-def filter_pseudo_labels(pseudo_label, pseudo_conf, ignore_mask, conf_thresh, ignore_index):
-    valid_mask = build_pseudo_mask(pseudo_conf, ignore_mask, conf_thresh)
-    return pseudo_label.masked_fill(~valid_mask, ignore_index), valid_mask
-
 
 def get_parser():
     parser = argparse.ArgumentParser(
@@ -114,8 +96,10 @@ def build_dataloaders(args, cfg):
 
 
 def main(args, cfg):
-    logger, rank, _, writer = build_logger_and_runtime(args, cfg)
     segmind_cfg = cfg.setdefault("segmind", {})
+    use_pseudo_branch = needs_pseudo_branch(segmind_cfg)
+
+    logger, rank, _, writer = build_logger_and_runtime(args, cfg)
     base_model, load_result = build_model(cfg, method="segmind")
     model = SegMindModel(
         base_model=base_model,
@@ -126,13 +110,24 @@ def main(args, cfg):
     log_model_info(logger, rank, model, load_result=load_result)
     model, local_rank = wrap_ddp(model, logger=logger, rank=rank, save_path=args.save_path)
     model_ema = build_ema_model(model)
-    criterion_l, criterion_u = build_criterions(cfg, local_rank)
+    criterion_l, _ = build_criterions(cfg, local_rank)
     criterion_r = nn.MSELoss().cuda(local_rank)
-    criterion_rsc = nn.CrossEntropyLoss(ignore_index=cfg["ignore_index"]).cuda(local_rank)
+    criterion_rsc = nn.CrossEntropyLoss(
+        reduction="none",
+        ignore_index=cfg["ignore_index"],
+    ).cuda(local_rank)
 
     trainloader_l, trainloader_u, valloader = build_dataloaders(args, cfg)
     total_iters = len(trainloader_u) * cfg["epochs"]
-    state = maybe_load_checkpoint(args, model, optimizer, model_ema=model_ema, logger=logger, rank=rank)
+
+    state = maybe_load_checkpoint(
+        args,
+        model,
+        optimizer,
+        model_ema=model_ema,
+        logger=logger,
+        rank=rank,
+    )
     previous_best = state["previous_best"]
     best_epoch = state["best_epoch"]
     previous_best_ema = state["previous_best_ema"]
@@ -162,13 +157,11 @@ def main(args, cfg):
     temperature = segmind_cfg.get("temperature", 0.5)
     num_query = segmind_cfg.get("num_query", 256)
     num_negative = segmind_cfg.get("num_negative", 512)
-    mask_gap = segmind_cfg.get("mim_mask_gap", 16)
-    mask_rate = segmind_cfg.get("mim_mask_rate", 0.25)
-    recon_warmup_epochs = segmind_cfg.get("recon_warmup_epochs", max(cfg["epochs"] // 2, 1))
-    entropy_percent = segmind_cfg.get("entropy_percent", 100)
-    conf_thresh = cfg.get("conf_thresh", 0.95)
+    mask_gap = segmind_cfg.get("mask_gap", 4)
+    mask_rate = segmind_cfg.get("mask_rate", 0.25)
+    epoch_pre = segmind_cfg.get("epoch_pre", max(cfg["epochs"] // 2, 1))
     lambda_l = segmind_cfg.get("lambda_l", 1.0)
-    lambda_u = segmind_cfg.get("lambda_u", 1.0)
+    lambda_pseudo = segmind_cfg.get("lambda_pseudo", 1.0)
     lambda_e = segmind_cfg.get("lambda_e", 1.0)
     lambda_r = segmind_cfg.get("lambda_r", 1.0)
     lambda_rsc = segmind_cfg.get("lambda_rsc", 1.0)
@@ -188,8 +181,8 @@ def main(args, cfg):
         trainloader_l.sampler.set_epoch(epoch)
         trainloader_u.sampler.set_epoch(epoch)
         model.train()
+        model_ema.train()
         meter = DictAverageMeter()
-
         for i, ((img_l_w, img_l_s, mask_l), (img_u_w, img_u_s, ignore_u)) in enumerate(zip(trainloader_l, trainloader_u)):
             img_l_w = img_l_w.cuda(local_rank)
             img_l_s = img_l_s.cuda(local_rank)
@@ -197,109 +190,92 @@ def main(args, cfg):
             img_u_w = img_u_w.cuda(local_rank)
             img_u_s = img_u_s.cuda(local_rank)
             ignore_u = ignore_u.cuda(local_rank)
+            del ignore_u
 
-            teacher_logits, pseudo_logit, pseudo_label, teacher_entropy_u = gather_pseudo_from_teacher(model_ema, img_l_w, img_u_w)
-            teacher_prob = teacher_logits.softmax(dim=1)
-            teacher_entropy_l = torch.sum(
-                -teacher_prob[: img_l_w.shape[0]] * torch.log(teacher_prob[: img_l_w.shape[0]].clamp_min(1e-8)),
-                dim=1,
-            )
-            mixed_u = class_mix_batch(
-                img_u_w=img_u_w,
-                img_s=img_u_s,
-                pseudo_label=pseudo_label,
-                pseudo_logit=pseudo_logit,
-                entropy=teacher_entropy_u,
-                ignore_mask=ignore_u,
-                ignore_index=cfg["ignore_index"],
-                conf_thresh=conf_thresh,
-            )
+            logits_l = model(img_l_w)
+            loss_x = criterion_l(logits_l, mask_l)
+            loss_pseudo = logits_l.sum() * 0.0
+            loss_e = logits_l.sum() * 0.0
+            loss_c = logits_l.sum() * 0.0
+            loss_r = logits_l.sum() * 0.0
+            loss_rsc = logits_l.sum() * 0.0
 
-            strong_inputs = torch.cat((img_l_s, mixed_u["img_s"]), dim=0)
-            weak_inputs = torch.cat((img_l_w, mixed_u["img_w"]), dim=0)
-            filtered_pseudo_label, pseudo_mask = filter_pseudo_labels(
-                mixed_u["pseudo_label"],
-                mixed_u["pseudo_logit"],
-                mixed_u["ignore_mask"],
-                conf_thresh,
-                cfg["ignore_index"],
-            )
-            pseudo_label = apply_ignore_mask_to_labels(
-                filtered_pseudo_label,
-                mixed_u["ignore_mask"],
-                cfg["ignore_index"],
-            )
-            label_all = torch.cat((mask_l, pseudo_label), dim=0)
-
-            strong_outputs = model(strong_inputs, return_aux=True)
-            seg_logits = strong_outputs["seg_logits"]
-            prob_all = seg_logits.softmax(dim=1)
-            pred_l, pred_u = seg_logits.split([img_l_s.shape[0], mixed_u["img_s"].shape[0]], dim=0)
-            loss_x = criterion_l(pred_l, mask_l)
-            loss_u_map = criterion_u(pred_u, pseudo_label)
-            if pseudo_mask.any():
-                loss_u = loss_u_map[pseudo_mask].mean()
-            else:
-                loss_u = loss_u_map.sum() * 0.0
-
-            student_entropy = torch.sum(-prob_all * torch.log(prob_all.clamp_min(1e-8)), dim=1)
-            teacher_entropy_all, valid_entropy = build_entropy_targets(
-                teacher_entropy_l,
-                mixed_u["entropy"],
-                mixed_u["ignore_mask"],
-                cfg["ignore_index"],
-            )
-            valid_entropy[img_l_s.shape[0]:] &= pseudo_mask
-            if entropy_percent < 100:
-                entropy_mask = percentile_entropy_mask(student_entropy, valid_entropy, entropy_percent)
-            else:
-                entropy_mask = valid_entropy
-            if entropy_mask.any():
-                loss_e = F.mse_loss(student_entropy[entropy_mask], teacher_entropy_all[entropy_mask])
-            else:
-                loss_e = student_entropy.sum() * 0.0
-
-            loss_c = segmind_contrastive_loss(
-                feat=strong_outputs["proj_feat"],
-                labels=label_all,
-                prob=prob_all,
-                bank=memory_bank,
-                query_threshold=query_threshold,
-                temperature=temperature,
-                num_queries=num_query,
-                num_negative=num_negative,
-                ignore_index=cfg["ignore_index"],
-            )
-
-            if epoch < recon_warmup_epochs:
-                mim_mask = generate_grid_mask(
-                    batch=weak_inputs.shape[0],
-                    height=weak_inputs.shape[-2],
-                    width=weak_inputs.shape[-1],
-                    mask_gap=mask_gap,
-                    mask_rate=mask_rate,
-                    device=weak_inputs.device,
+            if use_pseudo_branch:
+                teacher_logits, pseudo_logit, pseudo_label, teacher_entropy_u = gather_pseudo_from_teacher(model_ema, img_l_w, img_u_w)
+                teacher_prob = teacher_logits.softmax(dim=1)
+                teacher_entropy_l = torch.sum(
+                    -teacher_prob[: img_l_w.shape[0]] * torch.log(teacher_prob[: img_l_w.shape[0]].clamp_min(1e-8)),
+                    dim=1,
                 )
-                masked_weak_inputs = weak_inputs * mim_mask
-                recon_outputs = model(masked_weak_inputs, mim_mask=mim_mask, return_aux=True)
-                recon_target = F.interpolate(weak_inputs, size=recon_outputs["recon_img"].shape[-2:], mode="bilinear", align_corners=False)
-                low_mask = F.interpolate(mim_mask, size=recon_outputs["recon_img"].shape[-2:], mode="nearest").bool().expand_as(recon_outputs["recon_img"])
-                hidden_region = ~low_mask
-                if hidden_region.any():
-                    loss_r = criterion_r(recon_outputs["recon_img"][hidden_region], recon_target[hidden_region])
-                else:
-                    loss_r = recon_outputs["recon_img"].sum() * 0.0
-                small_labels = F.interpolate(label_all.float().unsqueeze(1), size=recon_outputs["mask_logits"].shape[-2:], mode="nearest").squeeze(1).long()
-                small_mask = (~F.interpolate(mim_mask.float(), size=recon_outputs["mask_logits"].shape[-2:], mode="nearest").squeeze(1).bool())
-                small_labels = small_labels.masked_fill(~small_mask, cfg["ignore_index"])
-                loss_rsc = criterion_rsc(recon_outputs["mask_logits"], small_labels)
-            else:
-                loss_r = seg_logits.sum() * 0.0
-                loss_rsc = seg_logits.sum() * 0.0
+                mixed_u = class_mix_batch(
+                    img_u_w=img_u_w,
+                    img_s=img_u_s,
+                    pseudo_label=pseudo_label,
+                    pseudo_logit=pseudo_logit,
+                    entropy=teacher_entropy_u,
+                )
+
+                strong_inputs = torch.cat((img_l_s, mixed_u["img_s"]), dim=0)
+                weak_inputs = torch.cat((img_l_w, mixed_u["img_w"]), dim=0)
+                label_all = torch.cat((mask_l, mixed_u["pseudo_label"]), dim=0)
+
+                strong_outputs = model(strong_inputs, return_aux=True)
+                seg_logits = strong_outputs["seg_logits"]
+                prob_all = seg_logits.softmax(dim=1)
+                _, pred_u = seg_logits.split([img_l_s.shape[0], mixed_u["img_s"].shape[0]], dim=0)
+                loss_pseudo = criterion_l(pred_u, mixed_u["pseudo_label"])
+
+                if lambda_e != 0.0:
+                    student_entropy = torch.sum(-prob_all * torch.log(prob_all.clamp_min(1e-8)), dim=1)
+                    teacher_entropy_all = build_entropy_targets(teacher_entropy_l, mixed_u["entropy"])
+                    loss_e = F.mse_loss(student_entropy, teacher_entropy_all)
+
+                if lambda_c != 0.0:
+                    loss_c = segmind_contrastive_loss(
+                        feat=strong_outputs["proj_feat"],
+                        labels=label_all,
+                        prob=prob_all,
+                        bank=memory_bank,
+                        query_threshold=query_threshold,
+                        temperature=temperature,
+                        num_queries=num_query,
+                        num_negative=num_negative,
+                        ignore_index=cfg["ignore_index"],
+                    )
+
+                if (lambda_r != 0.0 or lambda_rsc != 0.0) and epoch + 1 <= epoch_pre:
+                    mim_mask = generate_grid_mask(
+                        batch=weak_inputs.shape[0],
+                        height=weak_inputs.shape[-2],
+                        width=weak_inputs.shape[-1],
+                        mask_gap=mask_gap,
+                        mask_rate=mask_rate,
+                        device=weak_inputs.device,
+                    )
+                    masked_weak_inputs = weak_inputs * mim_mask
+                    recon_outputs = model(masked_weak_inputs, mim_mask=mim_mask, return_aux=True)
+                    recon_img = F.interpolate(
+                        recon_outputs["recon_img"],
+                        size=weak_inputs.shape[-2:],
+                        mode="bilinear",
+                        align_corners=False,
+                    )
+                    hidden_region = ~mim_mask.bool().expand_as(recon_img)
+                    if hidden_region.any():
+                        loss_r = criterion_r(recon_img[hidden_region], weak_inputs[hidden_region])
+                    else:
+                        loss_r = recon_img.sum() * 0.0
+                    hidden_labels = label_all.masked_fill(mim_mask.squeeze(1).bool(), cfg["ignore_index"])
+                    loss_rsc_map = criterion_rsc(recon_outputs["seg_logits"], hidden_labels)
+                    valid_hidden = hidden_labels != cfg["ignore_index"]
+                    if valid_hidden.any():
+                        loss_rsc = loss_rsc_map[valid_hidden].mean()
+                    else:
+                        loss_rsc = loss_rsc_map.sum() * 0.0
 
             loss = (
                 lambda_l * loss_x
-                + lambda_u * loss_u
+                + lambda_pseudo * loss_pseudo
                 + lambda_e * loss_e
                 + lambda_c * loss_c
                 + lambda_r * loss_r
@@ -310,15 +286,17 @@ def main(args, cfg):
             loss.backward()
             optimizer.step()
 
-            iters = epoch * len(trainloader_u) + i
+            current_loader_len = len(trainloader_u)
+            iters = epoch * current_loader_len + i
             lr = update_lr(optimizer, cfg, iters, total_iters)
-            update_ema(model, model_ema, iters, max_decay=ema_decay)
+            if use_pseudo_branch:
+                update_ema(model, model_ema, iters, max_decay=ema_decay)
 
             meter.update(
                 {
                     "loss": loss.item(),
                     "loss_x": loss_x.item(),
-                    "loss_u": loss_u.item(),
+                    "loss_pseudo": loss_pseudo.item(),
                     "loss_e": loss_e.item(),
                     "loss_c": loss_c.item(),
                     "loss_r": loss_r.item(),
@@ -329,9 +307,9 @@ def main(args, cfg):
             if rank == 0:
                 writer.add_scalar("train/loss_all", loss.item(), iters)
                 writer.add_scalar("train/loss_x", loss_x.item(), iters)
-                writer.add_scalar("train/loss_u", loss_u.item(), iters)
-                writer.add_scalar("train/pseudo_conf", mixed_u["pseudo_logit"][pseudo_mask].mean().item() if pseudo_mask.any() else 0.0, iters)
-                writer.add_scalar("train/mask_ratio", pseudo_mask.float().mean().item(), iters)
+                writer.add_scalar("train/loss_pseudo", loss_pseudo.item(), iters)
+                if use_pseudo_branch:
+                    writer.add_scalar("train/pseudo_conf", mixed_u["pseudo_logit"].mean().item(), iters)
                 writer.add_scalar("train/loss_e", loss_e.item(), iters)
                 writer.add_scalar("train/loss_c", loss_c.item(), iters)
                 writer.add_scalar("train/loss_r", loss_r.item(), iters)
@@ -341,18 +319,25 @@ def main(args, cfg):
                 if i < 5:
                     viz.push(
                         {
-                            "img_l": (img_l_s[0], Visualizer.TENSOR),
+                            "img_l_w": (img_l_w[0], Visualizer.TENSOR),
                             "mask_l": (mask_l[0], Visualizer.SEGMENTATION),
-                            "pred_l": (seg_logits.argmax(dim=1)[0], Visualizer.SEGMENTATION),
-                            "img_u": (mixed_u["img_s"][0], Visualizer.TENSOR),
-                            "pseudo_u": (mixed_u["pseudo_label"][0], Visualizer.SEGMENTATION),
-                            "pred_u": (seg_logits.argmax(dim=1)[img_l_s.shape[0]], Visualizer.SEGMENTATION),
+                            "pred_l_w": (logits_l.argmax(dim=1)[0], Visualizer.SEGMENTATION),
                         }
                     )
+                    if use_pseudo_branch:
+                        viz.push(
+                            {
+                                "img_l": (img_l_s[0], Visualizer.TENSOR),
+                                "pred_joint_l": (seg_logits.argmax(dim=1)[0], Visualizer.SEGMENTATION),
+                                "img_u": (mixed_u["img_s"][0], Visualizer.TENSOR),
+                                "pseudo_u": (mixed_u["pseudo_label"][0], Visualizer.SEGMENTATION),
+                                "pred_u": (seg_logits.argmax(dim=1)[img_l_s.shape[0]], Visualizer.SEGMENTATION),
+                            }
+                        )
                     viz.render(f"epoch_{epoch}_iter_{i}")
                     viz.reset()
 
-            log_interval = max(1, len(trainloader_u) // 8)
+            log_interval = max(1, current_loader_len // 8)
             if rank == 0 and i % log_interval == 0:
                 logger.info("Iters: %d, LR: %.7f, %s", i, lr, meter)
 

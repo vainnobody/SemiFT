@@ -59,15 +59,12 @@ def generate_class_mask(
     conf_thresh: float = 0.0,
     ignore_index: int = 255,
 ) -> torch.Tensor:
-    valid = pseudo_labels != ignore_index
-    if pseudo_conf is not None:
-        valid = valid & (pseudo_conf >= conf_thresh)
-    labels = torch.unique(pseudo_labels[valid])
+    del pseudo_conf, conf_thresh, ignore_index
+    labels = torch.unique(pseudo_labels)
     if labels.numel() == 0:
         return torch.zeros_like(pseudo_labels, dtype=torch.float32)
-    selected = labels[torch.randperm(labels.numel(), device=pseudo_labels.device)[: max(1, labels.numel() // 2)]]
-    mask = (pseudo_labels.unsqueeze(-1) == selected).any(dim=-1) & valid
-    return mask.float()
+    selected = labels[torch.randperm(labels.numel(), device=pseudo_labels.device)[: labels.numel() // 2]]
+    return (pseudo_labels.unsqueeze(-1) == selected).any(dim=-1).float()
 
 
 def class_mix_batch(
@@ -81,6 +78,7 @@ def class_mix_batch(
     conf_thresh: float = 0.0,
     img_u_w: torch.Tensor | None = None,
 ):
+    del ignore_mask, ignore_index, conf_thresh
     if img_w is None:
         img_w = img_u_w
     if img_w is None:
@@ -91,15 +89,9 @@ def class_mix_batch(
     mix_masks = []
     out_img_w, out_img_s = [], []
     out_label, out_logit, out_entropy = [], [], []
-    out_ignore = [] if ignore_mask is not None else None
 
     for i in range(batch):
-        mix_mask = generate_class_mask(
-            pseudo_label[i],
-            pseudo_conf=None if pseudo_logit is None else pseudo_logit[i],
-            conf_thresh=conf_thresh,
-            ignore_index=ignore_index,
-        )
+        mix_mask = generate_class_mask(pseudo_label[i])
         mix_masks.append(mix_mask.unsqueeze(0))
         j = (i + 1) % batch
         mix = mix_mask.unsqueeze(0)
@@ -108,9 +100,6 @@ def class_mix_batch(
         out_label.append((pseudo_label[i] * mix_mask + pseudo_label[j] * (1 - mix_mask)).unsqueeze(0))
         out_logit.append((pseudo_logit[i] * mix_mask + pseudo_logit[j] * (1 - mix_mask)).unsqueeze(0))
         out_entropy.append((entropy[i] * mix_mask + entropy[j] * (1 - mix_mask)).unsqueeze(0))
-        if ignore_mask is not None:
-            mixed_ignore = torch.where(mix_mask.bool(), ignore_mask[i], ignore_mask[j])
-            out_ignore.append(mixed_ignore.unsqueeze(0))
 
     return {
         "img_w": torch.cat(out_img_w, dim=0),
@@ -118,7 +107,6 @@ def class_mix_batch(
         "pseudo_label": torch.cat(out_label, dim=0).long(),
         "pseudo_logit": torch.cat(out_logit, dim=0),
         "entropy": torch.cat(out_entropy, dim=0),
-        "ignore_mask": None if out_ignore is None else torch.cat(out_ignore, dim=0),
         "mix_mask": torch.cat(mix_masks, dim=0),
     }
 
@@ -134,20 +122,32 @@ def dequeue_and_enqueue(keys: torch.Tensor, bank: SegMindMemoryBank, class_idx: 
     bank.ptrs[class_idx] = min(queue.shape[0], bank.bank_size)
 
 
-def _sample_negatives(bank: SegMindMemoryBank, num_classes: int, exclude_class: int, num_negative: int, device: torch.device):
-    candidates = []
-    for cls_idx in range(num_classes):
-        if cls_idx == exclude_class:
+def _sample_negative_features(
+    sample_class_counts: torch.Tensor,
+    bank: SegMindMemoryBank,
+    feat_dim: int,
+    num_queries: int,
+    num_negative: int,
+    device: torch.device,
+) -> torch.Tensor:
+    negatives = torch.zeros((num_queries, num_negative, feat_dim), device=device)
+    for query_idx in range(sample_class_counts.shape[0]):
+        chunks = []
+        for class_idx, sample_count in enumerate(sample_class_counts[query_idx].tolist()):
+            if sample_count <= 0 or bank.queues[class_idx].shape[0] == 0:
+                continue
+            sample_idx = torch.randint(
+                low=0,
+                high=bank.queues[class_idx].shape[0],
+                size=(sample_count,),
+                device=device,
+            )
+            chunks.append(bank.queues[class_idx][sample_idx].to(device))
+        if not chunks:
             continue
-        if bank.queues[cls_idx].shape[0] > 0:
-            candidates.append(bank.queues[cls_idx])
-    if not candidates:
-        return None
-    negatives = torch.cat(candidates, dim=0)
-    if negatives.shape[0] <= num_negative:
-        return negatives.to(device)
-    idx = torch.randint(0, negatives.shape[0], (num_negative,), device=device)
-    return negatives[idx].to(device)
+        chunk = torch.cat(chunks, dim=0)
+        negatives[query_idx, : chunk.shape[0]] = chunk
+    return negatives
 
 
 def segmind_contrastive_loss(
@@ -161,54 +161,81 @@ def segmind_contrastive_loss(
     num_negative: int,
     ignore_index: int = 255,
 ) -> torch.Tensor:
-    feat = F.normalize(feat, dim=1)
     num_classes = prob.shape[1]
+    feat_dim = feat.shape[1]
     feat_hw = feat.permute(0, 2, 3, 1)
     labels_small = F.interpolate(labels.float().unsqueeze(1), size=feat.shape[-2:], mode="nearest").squeeze(1).long()
     prob_small = F.interpolate(prob, size=feat.shape[-2:], mode="bilinear", align_corners=True)
     device = feat.device
-    losses = []
 
-    for cls_idx in range(num_classes):
-        valid = labels_small == cls_idx
-        if valid.sum() == 0:
+    valid_classes = []
+    batch_means = []
+    hard_features = []
+    queue_means = torch.zeros((num_classes, feat_dim), device=device)
+
+    for class_idx in range(num_classes):
+        valid_mask = labels_small == class_idx
+        if valid_mask.sum() == 0:
             continue
-        class_feat = feat_hw[valid]
-        dequeue_and_enqueue(class_feat, bank, cls_idx)
+        valid_classes.append(class_idx)
+        class_feat = feat_hw[valid_mask]
+        dequeue_and_enqueue(class_feat, bank, class_idx)
+        batch_means.append(torch.mean(class_feat, dim=0, keepdim=True))
+        hard_features.append(feat_hw[(prob_small[:, class_idx] < query_threshold) & valid_mask])
+        if bank.queues[class_idx].shape[0] > 0:
+            queue_means[class_idx] = torch.mean(bank.queues[class_idx], dim=0).to(device)
 
-        hard_mask = valid & (prob_small[:, cls_idx] < query_threshold)
-        hard_feat = feat_hw[hard_mask]
-        if hard_feat.shape[0] == 0 or bank.queues[cls_idx].shape[0] == 0:
-            continue
-
-        q_idx = torch.randint(0, hard_feat.shape[0], (min(num_queries, hard_feat.shape[0]),), device=device)
-        queries = hard_feat[q_idx]
-        positive = F.normalize(bank.queues[cls_idx].mean(dim=0, keepdim=True).to(device), dim=1)
-        negatives = _sample_negatives(bank, num_classes, cls_idx, num_negative, device)
-        if negatives is None or negatives.shape[0] == 0:
-            continue
-        negatives = F.normalize(negatives, dim=1)
-
-        pos_logits = torch.matmul(queries, positive.t())
-        neg_logits = torch.matmul(queries, negatives.t())
-        logits = torch.cat((pos_logits, neg_logits), dim=1) / temperature
-        target = torch.zeros(logits.shape[0], dtype=torch.long, device=device)
-        losses.append(F.cross_entropy(logits, target))
-
-    if not losses:
+    if not valid_classes:
         return feat.sum() * 0.0
-    return torch.stack(losses).mean()
+
+    total_loss = feat.sum() * 0.0
+    for valid_idx, class_idx in enumerate(valid_classes):
+        class_hard_features = hard_features[valid_idx]
+        if class_hard_features.shape[0] == 0:
+            continue
+        query_idx = torch.randint(class_hard_features.shape[0], (num_queries,), device=device)
+        query_features = class_hard_features[query_idx]
+
+        mean_similarity = F.cosine_similarity(batch_means[valid_idx].to(device), queue_means, dim=1)
+        mean_similarity = torch.cat((mean_similarity[:class_idx], mean_similarity[class_idx + 1 :]))
+        if mean_similarity.numel() == 0:
+            continue
+        negative_probs = torch.softmax(mean_similarity, dim=0)
+        full_probs = torch.zeros(num_classes, device=device)
+        if class_idx > 0:
+            full_probs[:class_idx] = negative_probs[:class_idx]
+        if class_idx + 1 < num_classes:
+            full_probs[class_idx + 1 :] = negative_probs[class_idx:]
+        if full_probs.sum() <= 0:
+            continue
+        sampler = torch.distributions.Categorical(probs=full_probs)
+        sampled_classes = sampler.sample((num_queries, num_negative))
+        sampled_class_counts = torch.stack(
+            [(sampled_classes == cls_idx).sum(dim=1) for cls_idx in range(num_classes)],
+            dim=1,
+        )
+        negative_features = _sample_negative_features(
+            sampled_class_counts,
+            bank,
+            feat_dim=feat_dim,
+            num_queries=num_queries,
+            num_negative=num_negative,
+            device=device,
+        )
+        positive_features = batch_means[valid_idx].to(device).unsqueeze(0).repeat(num_queries, 1, 1)
+        all_features = torch.cat((positive_features, negative_features), dim=1)
+        logits = F.cosine_similarity(query_features.unsqueeze(1), all_features, dim=2)
+        total_loss = total_loss + F.cross_entropy(
+            logits / temperature,
+            torch.zeros(num_queries, dtype=torch.long, device=device),
+        )
+
+    return total_loss / len(valid_classes)
 
 
 @torch.no_grad()
 def gather_pseudo_from_teacher(model_ema, img_l_w: torch.Tensor, img_u_w: torch.Tensor):
-    was_training = model_ema.training
-    model_ema.eval()
-    try:
-        outputs = model_ema(torch.cat((img_l_w, img_u_w), dim=0), return_aux=True)
-    finally:
-        if was_training:
-            model_ema.train()
+    outputs = model_ema(torch.cat((img_l_w, img_u_w), dim=0), return_aux=True)
     logits = outputs["seg_logits"]
     probs = logits.softmax(dim=1)
     pseudo_logit, pseudo_label = probs[img_l_w.shape[0] :].max(dim=1)

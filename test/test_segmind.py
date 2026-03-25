@@ -25,7 +25,7 @@ if str(REPO_ROOT) not in sys.path:
 from model.semseg import dpt as dpt_mod
 from model.semseg import upernet as upernet_mod
 from model.semseg.segmind import SegMindModel
-from segmind import apply_ignore_mask_to_labels, build_entropy_targets, build_pseudo_mask, filter_pseudo_labels
+from segmind import build_entropy_targets, needs_pseudo_branch
 from util.segmind_utils import class_mix_batch, create_memory_bank, generate_class_mask, generate_grid_mask, segmind_contrastive_loss
 
 
@@ -68,81 +68,60 @@ def test_class_mix_batch_preserves_shapes_and_types():
     assert out["pseudo_label"].dtype == torch.long
     assert out["mix_mask"].shape == (b, h, w)
 
+def test_generate_class_mask_can_be_empty_for_single_class_inputs():
+    pseudo_label = torch.ones(4, 4, dtype=torch.long)
+    mask = generate_class_mask(pseudo_label)
+    assert torch.count_nonzero(mask).item() == 0
 
 
-
-
-
-def test_generate_class_mask_only_uses_high_confidence_pixels():
-    pseudo_label = torch.tensor([[1, 1, 2, 2]])
-    pseudo_conf = torch.tensor([[0.99, 0.20, 0.97, 0.10]])
-    mask = generate_class_mask(pseudo_label, pseudo_conf=pseudo_conf, conf_thresh=0.95, ignore_index=255)
-    assert mask[0, 1].item() == 0.0
-    assert mask[0, 3].item() == 0.0
-    assert set(torch.unique(mask).tolist()).issubset({0.0, 1.0})
-
-
-def test_class_mix_batch_masks_out_low_confidence_regions_from_paste():
+def test_class_mix_batch_ignores_confidence_thresholds_for_official_behavior():
     img_w = torch.arange(2 * 3 * 2 * 2, dtype=torch.float32).reshape(2, 3, 2, 2)
     img_s = img_w.clone()
     pseudo_label = torch.tensor([[[1, 1], [2, 2]], [[3, 3], [4, 4]]])
-    pseudo_logit = torch.tensor([[[0.99, 0.10], [0.98, 0.20]], [[0.99, 0.99], [0.99, 0.99]]])
+    pseudo_logit_low = torch.tensor([[[0.01, 0.10], [0.02, 0.20]], [[0.01, 0.01], [0.01, 0.01]]])
+    pseudo_logit_high = torch.ones_like(pseudo_logit_low)
     entropy = torch.rand(2, 2, 2)
-    out = class_mix_batch(
+    torch.manual_seed(0)
+    out_low = class_mix_batch(
         img_w=img_w,
         img_s=img_s,
         pseudo_label=pseudo_label,
-        pseudo_logit=pseudo_logit,
+        pseudo_logit=pseudo_logit_low,
         entropy=entropy,
-        ignore_mask=torch.zeros(2, 2, 2, dtype=torch.long),
         conf_thresh=0.95,
     )
-    low_conf_pos = (0, 0, 1)
-    assert out["mix_mask"][low_conf_pos].item() == 0.0
+    torch.manual_seed(0)
+    out_high = class_mix_batch(
+        img_w=img_w,
+        img_s=img_s,
+        pseudo_label=pseudo_label,
+        pseudo_logit=pseudo_logit_high,
+        entropy=entropy,
+        conf_thresh=0.0,
+    )
+    assert torch.equal(out_low["mix_mask"], out_high["mix_mask"])
 
-def test_apply_ignore_mask_to_labels_replaces_invalid_pseudo_pixels():
-    labels = torch.tensor([[[1, 2], [3, 4]]])
-    ignore_mask = torch.tensor([[[0, 255], [255, 0]]])
-    masked = apply_ignore_mask_to_labels(labels, ignore_mask, ignore_index=99)
-    assert torch.equal(masked, torch.tensor([[[1, 99], [99, 4]]]))
 
-
-def test_build_entropy_targets_uses_teacher_labeled_entropy_and_unlabeled_ignore_mask():
+def test_build_entropy_targets_is_plain_concatenation():
     teacher_entropy_l = torch.tensor([[[0.1, 0.2], [0.3, 0.4]]])
     mixed_entropy = torch.tensor([[[0.5, 0.6], [0.7, 0.8]]])
-    ignore_mask = torch.tensor([[[0, 255], [0, 255]]])
-    teacher_entropy_all, valid_entropy = build_entropy_targets(
-        teacher_entropy_l,
-        mixed_entropy,
-        ignore_mask,
-        ignore_index=255,
-    )
+    teacher_entropy_all = build_entropy_targets(teacher_entropy_l, mixed_entropy)
     assert torch.equal(teacher_entropy_all[0], teacher_entropy_l[0])
     assert torch.equal(teacher_entropy_all[1], mixed_entropy[0])
-    assert torch.equal(valid_entropy[0], torch.tensor([[True, True], [True, True]]))
-    assert torch.equal(valid_entropy[1], torch.tensor([[True, False], [True, False]]))
 
 
-def test_filter_pseudo_labels_rejects_low_confidence_or_invalid_pixels():
-    pseudo_label = torch.tensor([[[1, 2], [3, 4]]])
-    pseudo_conf = torch.tensor([[[0.99, 0.60], [0.96, 0.98]]])
-    ignore_mask = torch.tensor([[[0, 0], [255, 0]]])
-    filtered, valid_mask = filter_pseudo_labels(
-        pseudo_label,
-        pseudo_conf,
-        ignore_mask,
-        conf_thresh=0.95,
-        ignore_index=255,
+def test_needs_pseudo_branch_depends_on_pseudo_or_auxiliary_losses():
+    assert not needs_pseudo_branch(
+        {"lambda_pseudo": 0.0, "lambda_e": 0.0, "lambda_r": 0.0, "lambda_rsc": 0.0, "lambda_c": 0.0}
     )
-    assert torch.equal(valid_mask, torch.tensor([[[True, False], [False, True]]]))
-    assert torch.equal(filtered, torch.tensor([[[1, 255], [255, 4]]]))
+    assert needs_pseudo_branch(
+        {"lambda_pseudo": 1.0, "lambda_e": 0.0, "lambda_r": 0.0, "lambda_rsc": 0.0, "lambda_c": 0.0}
+    )
+    assert needs_pseudo_branch(
+        {"lambda_pseudo": 0.0, "lambda_e": 0.0, "lambda_r": 0.0, "lambda_rsc": 0.0, "lambda_c": 1.0}
+    )
 
 
-def test_build_pseudo_mask_combines_confidence_and_ignore_mask():
-    pseudo_conf = torch.tensor([[[0.9, 0.96]]])
-    ignore_mask = torch.tensor([[[0, 255]]])
-    valid_mask = build_pseudo_mask(pseudo_conf, ignore_mask, conf_thresh=0.95)
-    assert torch.equal(valid_mask, torch.tensor([[[False, False]]]))
 def test_generate_grid_mask_matches_requested_ratio_and_shape():
     mask = generate_grid_mask(2, 32, 32, mask_gap=8, mask_rate=0.25, device=torch.device("cpu"))
     assert mask.shape == (2, 1, 32, 32)
@@ -206,16 +185,21 @@ def test_build_criterions_sets_ignore_index_for_unlabeled_ce():
 def test_segmind_source_uses_shared_helpers_and_validation_wrapper():
     text = (REPO_ROOT / "segmind.py").read_text(encoding="utf-8")
     assert 'wrap_ddp(model, logger=logger, rank=rank, save_path=args.save_path)' in text
-    assert 'maybe_load_checkpoint(args, model, optimizer, model_ema=model_ema, logger=logger, rank=rank)' in text
+    assert 'use_pseudo_branch = needs_pseudo_branch(segmind_cfg)' in text
     assert 'from util.validation import validation_cpu as shared_validation_cpu' in text
     assert 'return shared_validation_cpu(cfg, model, valid_loader)' in text
-    assert 'criterion_l, criterion_u = build_criterions(cfg, local_rank)' in text
-    assert 'loss_u_map = criterion_u(pred_u, pseudo_label)' in text
-    assert 'conf_thresh = cfg.get("conf_thresh", 0.95)' in text
+    assert 'criterion_l, _ = build_criterions(cfg, local_rank)' in text
+    assert 'model = SegMindModel(' in text
+    assert 'logits_l = model(img_l_w)' in text
+    assert 'loss_x = criterion_l(logits_l, mask_l)' in text
+    assert 'loss_pseudo = criterion_l(pred_u, mixed_u["pseudo_label"])' in text
+    assert 'lambda_pseudo = segmind_cfg.get("lambda_pseudo", 1.0)' in text
     assert 'teacher_entropy_l' in text
-    assert 'filtered_pseudo_label, pseudo_mask = filter_pseudo_labels(' in text
-    assert 'conf_thresh=conf_thresh' in text
     assert 'strong_outputs = model(strong_inputs, return_aux=True)' in text
     assert 'masked_weak_inputs = weak_inputs * mim_mask' in text
     assert 'recon_outputs = model(masked_weak_inputs, mim_mask=mim_mask, return_aux=True)' in text
     assert 'feat=strong_outputs["proj_feat"]' in text
+    assert 'writer.add_scalar("train/pseudo_conf", mixed_u["pseudo_logit"].mean().item(), iters)' in text
+    assert 'train/loss_pseudo' in text
+    assert 'build_labeled_only_dataloaders' not in text
+    assert 'runtime_cfg' not in text
