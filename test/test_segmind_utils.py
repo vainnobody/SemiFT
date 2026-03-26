@@ -80,6 +80,8 @@ def test_segmind_source_uses_lr_multi_defaults_and_pseudo_threshold():
     assert "for param, param_ema in zip(model.parameters(), model_ema.parameters()):" in source
     assert "for buffer, buffer_ema in zip(model.buffers(), model_ema.buffers()):" in source
     assert "model_ema.eval()" in source
+    assert "find_unused_parameters=False" in source
+    assert 'logger.info("Enabled DDP static graph for SegMind training.")' in source
 
 
 def test_validate_segmind_recipe_rejects_incompatible_crop_and_mask_gap():

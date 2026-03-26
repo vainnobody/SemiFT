@@ -265,10 +265,12 @@ def main(args, cfg):
         device_ids=[local_rank],
         broadcast_buffers=False,
         output_device=local_rank,
-        find_unused_parameters=True,
+        find_unused_parameters=False,
     )
     if hasattr(model, "_set_static_graph"):
         model._set_static_graph()
+        if rank == 0:
+            logger.info("Enabled DDP static graph for SegMind training.")
 
     model_ema = deepcopy(model)
     model_ema.eval()
