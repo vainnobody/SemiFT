@@ -153,32 +153,3 @@ def test_dpt_supports_resnet101_need_fp():
     y, y_fp = model(x, need_fp=True)
     assert y.shape == (2, 3, 128, 128)
     assert y_fp.shape == (2, 3, 128, 128)
-
-
-def test_scalematch_models_support_resnet101_backbone():
-    x = torch.randn(2, 3, 128, 128)
-
-    dpt_model = dpt_mod.DPT(
-        encoder_size="resnet101",
-        nclass=3,
-        features=64,
-        out_channels=[256, 512, 1024, 2048],
-        backbone_version="resnet",
-        enable_scalematch=True,
-    )
-    y = dpt_model(x)
-    assert y.shape == (2, 3, 128, 128)
-    scale_out = dpt_model(x, scale_factor=1.25, feature_scale=1.25)
-    assert set(scale_out) == {"pred_joint", "pred_ori", "pred_fp", "pred_size"}
-
-    uper_model = upernet_mod.UperNet(
-        encoder_size="resnet101",
-        nclass=3,
-        fpn_channels=64,
-        backbone_version="resnet",
-        enable_scalematch=True,
-    )
-    y = uper_model(x)
-    assert y.shape == (2, 3, 128, 128)
-    scale_out = uper_model(x, scale_factor=1.25, feature_scale=1.25)
-    assert set(scale_out) == {"pred_joint", "pred_ori", "pred_fp", "pred_size"}

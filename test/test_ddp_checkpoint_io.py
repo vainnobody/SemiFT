@@ -25,8 +25,6 @@ DIRECT_ENTRYPOINTS = [
     'unimatch_v2.py',
     'unimatch_v2_rgcr.py',
     'unimatchv2_peft.py',
-    'scalematch.py',
-    'scalematch_peft.py',
 ]
 
 HELPER_ENTRYPOINTS = ['wscl.py', 'unimatch.py']
