@@ -92,9 +92,9 @@ def update_lr_official(optimizer, base_lr, iters, total_iters, power=0.9, min_lr
     lr = max(base_lr * (1 - iters / total_iters) ** power, min_lr)
     optimizer.param_groups[0]["lr"] = lr
     for group_idx in range(1, len(optimizer.param_groups)):
-        optimizer.param_groups[group_idx]["lr"] = (
-            lr * optimizer.param_groups[group_idx].get("lr_scale", 1.0)
-        )
+        optimizer.param_groups[group_idx]["lr"] = lr * optimizer.param_groups[
+            group_idx
+        ].get("lr_scale", 1.0)
     return lr
 
 
@@ -113,10 +113,10 @@ def apply_segmind_defaults(cfg):
     cfg.setdefault("mask_gap", 4)
     cfg.setdefault("mask_rate", cfg.get("mask_rate_end", 0.25))
     cfg.setdefault("lambda_l", 1.0)
-    cfg.setdefault("lambda_e", 0.1)
-    cfg.setdefault("lambda_r", 0.0)
-    cfg.setdefault("lambda_rsc", 0.0)
-    cfg.setdefault("lambda_c", 0.0)
+    cfg.setdefault("lambda_e", 0.25)
+    cfg.setdefault("lambda_r", 0.25)
+    cfg.setdefault("lambda_rsc", 0.25)
+    cfg.setdefault("lambda_c", 0.25)
     return cfg
 
 
@@ -218,7 +218,9 @@ def unpack_queue_state(checkpoint, nclass, feat_dim, bank_size):
     return load_queue_state(payload)
 
 
-def create_block_mask(batch_size, height, width, mask_patch=16, mask_ratio=0.25, device=None):
+def create_block_mask(
+    batch_size, height, width, mask_patch=16, mask_ratio=0.25, device=None
+):
     return get_batch_mask_tensor(
         (batch_size, 1, height, width),
         mask_gap=mask_patch,
@@ -238,7 +240,14 @@ def classmix_batch(img_w, img_s, pseudo_label, pseudo_conf, pseudo_entropy, vali
         labels=pseudo_label,
     )
     img_w_mix, img_s_mix, pseudo_mix, conf_mix, entropy_mix, valid_mix, _ = mixed
-    return img_w_mix, img_s_mix, pseudo_mix.long(), conf_mix, entropy_mix, valid_mix.bool()
+    return (
+        img_w_mix,
+        img_s_mix,
+        pseudo_mix.long(),
+        conf_mix,
+        entropy_mix,
+        valid_mix.bool(),
+    )
 
 
 def main(args, cfg):
@@ -247,7 +256,9 @@ def main(args, cfg):
     logger, rank, world_size, writer = build_logger_and_runtime(args, cfg)
 
     if rank == 0:
-        logger.info("{}\n".format(pprint.pformat({**cfg, **vars(args), "ngpus": world_size})))
+        logger.info(
+            "{}\n".format(pprint.pformat({**cfg, **vars(args), "ngpus": world_size}))
+        )
 
     model = build_model(cfg)
     load_result = load_backbone_checkpoint(model, cfg)
@@ -339,9 +350,10 @@ def main(args, cfg):
                 best_epoch_ema,
             )
 
-        for step, ((img_l_w, img_l_s, mask_l), (img_u_w, img_u_s, valid_mask_u)) in enumerate(
-            zip(trainloader_l, trainloader_u)
-        ):
+        for step, (
+            (img_l_w, img_l_s, mask_l),
+            (img_u_w, img_u_s, valid_mask_u),
+        ) in enumerate(zip(trainloader_l, trainloader_u)):
             img_l_w = img_l_w.cuda(local_rank)
             img_l_s = img_l_s.cuda(local_rank)
             mask_l = mask_l.cuda(local_rank)
@@ -351,7 +363,9 @@ def main(args, cfg):
 
             with torch.no_grad():
                 teacher_inputs = torch.cat((img_l_w, img_u_w), dim=0)
-                teacher_logits = model_ema(teacher_inputs, return_proj=False)["out"].detach()
+                teacher_logits = model_ema(teacher_inputs, return_proj=False)[
+                    "out"
+                ].detach()
                 teacher_probs = torch.softmax(teacher_logits, dim=1)
                 teacher_entropy = torch.sum(
                     -teacher_probs * torch.log(teacher_probs.clamp_min(1e-8)),
@@ -404,7 +418,9 @@ def main(args, cfg):
 
             loss_r = student_logits.new_zeros(())
             loss_rsc = student_logits.new_zeros(())
-            if (cfg.get("lambda_r", 1.0) != 0 or cfg.get("lambda_rsc", 1.0) != 0) and epoch <= epoch_pre:
+            if (
+                cfg.get("lambda_r", 1.0) != 0 or cfg.get("lambda_rsc", 1.0) != 0
+            ) and epoch <= epoch_pre:
                 weak_inputs = torch.cat((img_l_w, img_u_w_mix), dim=0)
                 mask_tensor = get_batch_mask_tensor(
                     weak_inputs.shape,
@@ -493,7 +509,9 @@ def main(args, cfg):
                 writer.add_scalar("train/loss_r", loss_r.item(), iters)
                 writer.add_scalar("train/loss_rsc", loss_rsc.item(), iters)
                 writer.add_scalar("train/loss_c", loss_c.item(), iters)
-                writer.add_scalar("train/pseudo_conf", pseudo_conf_mix.mean().item(), iters)
+                writer.add_scalar(
+                    "train/pseudo_conf", pseudo_conf_mix.mean().item(), iters
+                )
                 writer.add_scalar("train/lr", lr, iters)
 
             if rank == 0 and step % max(1, len(trainloader_u) // 8) == 0:
@@ -537,8 +555,14 @@ def main(args, cfg):
             writer.add_scalar("eval/mIoU", mIoU, epoch)
             writer.add_scalar("eval/mIoU_ema", mIoU_ema, epoch)
             for cls_idx, iou in enumerate(iou_class):
-                writer.add_scalar(f"eval/{CLASSES[cfg['dataset']][cls_idx]}_IoU", iou, epoch)
-                writer.add_scalar(f"eval/{CLASSES[cfg['dataset']][cls_idx]}_IoU_ema", iou_class_ema[cls_idx], epoch)
+                writer.add_scalar(
+                    f"eval/{CLASSES[cfg['dataset']][cls_idx]}_IoU", iou, epoch
+                )
+                writer.add_scalar(
+                    f"eval/{CLASSES[cfg['dataset']][cls_idx]}_IoU_ema",
+                    iou_class_ema[cls_idx],
+                    epoch,
+                )
 
         is_best = mIoU >= previous_best
         previous_best = max(mIoU, previous_best)
