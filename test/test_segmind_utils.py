@@ -76,6 +76,10 @@ def test_segmind_source_uses_lr_multi_defaults_and_pseudo_threshold():
     assert 'cfg.setdefault("pseudo_threshold", cfg.get("conf_thresh", 0.95))' in source
     assert '"lr_scale": lr_multi' in source
     assert 'pseudo_conf_mix >= cfg["pseudo_threshold"]' in source
+    assert "ema_ratio = min(1 - 1 / (iters + 1), alpha_ema)" in source
+    assert "for param, param_ema in zip(model.parameters(), model_ema.parameters()):" in source
+    assert "for buffer, buffer_ema in zip(model.buffers(), model_ema.buffers()):" in source
+    assert "model_ema.eval()" in source
 
 
 def test_validate_segmind_recipe_rejects_incompatible_crop_and_mask_gap():

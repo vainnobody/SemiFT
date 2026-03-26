@@ -36,7 +36,6 @@ from util.ssl_method_utils import (
     load_backbone_checkpoint,
     load_checkpoint_on_cpu,
     log_model_info,
-    update_ema,
     save_checkpoint_to_disk,
 )
 from util.utils import AverageMeter
@@ -272,7 +271,7 @@ def main(args, cfg):
         model._set_static_graph()
 
     model_ema = deepcopy(model)
-    model_ema.train()
+    model_ema.eval()
     for param in model_ema.parameters():
         param.requires_grad = False
 
@@ -320,7 +319,7 @@ def main(args, cfg):
         trainloader_l.sampler.set_epoch(epoch)
         trainloader_u.sampler.set_epoch(epoch)
         model.train()
-        model_ema.train()
+        model_ema.eval()
 
         meters = {
             "loss_all": AverageMeter(),
@@ -471,7 +470,15 @@ def main(args, cfg):
                 power=cfg.get("lr_power", 0.9),
                 min_lr=cfg.get("min_lr", 1e-6),
             )
-            update_ema(model, model_ema, iters, max_decay=alpha_ema)
+            ema_ratio = min(1 - 1 / (iters + 1), alpha_ema)
+            for param, param_ema in zip(model.parameters(), model_ema.parameters()):
+                param_ema.copy_(
+                    param_ema * ema_ratio + param.detach() * (1 - ema_ratio)
+                )
+            for buffer, buffer_ema in zip(model.buffers(), model_ema.buffers()):
+                buffer_ema.copy_(
+                    buffer_ema * ema_ratio + buffer.detach() * (1 - ema_ratio)
+                )
 
             meters["loss_all"].update(loss.item())
             meters["loss_l"].update(loss_l.item())
