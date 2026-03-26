@@ -431,6 +431,11 @@ def main(args, cfg):
                 )
                 strong_batch = strong_inputs.shape[0]
                 student_logits = student_outputs["out"][:strong_batch]
+                student_proj_feat = (
+                    student_outputs["proj_feat"][:strong_batch]
+                    if need_contrastive
+                    else None
+                )
                 recon_logits = student_outputs["out"][strong_batch:]
                 recon_pred = student_outputs["recon"][strong_batch:]
             else:
@@ -439,6 +444,9 @@ def main(args, cfg):
                     return_proj=need_contrastive,
                 )
                 student_logits = student_outputs["out"]
+                student_proj_feat = (
+                    student_outputs["proj_feat"] if need_contrastive else None
+                )
                 recon_logits = None
                 recon_pred = None
                 mask_tensor = None
@@ -474,7 +482,7 @@ def main(args, cfg):
             loss_c = student_logits.new_zeros(())
             if cfg.get("lambda_c", 1.0) != 0:
                 loss_c = compute_contrastive_loss(
-                    student_outputs["proj_feat"],
+                    student_proj_feat,
                     labels_all,
                     student_probs,
                     queue_state,
