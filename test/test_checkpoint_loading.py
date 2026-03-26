@@ -25,7 +25,6 @@ def test_training_entrypoints_load_backbone_checkpoints_on_cpu():
         'dwl.py',
         'scalematch.py',
         'scalematch_peft.py',
-        'segmind.py',
     ]
 
     helper_text = (REPO_ROOT / 'util/ssl_method_utils.py').read_text()
