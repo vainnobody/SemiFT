@@ -641,3 +641,6 @@ class UperNet(nn.Module):
         )
 
         return out
+
+# Backward-compatible alias
+UPerNet = UperNet

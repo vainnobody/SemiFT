@@ -16,7 +16,7 @@ from einops import rearrange
 from dataset.semi_rs import SemiDataset
 from dataset.val import ValDataset
 from model.semseg.dpt import DPT
-from model.semseg.upernet import UPerNet
+from model.semseg.upernet import UperNet
 from util.classes import CLASSES
 from util.ohem import ProbOhemCrossEntropy2d
 from util.focal import FocalLoss
@@ -63,7 +63,7 @@ def build_model(cfg, backbone_version):
             enable_corrmatch=True,
         )
     elif cfg["model"] == "upernet":
-        model = UPerNet(
+        model = UperNet(
             **model_kwargs,
             backbone_version=backbone_version,
             enable_corrmatch=True,
