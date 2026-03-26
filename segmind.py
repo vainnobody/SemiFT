@@ -109,7 +109,7 @@ def apply_segmind_defaults(cfg):
     cfg.setdefault("query_threshold", 0.97)
     cfg.setdefault("pseudo_threshold", cfg.get("conf_thresh", 0.95))
     cfg.setdefault("alpha_ema", 0.99)
-    cfg.setdefault("epoch_pre", 0)
+    cfg.setdefault("epoch_pre", 40)
     cfg.setdefault("mask_gap", 4)
     cfg.setdefault("mask_rate", cfg.get("mask_rate_end", 0.25))
     cfg.setdefault("lambda_l", 1.0)
