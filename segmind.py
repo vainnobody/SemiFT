@@ -399,28 +399,14 @@ def main(args, cfg):
                 )
                 pseudo_label_mix[~pseudo_valid_mask] = cfg["ignore_index"]
 
-            strong_inputs = torch.cat((img_l_s, img_u_s_mix), dim=0)
-            student_outputs = model(
-                strong_inputs,
-                return_proj=cfg.get("lambda_c", 1.0) != 0,
-            )
-            student_logits = student_outputs["out"]
-            student_probs = torch.softmax(student_logits, dim=1)
-            student_entropy = torch.sum(
-                -student_probs * torch.log(student_probs.clamp_min(1e-8)),
-                dim=1,
-            )
-
             labels_all = torch.cat((mask_l, pseudo_label_mix), dim=0)
-            loss_l = criterion_l(student_logits, labels_all)
-            entropy_targets = torch.cat((teacher_entropy_l, entropy_u_mix), dim=0)
-            loss_e = entropy_criterion(student_entropy, entropy_targets)
-
-            loss_r = student_logits.new_zeros(())
-            loss_rsc = student_logits.new_zeros(())
-            if (
+            strong_inputs = torch.cat((img_l_s, img_u_s_mix), dim=0)
+            need_contrastive = cfg.get("lambda_c", 1.0) != 0
+            need_reconstruction = (
                 cfg.get("lambda_r", 1.0) != 0 or cfg.get("lambda_rsc", 1.0) != 0
-            ) and epoch <= epoch_pre:
+            ) and epoch <= epoch_pre
+
+            if need_reconstruction:
                 weak_inputs = torch.cat((img_l_w, img_u_w_mix), dim=0)
                 mask_tensor = get_batch_mask_tensor(
                     weak_inputs.shape,
@@ -429,21 +415,57 @@ def main(args, cfg):
                     device=weak_inputs.device,
                 )
                 masked_inputs = weak_inputs * mask_tensor
-                recon_outputs = model(
-                    masked_inputs,
-                    return_proj=False,
-                    return_reconstruction=True,
-                    reconstruction_mask=mask_tensor,
+                # DDP expects one forward graph per iteration. Concatenate the
+                # strong and reconstruction branches so every trainable parameter
+                # participates in a single reducer graph before backward().
+                forward_inputs = torch.cat((strong_inputs, masked_inputs), dim=0)
+                reconstruction_masks = torch.cat(
+                    (torch.ones_like(mask_tensor), mask_tensor),
+                    dim=0,
                 )
+                student_outputs = model(
+                    forward_inputs,
+                    return_proj=need_contrastive,
+                    return_reconstruction=True,
+                    reconstruction_mask=reconstruction_masks,
+                )
+                strong_batch = strong_inputs.shape[0]
+                student_logits = student_outputs["out"][:strong_batch]
+                recon_logits = student_outputs["out"][strong_batch:]
+                recon_pred = student_outputs["recon"][strong_batch:]
+            else:
+                student_outputs = model(
+                    strong_inputs,
+                    return_proj=need_contrastive,
+                )
+                student_logits = student_outputs["out"]
+                recon_logits = None
+                recon_pred = None
+                mask_tensor = None
+                weak_inputs = None
+
+            student_probs = torch.softmax(student_logits, dim=1)
+            student_entropy = torch.sum(
+                -student_probs * torch.log(student_probs.clamp_min(1e-8)),
+                dim=1,
+            )
+
+            loss_l = criterion_l(student_logits, labels_all)
+            entropy_targets = torch.cat((teacher_entropy_l, entropy_u_mix), dim=0)
+            loss_e = entropy_criterion(student_entropy, entropy_targets)
+
+            loss_r = student_logits.new_zeros(())
+            loss_rsc = student_logits.new_zeros(())
+            if need_reconstruction:
                 if cfg.get("lambda_r", 1.0) != 0:
                     loss_r = compute_reconstruction_loss(
-                        recon_outputs["recon"],
+                        recon_pred,
                         weak_inputs,
                         mask_tensor.squeeze(1),
                     )
                 if cfg.get("lambda_rsc", 1.0) != 0:
                     loss_rsc = compute_masked_segmentation_loss(
-                        recon_outputs["out"],
+                        recon_logits,
                         labels_all,
                         mask_tensor.squeeze(1),
                         cfg["ignore_index"],
