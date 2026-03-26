@@ -156,6 +156,8 @@ class DPT(nn.Module):
         backbone_version="dinov2",  # 'dinov2' or 'dinov3'
         enable_scalematch=False,
         enable_corrmatch=False,
+        corr_sample_num=128,
+        corr_chunk_size=512,
     ):
         super(DPT, self).__init__()
 
@@ -221,7 +223,11 @@ class DPT(nn.Module):
                 nn.ReLU(inplace=True),
                 nn.Dropout2d(0.1),
             )
-            self.corr = Corr(nclass=nclass)
+            self.corr = Corr(
+                nclass=nclass,
+                sample_num=int(corr_sample_num),
+                chunk_size=int(corr_chunk_size),
+            )
         if self.enable_scalematch:
             scale_in_ch = 2 * features
             rwkv_channels = max(scale_in_ch // 16, 1)
@@ -439,9 +445,11 @@ class DPT(nn.Module):
         patch_w,
         need_fp=False,
     ):
-        logits, corr_feats = self.head(features, patch_h, patch_w, return_feats=True)
+        logits_lowres, corr_feats = self.head(
+            features, patch_h, patch_w, return_feats=True
+        )
         logits = F.interpolate(
-            logits,
+            logits_lowres,
             x.shape[-2:],
             mode="bilinear",
             align_corners=True,
@@ -463,7 +471,9 @@ class DPT(nn.Module):
             outputs["out_fp"] = logits_fp
 
         corr_inputs = self.corr_proj(corr_feats)
-        corr_dict = self.corr(corr_inputs, logits)
+        corr_dict = self.corr(
+            corr_inputs, logits_lowres, output_size=x.shape[-2:]
+        )
         outputs["corr_map"] = corr_dict["corr_map"]
         outputs["corr_out"] = F.interpolate(
             corr_dict["out"],

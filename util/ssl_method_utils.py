@@ -97,7 +97,11 @@ def get_model_kwargs(cfg):
         raise ValueError(
             f"Unsupported backbone size '{info['size']}' for backbone '{cfg['backbone']}'."
         )
-    return {**model_cfg, "nclass": cfg["nclass"]}
+    kwargs = {**model_cfg, "nclass": cfg["nclass"]}
+    for optional_key in ("corr_sample_num", "corr_chunk_size"):
+        if optional_key in cfg:
+            kwargs[optional_key] = cfg[optional_key]
+    return kwargs
 
 
 def get_backbone_checkpoint_path(cfg):

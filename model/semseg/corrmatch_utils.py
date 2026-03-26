@@ -7,9 +7,11 @@ from einops import rearrange
 
 
 class Corr(nn.Module):
-    def __init__(self, nclass=21):
+    def __init__(self, nclass=21, sample_num=128, chunk_size=512):
         super(Corr, self).__init__()
         self.nclass = nclass
+        self.sample_num = sample_num
+        self.chunk_size = chunk_size
         self.conv1 = nn.Conv2d(
             256, self.nclass, kernel_size=1, stride=1, padding=0, bias=True
         )
@@ -17,48 +19,76 @@ class Corr(nn.Module):
             256, self.nclass, kernel_size=1, stride=1, padding=0, bias=True
         )
 
-    def forward(self, feature_in, out):
+    def forward(self, feature_in, out, output_size=None):
         dict_return = {}
-        # Use feature_in shape for h_in/w_in logic from original code.
-        # Original: h_in, w_in = math.ceil(feature_in.shape[2] / (1)), math.ceil(feature_in.shape[3] / (1))
-        # Since divisor is 1, it's just shape.
         h_in, w_in = feature_in.shape[2], feature_in.shape[3]
-        h_out, w_out = out.shape[2], out.shape[3]
+        if output_size is None:
+            h_out, w_out = out.shape[2], out.shape[3]
+        else:
+            h_out, w_out = output_size
 
-        out = F.interpolate(
-            out.detach(), (h_in, w_in), mode="bilinear", align_corners=True
-        )
-        feature = F.interpolate(
-            feature_in, (h_in, w_in), mode="bilinear", align_corners=True
-        )
+        if out.shape[-2:] != (h_in, w_in):
+            out = F.interpolate(
+                out.detach(), (h_in, w_in), mode="bilinear", align_corners=True
+            )
+        else:
+            out = out.detach()
 
-        f1 = rearrange(self.conv1(feature), "n c h w -> n c (h w)")
-        f2 = rearrange(self.conv2(feature), "n c h w -> n c (h w)")
+        f1 = rearrange(self.conv1(feature_in), "n c h w -> n c (h w)")
+        f2 = rearrange(self.conv2(feature_in), "n c h w -> n c (h w)")
         out_temp = rearrange(out, "n c h w -> n c (h w)")
 
-        corr_map = torch.matmul(f1.transpose(1, 2), f2) / torch.sqrt(
-            torch.tensor(f1.shape[1]).float()
-        )
-        corr_map = F.softmax(corr_map, dim=-1)
+        hw = f1.shape[-1]
+        sample_num = min(self.sample_num, hw)
+        sample_idx = None
+        if sample_num > 0:
+            sample_idx = torch.randperm(hw, device=f1.device)[:sample_num].sort().values
 
-        corr_map_sample = self.sample(corr_map.detach(), h_in, w_in)
-        dict_return["corr_map"] = self.normalize_corr_map(
-            corr_map_sample, h_in, w_in, h_out, w_out
-        )
+        f1_t = f1.transpose(1, 2).contiguous()
+        corr_out = out_temp.new_zeros(out_temp.shape)
+        corr_map_sample_chunks = []
+        scale = math.sqrt(float(f1.shape[1]))
+
+        for start in range(0, hw, self.chunk_size):
+            end = min(start + self.chunk_size, hw)
+            corr_chunk = torch.bmm(f1_t[:, start:end, :], f2) / scale
+            corr_chunk = F.softmax(corr_chunk, dim=-1)
+
+            corr_out = corr_out + torch.bmm(out_temp[:, :, start:end], corr_chunk)
+
+            if sample_idx is not None:
+                sample_mask = (sample_idx >= start) & (sample_idx < end)
+                if sample_mask.any():
+                    local_idx = (sample_idx[sample_mask] - start).long()
+                    corr_map_sample_chunks.append(corr_chunk[:, local_idx, :].detach())
+
+        if corr_map_sample_chunks:
+            corr_map_sample = torch.cat(corr_map_sample_chunks, dim=1)
+            dict_return["corr_map"] = self.normalize_corr_map(
+                corr_map_sample, h_in, w_in, h_out, w_out
+            )
+        else:
+            dict_return["corr_map"] = torch.zeros(
+                f1.shape[0],
+                0,
+                h_out,
+                w_out,
+                dtype=torch.bool,
+                device=f1.device,
+            )
+
         dict_return["out"] = rearrange(
-            torch.matmul(out_temp, corr_map), "n c (h w) -> n c h w", h=h_in, w=w_in
+            corr_out, "n c (h w) -> n c h w", h=h_in, w=w_in
         )
 
         return dict_return
 
-    def sample(self, corr_map, h_in, w_in):
-        # Original code used 128 samples
-        index = torch.randint(0, h_in * w_in - 1, [128])
-        corr_map_sample = corr_map[:, index.long(), :]
-        return corr_map_sample
-
     def normalize_corr_map(self, corr_map, h_in, w_in, h_out, w_out):
         n, m, hw = corr_map.shape
+        if m == 0:
+            return torch.zeros(
+                n, 0, h_out, w_out, dtype=torch.bool, device=corr_map.device
+            )
         corr_map = rearrange(corr_map, "n m (h w) -> (n m) 1 h w", h=h_in, w=w_in)
         corr_map = F.interpolate(
             corr_map, (h_out, w_out), mode="bilinear", align_corners=True

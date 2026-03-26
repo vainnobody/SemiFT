@@ -231,6 +231,8 @@ class UperNet(nn.Module):
         **kwargs,  # Ignore DPT-specific params (features, out_channels)
     ):
         super(UperNet, self).__init__()
+        corr_sample_num = int(kwargs.pop("corr_sample_num", 128))
+        corr_chunk_size = int(kwargs.pop("corr_chunk_size", 512))
 
         # Intermediate layer indices for feature extraction
         self.intermediate_layer_idx_v2 = {
@@ -301,7 +303,11 @@ class UperNet(nn.Module):
                 nn.ReLU(inplace=True),
                 nn.Dropout2d(0.1),
             )
-            self.corr = Corr(nclass=nclass)
+            self.corr = Corr(
+                nclass=nclass,
+                sample_num=corr_sample_num,
+                chunk_size=corr_chunk_size,
+            )
         if self.enable_scalematch:
             scale_in_ch = 2 * fpn_channels
             rwkv_channels = max(scale_in_ch // 16, 1)
@@ -475,9 +481,9 @@ class UperNet(nn.Module):
             ]
 
         pyramid_feats = self.neck(tuple(feat_maps))
-        logits, corr_feats = self.decoder(pyramid_feats, return_feats=True)
+        logits_lowres, corr_feats = self.decoder(pyramid_feats, return_feats=True)
         logits = F.interpolate(
-            logits,
+            logits_lowres,
             size=(height, width),
             mode="bilinear",
             align_corners=False,
@@ -502,7 +508,7 @@ class UperNet(nn.Module):
             outputs["out_fp"] = logits_fp
 
         corr_inputs = self.corr_proj(corr_feats)
-        corr_dict = self.corr(corr_inputs, logits)
+        corr_dict = self.corr(corr_inputs, logits_lowres, output_size=(height, width))
         outputs["corr_map"] = corr_dict["corr_map"]
         outputs["corr_out"] = F.interpolate(
             corr_dict["out"],
