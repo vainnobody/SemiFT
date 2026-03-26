@@ -17,12 +17,6 @@ from model.semseg.scalematch_core import (
     scale_as,
 )
 from model.semseg.feature_perturb import apply_structured_feature_perturbation
-try:
-    from model.semseg.corrmatch_utils import Corr
-    _CORR_IMPORT_ERROR = None
-except ModuleNotFoundError as exc:
-    Corr = None
-    _CORR_IMPORT_ERROR = exc
 
 
 class PPM(nn.Module):
@@ -227,13 +221,9 @@ class UperNet(nn.Module):
         use_bn=True,  # kept for API compatibility with DPT
         backbone_version="dinov2",
         enable_scalematch=False,
-        enable_corrmatch=False,
         **kwargs,  # Ignore DPT-specific params (features, out_channels)
     ):
         super(UperNet, self).__init__()
-        corr_sample_num = int(kwargs.pop("corr_sample_num", 128))
-        corr_chunk_size = int(kwargs.pop("corr_chunk_size", 512))
-
         # Intermediate layer indices for feature extraction
         self.intermediate_layer_idx_v2 = {
             "small": [2, 5, 8, 11],
@@ -254,7 +244,6 @@ class UperNet(nn.Module):
         self.encoder_size = encoder_size
         self.backbone_version = backbone_version
         self.enable_scalematch = enable_scalematch
-        self.enable_corrmatch = enable_corrmatch
 
         # Initialize backbone
         if backbone_version == "dinov2":
@@ -290,24 +279,6 @@ class UperNet(nn.Module):
         # For comp_drop support (same as DPT)
         self.binomial = torch.distributions.binomial.Binomial(probs=0.5)
         self.fp_dropout = nn.Dropout2d(0.5)
-        if self.enable_corrmatch:
-            if Corr is None:
-                raise ModuleNotFoundError(
-                    "CorrMatch support requires optional dependency 'einops'."
-                ) from _CORR_IMPORT_ERROR
-            self.corr_proj = nn.Sequential(
-                nn.Conv2d(
-                    fpn_channels, 256, kernel_size=3, stride=1, padding=1, bias=True
-                ),
-                nn.BatchNorm2d(256),
-                nn.ReLU(inplace=True),
-                nn.Dropout2d(0.1),
-            )
-            self.corr = Corr(
-                nclass=nclass,
-                sample_num=corr_sample_num,
-                chunk_size=corr_chunk_size,
-            )
         if self.enable_scalematch:
             scale_in_ch = 2 * fpn_channels
             rwkv_channels = max(scale_in_ch // 16, 1)
@@ -471,59 +442,12 @@ class UperNet(nn.Module):
             "pred_size": p_lo_ori,
         }
 
-    def _corrmatch_forward(self, x, feat_maps, need_fp=False, feature_perturb=None):
-        height, width = x.shape[-2:]
-        feat_maps = [feat.float() for feat in feat_maps]
-        if feature_perturb is not None:
-            feat_maps = [
-                apply_structured_feature_perturbation(feat, feature_perturb)
-                for feat in feat_maps
-            ]
-
-        pyramid_feats = self.neck(tuple(feat_maps))
-        logits_lowres, corr_feats = self.decoder(pyramid_feats, return_feats=True)
-        logits = F.interpolate(
-            logits_lowres,
-            size=(height, width),
-            mode="bilinear",
-            align_corners=False,
-        )
-
-        outputs = {"out": logits}
-        if need_fp:
-            feat_maps_fp = [self.fp_dropout(feat) for feat in feat_maps]
-            if feature_perturb is not None:
-                feat_maps_fp = [
-                    apply_structured_feature_perturbation(feat, feature_perturb)
-                    for feat in feat_maps_fp
-                ]
-            pyramid_feats_fp = self.neck(tuple(feat_maps_fp))
-            logits_fp = self.decoder(pyramid_feats_fp)
-            logits_fp = F.interpolate(
-                logits_fp,
-                size=(height, width),
-                mode="bilinear",
-                align_corners=False,
-            )
-            outputs["out_fp"] = logits_fp
-
-        corr_inputs = self.corr_proj(corr_feats)
-        corr_dict = self.corr(corr_inputs, logits_lowres, output_size=(height, width))
-        outputs["corr_map"] = corr_dict["corr_map"]
-        outputs["corr_out"] = F.interpolate(
-            corr_dict["out"],
-            size=(height, width),
-            mode="bilinear",
-            align_corners=False,
-        )
-        return outputs
     def forward(
         self,
         x,
         comp_drop=False,
         feature_perturb=None,
         need_fp=False,
-        use_corr=False,
         scale_factor=None,
         feature_scale=1.0,
     ):
@@ -544,15 +468,12 @@ class UperNet(nn.Module):
         if scale_factor is not None:
             if not self.enable_scalematch:
                 raise ValueError("ScaleMatch forward requested but enable_scalematch=False.")
-            if need_fp or feature_perturb is not None or comp_drop or use_corr:
-                raise ValueError("ScaleMatch forward does not support comp_drop/need_fp/feature_perturb/use_corr.")
+            if need_fp or feature_perturb is not None or comp_drop:
+                raise ValueError("ScaleMatch forward does not support comp_drop/need_fp/feature_perturb.")
             return self._scalematch_two_scale_forward(x, scale_factor, feature_scale)
 
         if need_fp and comp_drop:
             raise ValueError("UPerNet does not support need_fp=True together with comp_drop=True.")
-        if use_corr and not self.enable_corrmatch:
-            raise ValueError("CorrMatch forward requested but enable_corrmatch=False.")
-
         B, C, H, W = x.shape
         if self.feature_kind == "token":
             patch_size = self.backbone.patch_size
@@ -563,14 +484,6 @@ class UperNet(nn.Module):
         else:
             patch_h = patch_w = None
             features = self.backbone.forward_features(x)
-
-        if use_corr:
-            return self._corrmatch_forward(
-                x,
-                features,
-                need_fp=need_fp,
-                feature_perturb=feature_perturb,
-            )
 
         if need_fp:
             feat_maps = []

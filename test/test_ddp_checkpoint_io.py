@@ -8,7 +8,6 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 
 
 DIRECT_ENTRYPOINTS = [
-    'corrmatch.py',
     'supervised.py',
     'fixmatch.py',
     'dwl.py',
@@ -29,7 +28,7 @@ DIRECT_ENTRYPOINTS = [
     'scalematch_peft.py',
 ]
 
-HELPER_ENTRYPOINTS = ['wscl.py', 'segmind.py', 'unimatch.py']
+HELPER_ENTRYPOINTS = ['wscl.py', 'unimatch.py']
 
 
 def load_checkpoint_to_cpu_function():

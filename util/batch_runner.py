@@ -25,7 +25,6 @@ DEFAULT_GPU_IDLE_MAX_MEMORY_MB = 1024
 DEFAULT_GPU_IDLE_MAX_UTILIZATION = 10
 
 TRAINING_ENTRYPOINTS = {
-    "corrmatch.py",
     "dwl.py",
     "fixmatch.py",
     "fixmatch_pascal.py",
@@ -42,7 +41,6 @@ TRAINING_ENTRYPOINTS = {
     "ranpaste.py",
     "scalematch.py",
     "scalematch_peft.py",
-    "segmind.py",
     "supervised.py",
     "unimatch.py",
     "unimatch_v2.py",
