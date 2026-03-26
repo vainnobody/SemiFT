@@ -1,6 +1,7 @@
 import torch
 
 from segmind import classmix_batch, create_block_mask
+from util.segmind_utils import compute_masked_segmentation_loss
 
 
 def test_classmix_batch_preserves_shapes_and_dtypes():
@@ -49,3 +50,17 @@ def test_unsupervised_mask_style_reduction_avoids_nan_when_no_high_confidence_pi
     reduced = (loss_u_map * unsup_mask.float()).sum() / unsup_mask.sum().clamp(min=1.0)
     assert torch.isfinite(reduced)
     assert reduced.item() == 0.0
+
+
+def test_masked_segmentation_loss_only_supervises_masked_pixels():
+    logits = torch.tensor(
+        [[
+            [[10.0, -10.0], [10.0, -10.0]],
+            [[-10.0, 10.0], [-10.0, 10.0]],
+        ]]
+    )
+    labels = torch.tensor([[[0, 1], [1, 0]]])
+    mask = torch.tensor([[[0, 1], [1, 0]]], dtype=torch.float32)
+    loss = compute_masked_segmentation_loss(logits, labels, mask, ignore_index=255)
+    assert torch.isfinite(loss)
+    assert loss.item() > 0.0

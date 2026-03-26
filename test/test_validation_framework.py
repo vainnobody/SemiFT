@@ -20,6 +20,7 @@ def test_extract_validation_logits_supports_tensor_tuple_and_dict():
 
 def test_all_validation_wrappers_use_shared_impl_in_source():
     files = [
+        "segmind.py",
         "supervised.py",
         "rankmatch.py",
         "corrmatch.py",

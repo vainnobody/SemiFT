@@ -6,6 +6,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 
 def test_training_entrypoints_load_backbone_checkpoints_on_cpu():
     entrypoints = [
+        'segmind.py',
         'supervised.py',
         'fixmatch.py',
         'fixmatch_pascal.py',
