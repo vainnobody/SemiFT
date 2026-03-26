@@ -336,6 +336,10 @@ class AdaptModel(nn.Module):
         raise ValueError(f"Unsupported leaf adapter method: {method}")
 
     def _enable_bitfit(self, target_name, target):
+        if target_name == "head":
+            for param in target.parameters():
+                param.requires_grad = True
+            return
         for param in target.parameters():
             param.requires_grad = False
         for name, param in target.named_parameters(recurse=True):

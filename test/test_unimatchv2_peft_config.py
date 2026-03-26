@@ -339,6 +339,16 @@ def test_bitfit_only_enables_biases_for_target_module():
     assert adapted.model.block.mlp.fc2.bias.requires_grad is True
 
 
+def test_bitfit_keeps_head_fully_trainable():
+    semift = load_semift_module()
+    model = build_dummy_block(semift.torch)
+    cfg = semift.SemiFTConfig(method="bitfit", target_modules=["head"])
+    adapted = semift.AdaptModel(cfg, model)
+
+    assert adapted.model.head.weight.requires_grad is True
+    assert adapted.model.head.bias.requires_grad is True
+
+
 def test_adaptmodel_skips_non_linear_proj_suffix_matches():
     semift = load_semift_module()
     import torch.nn as nn
