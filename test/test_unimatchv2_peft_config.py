@@ -87,10 +87,14 @@ def load_semift_module():
     class SemiFtSAMoEV5(SemiFt):
         pass
 
+    class SemiFtSAMoEV6(SemiFt):
+        pass
+
     moe_mod.SemiFt = SemiFt
     moe_mod.SemiFtSAMoE = SemiFtSAMoE
     moe_mod.SemiFtSAMoEV4 = SemiFtSAMoEV4
     moe_mod.SemiFtSAMoEV5 = SemiFtSAMoEV5
+    moe_mod.SemiFtSAMoEV6 = SemiFtSAMoEV6
     moe_mod.SemiFtScaleGate = SemiFtScaleGate
 
     sys.modules["peft.utils"] = utils_mod
@@ -279,6 +283,49 @@ def test_adaptmodel_wraps_adaptformer_block():
     adapted = semift.AdaptModel(cfg, model)
     assert isinstance(adapted.model.block.mlp, semift.WarpBlock)
     assert isinstance(adapted.model.block.mlp.adapter, semift.AdapterFormer)
+
+
+def test_adaptmodel_falls_back_to_whole_patch_embed_wrapper_without_proj_or_norm():
+    semift = load_semift_module()
+    model = build_dummy_block(semift.torch)
+    cfg = semift.SemiFTConfig(method="ssf", target_modules=["patch_embed"])
+    adapted = semift.AdaptModel(cfg, model)
+
+    assert hasattr(adapted.model.patch_embed, "proj") is False
+    assert isinstance(adapted.model.patch_embed, semift.SsfWrapper)
+
+
+def test_adaptmodel_wraps_ssf_patch_embed_proj_and_norm_modules():
+    semift = load_semift_module()
+    import torch.nn as nn
+
+    class PatchEmbed(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.proj = nn.Conv2d(3, 8, kernel_size=2, stride=2)
+            self.norm = nn.LayerNorm(8)
+
+        def forward(self, x):
+            x = self.proj(x)
+            x = x.flatten(2).transpose(1, 2)
+            return self.norm(x)
+
+    class Model(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.patch_embed = PatchEmbed()
+
+        def forward(self, x):
+            return self.patch_embed(x)
+
+    model = Model()
+    cfg = semift.SemiFTConfig(method="ssf", target_modules=["patch_embed"])
+    adapted = semift.AdaptModel(cfg, model)
+
+    assert isinstance(adapted.model.patch_embed.proj, semift.SsfWrapper)
+    assert isinstance(adapted.model.patch_embed.norm, semift.SsfWrapper)
+    assert adapted.model.patch_embed.proj.base_layer.weight.requires_grad is False
+    assert adapted.model.patch_embed.norm.base_layer.weight.requires_grad is False
 
 
 def test_bitfit_only_enables_biases_for_target_module():

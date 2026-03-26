@@ -130,6 +130,11 @@ class AdaptModel(nn.Module):
             if not self._matches(key, expanded_targets):
                 continue
             parent, target, target_name = self._get_submodules(key)
+            if self.peft_config.method in SSF_METHODS and target_name == "patch_embed":
+                if self._apply_ssf_to_patch_embed(target):
+                    matched = True
+                    visited.add(key)
+                    continue
             if self.peft_config.method in PARAMETER_ONLY_METHODS:
                 self._enable_bitfit(target_name, target)
                 matched = True
@@ -257,6 +262,30 @@ class AdaptModel(nn.Module):
             init_scale=self.peft_config.ssf_init_scale,
             init_shift_std=self.peft_config.ssf_init_shift_std,
         )
+
+    def _apply_ssf_to_patch_embed(self, target):
+        wrapped = False
+        proj = getattr(target, "proj", None)
+        if proj is not None:
+            target.proj = SsfWrapper(
+                proj,
+                output_dim=self._infer_output_dim("proj", proj),
+                init_scale=self.peft_config.ssf_init_scale,
+                init_shift_std=self.peft_config.ssf_init_shift_std,
+            )
+            wrapped = True
+
+        norm = getattr(target, "norm", None)
+        if norm is not None and not isinstance(norm, nn.Identity):
+            target.norm = SsfWrapper(
+                norm,
+                output_dim=self._infer_output_dim("norm", norm),
+                init_scale=self.peft_config.ssf_init_scale,
+                init_shift_std=self.peft_config.ssf_init_shift_std,
+            )
+            wrapped = True
+
+        return wrapped
 
     def _supports_leaf_adapter_target(self, target_name, target):
         if self.peft_config.method == "ssf":
