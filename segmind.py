@@ -91,9 +91,72 @@ def build_labeled_criterion(cfg, local_rank):
 
 def update_lr_official(optimizer, base_lr, iters, total_iters, power=0.9, min_lr=1e-6):
     lr = max(base_lr * (1 - iters / total_iters) ** power, min_lr)
-    for group in optimizer.param_groups:
-        group["lr"] = lr
+    optimizer.param_groups[0]["lr"] = lr
+    for group_idx in range(1, len(optimizer.param_groups)):
+        optimizer.param_groups[group_idx]["lr"] = (
+            lr * optimizer.param_groups[group_idx].get("lr_scale", 1.0)
+        )
     return lr
+
+
+def apply_segmind_defaults(cfg):
+    cfg = dict(cfg)
+    cfg.setdefault("proj_dim", 256)
+    cfg.setdefault("recon_channels", 128)
+    cfg.setdefault("bank_size", 10000)
+    cfg.setdefault("num_query", 256)
+    cfg.setdefault("num_negative", 512)
+    cfg.setdefault("temperature", 0.5)
+    cfg.setdefault("query_threshold", 0.97)
+    cfg.setdefault("pseudo_threshold", cfg.get("conf_thresh", 0.95))
+    cfg.setdefault("alpha_ema", 0.99)
+    cfg.setdefault("epoch_pre", 0)
+    cfg.setdefault("mask_gap", 4)
+    cfg.setdefault("mask_rate", cfg.get("mask_rate_end", 0.25))
+    cfg.setdefault("lambda_l", 1.0)
+    cfg.setdefault("lambda_e", 0.1)
+    cfg.setdefault("lambda_r", 0.0)
+    cfg.setdefault("lambda_rsc", 0.0)
+    cfg.setdefault("lambda_c", 0.0)
+    return cfg
+
+
+def validate_segmind_recipe(cfg):
+    crop_size = cfg["crop_size"]
+    mask_gap = cfg["mask_gap"]
+    if isinstance(crop_size, int):
+        valid = crop_size % mask_gap == 0
+    else:
+        valid = all(size % mask_gap == 0 for size in crop_size)
+    if not valid:
+        raise ValueError(
+            f"SegMind requires crop_size divisible by mask_gap, got crop_size={crop_size} mask_gap={mask_gap}."
+        )
+
+
+def build_optimizer(cfg, model):
+    lr_multi = cfg.get("lr_multi", 1.0)
+    return AdamW(
+        [
+            {
+                "params": [p for p in model.backbone.parameters() if p.requires_grad],
+                "lr": cfg["lr"],
+                "lr_scale": 1.0,
+            },
+            {
+                "params": [
+                    param
+                    for name, param in model.named_parameters()
+                    if "backbone" not in name and param.requires_grad
+                ],
+                "lr": cfg["lr"] * lr_multi,
+                "lr_scale": lr_multi,
+            },
+        ],
+        lr=cfg["lr"],
+        betas=tuple(cfg.get("betas", (0.9, 0.99))),
+        weight_decay=cfg.get("weight_decay", cfg.get("weight_delay", 1e-6)),
+    )
 
 
 def build_dataloaders(args, cfg):
@@ -180,6 +243,8 @@ def classmix_batch(img_w, img_s, pseudo_label, pseudo_conf, pseudo_entropy, vali
 
 
 def main(args, cfg):
+    cfg = apply_segmind_defaults(cfg)
+    validate_segmind_recipe(cfg)
     logger, rank, world_size, writer = build_logger_and_runtime(args, cfg)
 
     if rank == 0:
@@ -191,12 +256,7 @@ def main(args, cfg):
         model.lock_backbone()
     log_model_info(logger, rank, model, load_result=load_result)
 
-    optimizer = AdamW(
-        [p for p in model.parameters() if p.requires_grad],
-        lr=cfg["lr"],
-        betas=tuple(cfg.get("betas", (0.9, 0.99))),
-        weight_decay=cfg.get("weight_decay", cfg.get("weight_delay", 1e-6)),
-    )
+    optimizer = build_optimizer(cfg, model)
 
     local_rank = int(os.environ.get("LOCAL_RANK", os.environ.get("RANK", 0)))
     model = torch.nn.SyncBatchNorm.convert_sync_batchnorm(model)
@@ -227,8 +287,8 @@ def main(args, cfg):
     best_epoch_ema = 0
     start_epoch = -1
 
-    proj_dim = cfg.get("proj_dim", 256)
-    queue_state = init_queue_state(cfg["nclass"], proj_dim, cfg.get("bank_size", 10000))
+    proj_dim = cfg["proj_dim"]
+    queue_state = init_queue_state(cfg["nclass"], proj_dim, cfg["bank_size"])
 
     latest_path = os.path.join(args.save_path, "latest.pth")
     if os.path.exists(latest_path):
@@ -246,15 +306,15 @@ def main(args, cfg):
             checkpoint,
             cfg["nclass"],
             proj_dim,
-            cfg.get("bank_size", 10000),
+            cfg["bank_size"],
         )
         if rank == 0:
             logger.info("************ Load from checkpoint at epoch %i\n", start_epoch)
 
-    alpha_ema = cfg.get("alpha_ema", 0.9)
-    epoch_pre = cfg.get("epoch_pre", max(cfg["epochs"] // 2, 1))
-    mask_rate = cfg.get("mask_rate", cfg.get("mask_rate_end", 0.25))
-    mask_gap = cfg.get("mask_gap", 4)
+    alpha_ema = cfg["alpha_ema"]
+    epoch_pre = cfg["epoch_pre"]
+    mask_rate = cfg["mask_rate"]
+    mask_gap = cfg["mask_gap"]
 
     for epoch in range(start_epoch + 1, cfg["epochs"]):
         trainloader_l.sampler.set_epoch(epoch)
@@ -323,7 +383,10 @@ def main(args, cfg):
                     labels=pseudo_label_u,
                 )
                 pseudo_label_mix = pseudo_label_mix.long()
-                pseudo_label_mix[valid_mask_mix < 0.5] = cfg["ignore_index"]
+                pseudo_valid_mask = (valid_mask_mix >= 0.5) & (
+                    pseudo_conf_mix >= cfg["pseudo_threshold"]
+                )
+                pseudo_label_mix[~pseudo_valid_mask] = cfg["ignore_index"]
 
             strong_inputs = torch.cat((img_l_s, img_u_s_mix), dim=0)
             student_outputs = model(

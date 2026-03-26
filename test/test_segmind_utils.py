@@ -1,5 +1,6 @@
 import torch
 
+import segmind
 from segmind import classmix_batch, create_block_mask
 from util.segmind_utils import compute_masked_segmentation_loss
 
@@ -64,3 +65,23 @@ def test_masked_segmentation_loss_only_supervises_masked_pixels():
     loss = compute_masked_segmentation_loss(logits, labels, mask, ignore_index=255)
     assert torch.isfinite(loss)
     assert loss.item() > 0.0
+
+
+def test_segmind_source_uses_lr_multi_defaults_and_pseudo_threshold():
+    source = open("segmind.py", "r", encoding="utf-8").read()
+    assert "def apply_segmind_defaults(cfg):" in source
+    assert 'cfg.setdefault("lambda_r", 0.0)' in source
+    assert 'cfg.setdefault("lambda_rsc", 0.0)' in source
+    assert 'cfg.setdefault("lambda_c", 0.0)' in source
+    assert 'cfg.setdefault("pseudo_threshold", cfg.get("conf_thresh", 0.95))' in source
+    assert '"lr_scale": lr_multi' in source
+    assert 'pseudo_conf_mix >= cfg["pseudo_threshold"]' in source
+
+
+def test_validate_segmind_recipe_rejects_incompatible_crop_and_mask_gap():
+    try:
+        segmind.validate_segmind_recipe({"crop_size": 518, "mask_gap": 4})
+    except ValueError as exc:
+        assert "crop_size divisible by mask_gap" in str(exc)
+    else:
+        raise AssertionError("validate_segmind_recipe should reject 518 with mask_gap=4")
