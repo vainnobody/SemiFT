@@ -198,7 +198,8 @@ def compute_contrastive_loss(
     ignore_index,
 ):
     feat = F.normalize(proj_feat.float(), dim=1)
-    feat = feat.permute(0, 2, 3, 1).reshape(-1, feat.shape[1])
+    feat_dim = feat.shape[1]
+    feat = feat.permute(0, 2, 3, 1).reshape(-1, feat_dim)
     labels = resize_labels_to_shape(labels.detach(), proj_feat.shape[-2:]).reshape(-1)
     probs = F.interpolate(
         probs.detach().float(),
@@ -206,7 +207,8 @@ def compute_contrastive_loss(
         mode="bilinear",
         align_corners=True,
     )
-    probs = probs.permute(0, 2, 3, 1).reshape(-1, probs.shape[1])
+    num_classes = probs.shape[1]
+    probs = probs.permute(0, 2, 3, 1).reshape(-1, num_classes)
 
     valid_mask = labels != ignore_index
     feat = feat[valid_mask]
@@ -217,14 +219,13 @@ def compute_contrastive_loss(
 
     _ensure_queue_device(queue_state, proj_feat.device)
 
-    feat_dim = feat.shape[1]
     device = proj_feat.device
     losses = []
     class_means = {}
     valid_class_ids = []
 
-    num_classes = queue_state.banks.shape[0]
-    for class_idx in range(num_classes):
+    queue_num_classes = queue_state.banks.shape[0]
+    for class_idx in range(queue_num_classes):
         class_mask = labels == class_idx
         if not class_mask.any():
             continue
@@ -238,7 +239,7 @@ def compute_contrastive_loss(
         return proj_feat.new_zeros(())
 
     global_class_means = torch.zeros(
-        (num_classes, feat_dim),
+        (queue_num_classes, feat_dim),
         device=device,
         dtype=feat.dtype,
     )
