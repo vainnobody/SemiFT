@@ -30,6 +30,7 @@ TRAINING_ENTRYPOINTS = {
     "fixmatch_pascal.py",
     "fixmatch_peft.py",
     "fixmatch_rgcr.py",
+    "rgcr.py",
     "fixmatch_rgcrv2.py",
     "fixmatch_rgcrv3.py",
     "fixmatch_rgcrv4.py",

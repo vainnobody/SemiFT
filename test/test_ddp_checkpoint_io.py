@@ -21,6 +21,7 @@ DIRECT_ENTRYPOINTS = [
     'fixmatch_rgcrv5.py',
     'fixmatch_rgcrv6.py',
     'fixmatch_rvsc.py',
+    'rgcr.py',
     'rankmatch.py',
     'unimatch_v2.py',
     'unimatch_v2_rgcr.py',
