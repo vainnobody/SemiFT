@@ -1246,6 +1246,13 @@ class SemiFtSAMoEV5(SemiFtSAMoE):
     def _expert_cls(self):
         return ScaleContextExpertV3
 
+    def _compute_context_gate(self, x_2d):
+        gate_input = x_2d.mean(dim=(-2, -1))
+        return torch.sigmoid(self.context_gate(gate_input)).to(x_2d.dtype)
+
+    def _apply_context_gate(self, sparse_out, context_gate):
+        return self.drop_path(sparse_out * context_gate.view(-1, 1, 1, 1))
+
     def forward(self, x, hw=None):
         x = self.input_act(self.proj_down(self.pre_norm(x)))
 
@@ -1275,10 +1282,9 @@ class SemiFtSAMoEV5(SemiFtSAMoE):
         topk_idx, topk_weight, router_stats = self.gating_network(x_2d)
         self.selected_experts = topk_idx.detach().clone()
         sparse_out = self._sparse_moe_forward(x_2d, topk_idx, topk_weight)
-        gate_input = x_2d.mean(dim=(-2, -1))
-        context_gate = torch.sigmoid(self.context_gate(gate_input)).to(x_2d.dtype)
+        context_gate = self._compute_context_gate(x_2d)
         self.context_gate_values = context_gate.detach().clone()
-        sparse_out = self.drop_path(sparse_out * context_gate.view(-1, 1, 1, 1))
+        sparse_out = self._apply_context_gate(sparse_out, context_gate)
         shared_out = self.shared_expert(x_2d) if self.shared_expert is not None else x_2d.new_zeros(x_2d.shape)
 
         combined_2d = x_2d + self.shared_scale(shared_out) + self.moe_scale(sparse_out)
@@ -1304,6 +1310,18 @@ class SemiFtSAMoEV6(SemiFtSAMoEV5):
         return ScaleSelectiveKernelExpertV6
 
 
+class SemiFtSAMoEV7(SemiFtSAMoEV5):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.context_gate = nn.Conv2d(self.r, 1, kernel_size=1, bias=True)
+        nn.init.zeros_(self.context_gate.weight)
+        nn.init.constant_(self.context_gate.bias, self.branch_gate_init_bias)
+
+    def _compute_context_gate(self, x_2d):
+        return torch.sigmoid(self.context_gate(x_2d)).to(x_2d.dtype)
+
+    def _apply_context_gate(self, sparse_out, context_gate):
+        return self.drop_path(sparse_out * context_gate)
 
 
 class ScaleGatedConvExpert(ConvExpert):

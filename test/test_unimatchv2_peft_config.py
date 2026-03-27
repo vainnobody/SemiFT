@@ -90,11 +90,15 @@ def load_semift_module():
     class SemiFtSAMoEV6(SemiFt):
         pass
 
+    class SemiFtSAMoEV7(SemiFt):
+        pass
+
     moe_mod.SemiFt = SemiFt
     moe_mod.SemiFtSAMoE = SemiFtSAMoE
     moe_mod.SemiFtSAMoEV4 = SemiFtSAMoEV4
     moe_mod.SemiFtSAMoEV5 = SemiFtSAMoEV5
     moe_mod.SemiFtSAMoEV6 = SemiFtSAMoEV6
+    moe_mod.SemiFtSAMoEV7 = SemiFtSAMoEV7
     moe_mod.SemiFtScaleGate = SemiFtScaleGate
 
     sys.modules["peft.utils"] = utils_mod
@@ -847,3 +851,68 @@ def test_build_peft_config_supports_samoev5():
     assert abs(config.moe_layerscale_init - 1e-5) < 1e-8
     assert config.moe_num_prefix_tokens == -1
     assert abs(config.moe_branch_gate_init_bias + 1.25) < 1e-8
+
+
+def test_adaptmodel_wraps_samoev7_block():
+    semift = load_semift_module()
+    model = build_dummy_block(semift.torch)
+    cfg = semift.SemiFTConfig(method="samoev7", target_modules=["mlp"], r=4, moe_num_prefix_tokens=-1)
+    adapted = semift.AdaptModel(cfg, model)
+    assert isinstance(adapted.model.block.mlp, semift.WarpBlock)
+    assert isinstance(adapted.model.block.mlp.adapter, semift.SemiFtSAMoEV7)
+
+
+def test_build_peft_config_supports_samoev7():
+    cfg = {
+        "nclass": 6,
+        "peft": {
+            "method": "samoev7",
+            "target_modules": ["mlp"],
+            "moe_expert_scales": [1, 2, 4, 8],
+            "moe_layerscale_init": 1e-5,
+            "moe_num_prefix_tokens": -1,
+            "moe_branch_gate_init_bias": -1.25,
+        },
+    }
+    peft_cfg = resolve_peft_cfg(cfg, make_args())
+    config = build_peft_config(peft_cfg, cfg)
+
+    assert config.method == "samoev7"
+    assert config.moe_expert_scales == [1, 2, 4, 8]
+    assert abs(config.moe_layerscale_init - 1e-5) < 1e-8
+    assert config.moe_num_prefix_tokens == -1
+    assert abs(config.moe_branch_gate_init_bias + 1.25) < 1e-8
+
+
+def test_semift_kwargs_supports_samoev7_branch_gate_bias():
+    module = load_semift_module()
+    fake_self = types.SimpleNamespace(
+        peft_config=types.SimpleNamespace(
+            method="samoev7",
+            r=32,
+            moe_num_experts=4,
+            moe_topk=2,
+            moe_router_balance_mode="deepseek_v3",
+            moe_router_bias_update_speed=1e-3,
+            moe_router_bias_clip=0.05,
+            moe_router_jitter_noise=1e-2,
+            moe_num_prefix_tokens=5,
+            moe_use_shared_expert=True,
+            moe_conv_hidden_ratio=2.0,
+            moe_conv_kernel_size=3,
+            moe_conv_context_kernel_size=5,
+            moe_conv_use_grn=True,
+            moe_conv_norm_type="groupnorm",
+            moe_expert_scales=[1, 2, 4, 8],
+            moe_conv_gate_temperature=1.0,
+            moe_layerscale_init=1e-5,
+            moe_expert_drop_path_rate=0.1,
+            moe_branch_gate_init_bias=-1.5,
+        )
+    )
+    kwargs = module.AdaptModel._semift_kwargs(fake_self)
+    assert kwargs["layerscale_init"] == 1e-5
+    assert kwargs["drop_path_rate"] == 0.1
+    assert kwargs["branch_gate_init_bias"] == -1.5
+    assert "conv_hidden_ratio" not in kwargs
+    assert "conv_context_kernel_size" not in kwargs

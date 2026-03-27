@@ -217,6 +217,9 @@ torchrun --nproc_per_node=4 unimatchv2_peft.py \
 - `semift`
 - `semift_samoe`
 - `samoev4`
+- `samoev5`
+- `samoev6`
+- `samoev7`
 - `semift_scalegate`
 - `lora`
 - `ssf`
@@ -234,6 +237,9 @@ torchrun --nproc_per_node=4 unimatchv2_peft.py \
 | semift | `["mlp"]` |
 | semift_samoe | `["mlp"]` |
 | samoev4 | `["mlp"]` |
+| samoev5 | `["mlp"]` |
+| samoev6 | `["mlp"]` |
+| samoev7 | `["mlp"]` |
 | semift_scalegate | `["mlp"]` |
 | lora | `["qkv", "proj", "fc1", "fc2"]` |
 | ssf | `["patch_embed", "norm1", "norm2", "qkv", "proj", "fc1", "fc2"]` |
