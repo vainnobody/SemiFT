@@ -4,13 +4,15 @@ import logging
 import os
 import pprint
 
+import numpy as np
 import torch
 from torch import nn
 import torch.backends.cudnn as cudnn
+import torch.nn.functional as F
 from torch.optim import AdamW
 import yaml
 
-from util.utils import count_params, init_log, AverageMeter
+from util.utils import count_params, init_log, AverageMeter, intersectionAndUnion
 from util.dist_helper import setup_distributed
 from util.ssl_method_utils import get_local_rank, load_checkpoint_on_cpu, save_checkpoint_to_disk, log_cuda_memory, load_backbone_checkpoint
 from unimatchv2_peft import apply_peft, resolve_peft_cfg, show_trainable_parameters
@@ -48,6 +50,106 @@ def get_parser():
     parser.set_defaults(freeze_backbone=None)
     return parser.parse_args()
 
+
+
+
+def extract_validation_logits(output):
+    if isinstance(output, torch.Tensor):
+        return output
+    if isinstance(output, dict):
+        if "out" in output:
+            return output["out"]
+        raise TypeError(f"Unsupported validation output dict keys: {list(output.keys())}")
+    if isinstance(output, (list, tuple)):
+        if not output:
+            raise TypeError("Validation output list/tuple is empty.")
+        return output[0]
+    raise TypeError(f"Unsupported validation output type: {type(output)!r}")
+
+
+@torch.no_grad()
+def validation_cpu(cfg, model, valid_loader):
+    intersection_meter = AverageMeter()
+    union_meter = AverageMeter()
+    target_meter = AverageMeter()
+
+    model.eval()
+
+    for x, y, _ in valid_loader:
+        x = x.cuda()
+        if cfg["eval_mode"] == "slide_window":
+            batch_size, _, h, w = x.shape
+            final = torch.zeros(batch_size, cfg["nclass"], h, w, device=x.device)
+            count = torch.zeros(batch_size, 1, h, w, device=x.device)
+
+            crop_size = cfg["crop_size"]
+            if isinstance(crop_size, int):
+                crop_h = crop_w = crop_size
+            else:
+                crop_h, crop_w = crop_size
+
+            step = cfg.get("stride", 510)
+            if isinstance(step, int):
+                step_h = step_w = step
+            else:
+                step_h, step_w = step
+
+            h_starts = list(range(0, max(h - crop_h, 0) + 1, step_h))
+            w_starts = list(range(0, max(w - crop_w, 0) + 1, step_w))
+            if not h_starts:
+                h_starts = [0]
+            if not w_starts:
+                w_starts = [0]
+            last_h = max(h - crop_h, 0)
+            last_w = max(w - crop_w, 0)
+            if h_starts[-1] != last_h:
+                h_starts.append(last_h)
+            if w_starts[-1] != last_w:
+                w_starts.append(last_w)
+
+            for hs in h_starts:
+                for ws in w_starts:
+                    he = min(hs + crop_h, h)
+                    we = min(ws + crop_w, w)
+                    sub_input = x[:, :, hs:he, ws:we]
+                    mask = extract_validation_logits(model(sub_input))
+                    final[:, :, hs:he, ws:we] += mask
+                    count[:, :, hs:he, ws:we] += 1
+
+            final = final / count.clamp_min(1.0)
+            o = final.argmax(dim=1)
+
+        elif cfg["eval_mode"] == "resize":
+            original_shape = x.shape[-2:]
+            resized_x = F.interpolate(
+                x, size=cfg["crop_size"], mode="bilinear", align_corners=True
+            )
+            resized_o = extract_validation_logits(model(resized_x))
+            o = F.interpolate(
+                resized_o, size=original_shape, mode="bilinear", align_corners=True
+            )
+            o = o.argmax(dim=1)
+
+        else:
+            o = extract_validation_logits(model(x))
+            o = o.max(1)[1]
+
+        gray = np.uint8(o.cpu().numpy())
+        target = np.array(y, dtype=np.int32)
+        intersection, union, target_area = intersectionAndUnion(
+            gray, target, cfg["nclass"], cfg["ignore_index"]
+        )
+        intersection_meter.update(intersection)
+        union_meter.update(union)
+        target_meter.update(target_area)
+
+    iou_class = intersection_meter.sum / (union_meter.sum + 1e-10)
+    if cfg["dataset"] == "iSAID":
+        mIoU = np.mean(iou_class[1:]) * 100.0
+    else:
+        mIoU = np.nanmean(iou_class) * 100.0
+
+    return mIoU, iou_class
 
 def build_model(cfg, peft_cfg):
     from model.semseg.dpt import DPT
@@ -136,7 +238,6 @@ def main(args, cfg):
 
     from dataset.semi_rs import SemiDataset
     from dataset.val import ValDataset
-    from supervised import validation_cpu
     from util.classes import CLASSES
     from util.ohem import ProbOhemCrossEntropy2d
     from util.focal import FocalLoss
