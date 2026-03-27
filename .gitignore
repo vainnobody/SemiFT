@@ -23,6 +23,7 @@ scripts/
 !scripts/
 scripts/*
 !scripts/batch_train.py
+!scripts/measure_fixmatch_peft_flops.py
 
 # logs
 logs/
@@ -44,6 +45,7 @@ test/*
 !test/test_validation_framework.py
 !test/test_rn101_backbone_support.py
 !test/test_corrmatch_resnet101.py
+!test/test_measure_fixmatch_peft_flops.py
 
 # local-only artifacts
 .DS_Store
