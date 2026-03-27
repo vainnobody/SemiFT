@@ -145,6 +145,8 @@ class AdaptModel(nn.Module):
                 if self._apply_ssf_to_patch_embed(target):
                     matched = True
                     visited.add(key)
+                    visited.add(f"{key}.proj")
+                    visited.add(f"{key}.norm")
                     continue
             if self.peft_config.method in PARAMETER_ONLY_METHODS:
                 self._enable_bitfit(target_name, target)
@@ -439,8 +441,9 @@ class AdaptModel(nn.Module):
             "conv_use_grn": self.peft_config.moe_conv_use_grn,
             "conv_norm_type": self.peft_config.moe_conv_norm_type,
             "scales": self.peft_config.moe_expert_scales,
-            "conv_gate_temperature": self.peft_config.moe_conv_gate_temperature,
         }
+        if self.peft_config.method == "semift_scalegate":
+            kwargs["conv_gate_temperature"] = self.peft_config.moe_conv_gate_temperature
         return kwargs
 
     def _infer_num_prefix_tokens_from_model(self):
@@ -659,7 +662,13 @@ class AdaptFormerBlockWrapper(nn.Module):
         return x_plus_residual.view_as(x)
 
     def _attn_residual(self, x, *args, **kwargs):
-        attn_out = self.base_block.attn(self.base_block.norm1(x), *args, **kwargs)
+        if len(args) == 1 and not kwargs:
+            try:
+                attn_out = self.base_block.attn(self.base_block.norm1(x), rope=args[0])
+            except TypeError:
+                attn_out = self.base_block.attn(self.base_block.norm1(x), *args, **kwargs)
+        else:
+            attn_out = self.base_block.attn(self.base_block.norm1(x), *args, **kwargs)
         return self.base_block.ls1(attn_out) if hasattr(self.base_block, "ls1") else attn_out
 
     def _ffn_residual(self, x):
@@ -763,6 +772,12 @@ class SsfWrapper(nn.Module):
         if out.dim() == 4 and out.shape[1] == self.scale.shape[0]:
             return out * self.scale.view(1, -1, 1, 1) + self.shift.view(1, -1, 1, 1)
         raise ValueError("SSF wrapper got unsupported output shape.")
+
+    def __getattr__(self, name: str):
+        try:
+            return super().__getattr__(name)
+        except AttributeError:
+            return getattr(self.base_layer, name)
 
 
 class FactTTShared(nn.Module):

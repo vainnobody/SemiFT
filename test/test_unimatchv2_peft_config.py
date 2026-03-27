@@ -500,6 +500,45 @@ def test_adaptformer_block_wrapper_keeps_parallel_residual_path():
     assert torch.allclose(out, x + block.mlp(x), atol=1e-6)
 
 
+def test_adaptformer_block_wrapper_routes_single_positional_arg_as_rope():
+    semift = load_semift_module()
+    import torch
+    import torch.nn as nn
+
+    class RopeAwareAttn(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.last_rope = None
+
+        def forward(self, x, attn_bias=None, rope=None):
+            assert attn_bias is None
+            self.last_rope = rope
+            return torch.zeros_like(x)
+
+    class ToyBlock(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.norm1 = nn.Identity()
+            self.attn = RopeAwareAttn()
+            self.norm2 = nn.Identity()
+            self.mlp = nn.Linear(8, 8, bias=False)
+            self.sample_drop_ratio = 0.0
+            with torch.no_grad():
+                self.mlp.weight.zero_()
+
+        def forward(self, x):
+            return x
+
+    block = ToyBlock()
+    adapter = semift.AdapterFormer(8, 8, r=4, dropout=0.0, scale=0.1, layernorm_option="none")
+    wrapped = semift.AdaptFormerBlockWrapper(block, adapter)
+    x = torch.randn(2, 3, 8)
+    rope = torch.randn(3, 4)
+    wrapped(x, rope)
+
+    assert block.attn.last_rope is rope
+
+
 def test_adaptmodel_falls_back_to_whole_patch_embed_wrapper_without_proj_or_norm():
     semift = load_semift_module()
     model = build_dummy_block(semift.torch)
@@ -541,6 +580,67 @@ def test_adaptmodel_wraps_ssf_patch_embed_proj_and_norm_modules():
     assert isinstance(adapted.model.patch_embed.norm, semift.SsfWrapper)
     assert adapted.model.patch_embed.proj.base_layer.weight.requires_grad is False
     assert adapted.model.patch_embed.norm.base_layer.weight.requires_grad is False
+
+
+def test_adaptmodel_ssf_default_targets_do_not_rewrap_patch_embed_children():
+    semift = load_semift_module()
+    import torch.nn as nn
+
+    class PatchEmbed(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.proj = nn.Conv2d(3, 8, kernel_size=2, stride=2)
+            self.norm = nn.LayerNorm(8)
+
+        def forward(self, x):
+            x = self.proj(x)
+            x = x.flatten(2).transpose(1, 2)
+            return self.norm(x)
+
+    class Attn(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.qkv = nn.Linear(8, 24)
+            self.proj = nn.Linear(8, 8)
+
+        def forward(self, x):
+            return self.proj(self.qkv(x).chunk(3, dim=-1)[0])
+
+    class Mlp(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.fc1 = nn.Linear(8, 16)
+            self.fc2 = nn.Linear(16, 8)
+
+        def forward(self, x):
+            return self.fc2(self.fc1(x).relu())
+
+    class Block(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.norm1 = nn.LayerNorm(8)
+            self.attn = Attn()
+            self.norm2 = nn.LayerNorm(8)
+            self.mlp = Mlp()
+
+        def forward(self, x):
+            x = self.attn(self.norm1(x))
+            return self.mlp(self.norm2(x))
+
+    class Model(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.patch_embed = PatchEmbed()
+            self.block = Block()
+
+        def forward(self, x):
+            return self.block(self.patch_embed(x))
+
+    cfg = semift.SemiFTConfig(method="ssf", target_modules=semift.METHOD_DEFAULT_TARGETS["ssf"])
+    adapted = semift.AdaptModel(cfg, Model())
+
+    assert isinstance(adapted.model.patch_embed.proj, semift.SsfWrapper)
+    assert isinstance(adapted.model.patch_embed.norm, semift.SsfWrapper)
 
 
 def test_bitfit_only_enables_biases_for_target_module():
