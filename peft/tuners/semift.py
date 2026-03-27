@@ -928,15 +928,11 @@ class HydraLora(nn.Module):
         super().__init__()
         self.shared_A = nn.Linear(in_features, r, bias=False)
         self.branches = nn.ModuleList([nn.Linear(r, out_features, bias=False) for _ in range(num_branches)])
-        self.router = nn.Sequential(
-            nn.Linear(in_features, router_hidden),
-            nn.GELU(),
-            nn.Dropout(router_dropout),
-            nn.Linear(router_hidden, num_branches),
-        )
+        self.router = nn.Linear(in_features, num_branches, bias=False)
         self.dropout = nn.Dropout(dropout)
         self.scaling = lora_alpha / max(r, 1)
         nn.init.kaiming_uniform_(self.shared_A.weight, a=math.sqrt(5))
+        nn.init.kaiming_uniform_(self.router.weight, a=math.sqrt(5))
         for branch in self.branches:
             nn.init.zeros_(branch.weight)
 

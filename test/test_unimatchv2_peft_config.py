@@ -404,6 +404,59 @@ def test_conv_lora_falls_back_to_plain_lora_when_tokens_are_not_square():
     assert torch.allclose(out, ref)
 
 
+def test_hydralora_uses_linear_router_like_official_design():
+    semift = load_semift_module()
+    import torch.nn as nn
+
+    adapter = semift.HydraLora(
+        in_features=8,
+        out_features=4,
+        r=2,
+        num_branches=3,
+        router_hidden=16,
+        router_dropout=0.2,
+        lora_alpha=8,
+        dropout=0.1,
+    )
+
+    assert isinstance(adapter.shared_A, nn.Linear)
+    assert isinstance(adapter.router, nn.Linear)
+    assert len(adapter.branches) == 3
+
+
+def test_hydralora_matches_shared_a_multi_b_weighted_sum():
+    semift = load_semift_module()
+    import torch
+
+    adapter = semift.HydraLora(
+        in_features=2,
+        out_features=1,
+        r=1,
+        num_branches=2,
+        router_hidden=4,
+        router_dropout=0.0,
+        lora_alpha=1,
+        dropout=0.0,
+    )
+    with torch.no_grad():
+        adapter.shared_A.weight.copy_(torch.tensor([[1.0, 0.0]]))
+        adapter.router.weight.copy_(torch.tensor([[1.0, 0.0], [0.0, 1.0]]))
+        adapter.branches[0].weight.copy_(torch.tensor([[2.0]]))
+        adapter.branches[1].weight.copy_(torch.tensor([[4.0]]))
+
+    x = torch.tensor([[[1.0, 0.0], [0.0, 1.0]]])
+    out = adapter(x)
+
+    weights = torch.softmax(adapter.router(x), dim=-1)
+    hidden = adapter.shared_A(x)
+    expected = (
+        adapter.branches[0](hidden) * weights[..., :1]
+        + adapter.branches[1](hidden) * weights[..., 1:]
+    ) * adapter.scaling
+
+    assert torch.allclose(out, expected, atol=1e-6)
+
+
 def test_adaptmodel_wraps_adaptformer_block():
     semift = load_semift_module()
     model = build_dummy_block(semift.torch)
