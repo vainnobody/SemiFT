@@ -281,8 +281,42 @@ def test_adaptmodel_wraps_adaptformer_block():
     model = build_dummy_block(semift.torch)
     cfg = semift.SemiFTConfig(method="adaptformer", target_modules=["mlp"], adapter_dim=4)
     adapted = semift.AdaptModel(cfg, model)
-    assert isinstance(adapted.model.block.mlp, semift.WarpBlock)
-    assert isinstance(adapted.model.block.mlp.adapter, semift.AdapterFormer)
+    assert isinstance(adapted.model.block, semift.AdaptFormerBlockWrapper)
+    assert isinstance(adapted.model.block.adapter, semift.AdapterFormer)
+
+
+def test_adaptformer_block_wrapper_keeps_parallel_residual_path():
+    semift = load_semift_module()
+    import torch
+    import torch.nn as nn
+
+    class ToyBlock(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.norm1 = nn.Identity()
+            self.attn = nn.Sequential(nn.Identity(), nn.Linear(8, 8, bias=False))
+            self.ls1 = nn.Identity()
+            self.drop_path1 = nn.Identity()
+            self.norm2 = nn.Identity()
+            self.drop_path2 = nn.Identity()
+            self.sample_drop_ratio = 0.0
+            self.mlp = nn.Linear(8, 8, bias=False)
+            self.ls2 = nn.Identity()
+            with torch.no_grad():
+                self.attn[1].weight.zero_()
+                self.mlp.weight.copy_(torch.eye(8))
+
+        def forward(self, x):
+            return x + self.mlp(x)
+
+    block = ToyBlock()
+    adapter = semift.AdapterFormer(8, 8, r=4, dropout=0.0, scale=0.1, layernorm_option="none")
+    wrapped = semift.AdaptFormerBlockWrapper(block, adapter)
+    x = torch.randn(2, 3, 8)
+    out = wrapped(x)
+
+    assert out.shape == x.shape
+    assert torch.allclose(out, x + block.mlp(x), atol=1e-6)
 
 
 def test_adaptmodel_falls_back_to_whole_patch_embed_wrapper_without_proj_or_norm():

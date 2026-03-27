@@ -130,6 +130,15 @@ class AdaptModel(nn.Module):
             if not self._matches(key, expanded_targets):
                 continue
             parent, target, target_name = self._get_submodules(key)
+            if (
+                self.peft_config.method == "adaptformer"
+                and target_name == "mlp"
+                and hasattr(parent, "norm2")
+            ):
+                self._replace_block_with_adaptformer(key, parent)
+                matched = True
+                visited.add(key)
+                continue
             if self.peft_config.method in SSF_METHODS and target_name == "patch_embed":
                 if self._apply_ssf_to_patch_embed(target):
                     matched = True
@@ -253,6 +262,23 @@ class AdaptModel(nn.Module):
         else:
             raise ValueError(f"Unsupported block-level method: {self.peft_config.method}")
         return WarpBlock(target, adapter)
+
+    def _replace_block_with_adaptformer(self, key, block):
+        block_key = ".".join(key.split(".")[:-1])
+        block_parent_key = ".".join(block_key.split(".")[:-1])
+        block_name = block_key.split(".")[-1]
+        block_parent = self.model if not block_parent_key else self.model.get_submodule(block_parent_key)
+        input_dim = block.mlp.fc1.in_features
+        output_dim = block.mlp.fc2.out_features
+        adapter = AdapterFormer(
+            input_dim,
+            output_dim,
+            r=self.peft_config.adapter_dim,
+            dropout=self.peft_config.adapter_dropout,
+            scale=self.peft_config.adapter_scale,
+            layernorm_option=self.peft_config.adapter_layernorm_option,
+        )
+        setattr(block_parent, block_name, AdaptFormerBlockWrapper(block, adapter))
 
     def _build_ssf_wrapper(self, target_name, target):
         output_dim = self._infer_output_dim(target_name, target)
@@ -576,6 +602,119 @@ class AdapterFormer(nn.Module):
         if self.layernorm_option == "out" and self.adapter_layer_norm_before is not None:
             x = self.adapter_layer_norm_before(x)
         return x * self.scale
+
+
+class AdaptFormerBlockWrapper(nn.Module):
+    def __init__(self, base_block, adapter: AdapterFormer):
+        super().__init__()
+        self.base_block = base_block
+        self.adapter = adapter
+        for param in self.base_block.parameters():
+            param.requires_grad = False
+
+    @staticmethod
+    def _drop_add_residual_stochastic_depth(x: torch.Tensor, residual_func, sample_drop_ratio: float) -> torch.Tensor:
+        b, _, _ = x.shape
+        sample_subset_size = max(int(b * (1 - sample_drop_ratio)), 1)
+        brange = (torch.randperm(b, device=x.device))[:sample_subset_size]
+        x_subset = x[brange]
+        residual = residual_func(x_subset)
+        x_flat = x.flatten(1)
+        residual = residual.flatten(1)
+        residual_scale_factor = b / sample_subset_size
+        x_plus_residual = torch.index_add(
+            x_flat,
+            0,
+            brange,
+            residual.to(dtype=x.dtype),
+            alpha=residual_scale_factor,
+        )
+        return x_plus_residual.view_as(x)
+
+    def _attn_residual(self, x, *args, **kwargs):
+        attn_out = self.base_block.attn(self.base_block.norm1(x), *args, **kwargs)
+        return self.base_block.ls1(attn_out) if hasattr(self.base_block, "ls1") else attn_out
+
+    def _ffn_residual(self, x):
+        ffn_out = self.base_block.mlp(self.base_block.norm2(x))
+        if hasattr(self.base_block, "ls2"):
+            ffn_out = self.base_block.ls2(ffn_out)
+        return ffn_out + self.adapter(x)
+
+    def _forward_tensor(self, x, *args, **kwargs):
+        sample_drop_ratio = float(getattr(self.base_block, "sample_drop_ratio", 0.0) or 0.0)
+
+        if hasattr(self.base_block, "drop_path1"):
+            if self.training and sample_drop_ratio > 0.1:
+                x = self._drop_add_residual_stochastic_depth(
+                    x,
+                    residual_func=lambda y: self._attn_residual(y, *args, **kwargs),
+                    sample_drop_ratio=sample_drop_ratio,
+                )
+                x = self._drop_add_residual_stochastic_depth(
+                    x,
+                    residual_func=self._ffn_residual,
+                    sample_drop_ratio=sample_drop_ratio,
+                )
+            elif self.training and sample_drop_ratio > 0.0:
+                x = x + self.base_block.drop_path1(self._attn_residual(x, *args, **kwargs))
+                drop_path2 = getattr(self.base_block, "drop_path2", self.base_block.drop_path1)
+                x = x + drop_path2(self._ffn_residual(x))
+            else:
+                x = x + self._attn_residual(x, *args, **kwargs)
+                x = x + self._ffn_residual(x)
+            return x
+
+        if self.training and sample_drop_ratio > 0.0:
+            b, _, _ = x.shape
+            sample_subset_size = max(int(b * (1 - sample_drop_ratio)), 1)
+            residual_scale_factor = b / sample_subset_size
+
+            indices_1 = (torch.randperm(b, device=x.device))[:sample_subset_size]
+            x_subset_1 = x[indices_1]
+            residual_1 = self._attn_residual(x_subset_1, *args, **kwargs)
+            x_attn = torch.index_add(
+                x,
+                dim=0,
+                source=residual_1,
+                index=indices_1,
+                alpha=residual_scale_factor,
+            )
+
+            indices_2 = (torch.randperm(b, device=x.device))[:sample_subset_size]
+            x_subset_2 = x_attn[indices_2]
+            residual_2 = self._ffn_residual(x_subset_2)
+            x_ffn = torch.index_add(
+                x_attn,
+                dim=0,
+                source=residual_2,
+                index=indices_2,
+                alpha=residual_scale_factor,
+            )
+            return x_ffn
+
+        x_attn = x + self._attn_residual(x, *args, **kwargs)
+        x_ffn = x_attn + self._ffn_residual(x_attn)
+        return x_ffn
+
+    def forward(self, x_or_x_list, *args, **kwargs):
+        if isinstance(x_or_x_list, torch.Tensor):
+            return self._forward_tensor(x_or_x_list, *args, **kwargs)
+        if isinstance(x_or_x_list, list):
+            aux_list = args[0] if args else kwargs.get("rope_or_rope_list")
+            if aux_list is None:
+                aux_list = [None for _ in x_or_x_list]
+            return [
+                self._forward_tensor(x, rope)
+                for x, rope in zip(x_or_x_list, aux_list)
+            ]
+        raise AssertionError
+
+    def __getattr__(self, name: str):
+        try:
+            return super().__getattr__(name)
+        except AttributeError:
+            return getattr(self.base_block, name)
 
 
 class SsfWrapper(nn.Module):
