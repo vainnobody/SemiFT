@@ -209,6 +209,28 @@ def test_semift_router_bias_settings_are_built_from_config():
     assert config.moe_router_z_loss_coef == 0.0
 
 
+def test_conv_lora_config_fields_are_built_from_config():
+    cfg = {
+        "nclass": 6,
+        "peft": {
+            "method": "conv_lora",
+            "target_modules": ["qkv"],
+            "conv_lora_num_experts": 3,
+            "conv_lora_topk": 1,
+            "conv_lora_kernel_size": 5,
+            "conv_lora_dropout": 0.2,
+        },
+    }
+    peft_cfg = resolve_peft_cfg(cfg, make_args())
+    config = build_peft_config(peft_cfg, cfg)
+
+    assert config.method == "conv_lora"
+    assert config.conv_lora_num_experts == 3
+    assert config.conv_lora_topk == 1
+    assert config.conv_lora_kernel_size == 5
+    assert abs(config.conv_lora_dropout - 0.2) < 1e-8
+
+
 def test_semift_samoe_config_builds_drop_path_rate():
     cfg = {
         "nclass": 6,
@@ -307,6 +329,79 @@ def test_adaptmodel_wraps_fact_tk_leaf_modules():
     assert isinstance(adapted.model.block.mlp.fc2, semift.WarpBlock)
     assert isinstance(adapted.model.block.mlp.fc1.adapter, semift.FactTKAdapter)
     assert isinstance(adapted.model.block.mlp.fc2.adapter, semift.FactTKAdapter)
+
+
+def test_adaptmodel_infers_prefix_tokens_for_conv_lora():
+    semift = load_semift_module()
+    model = build_dummy_block(semift.torch)
+    cfg = semift.SemiFTConfig(method="conv_lora", target_modules=["qkv"], r=4)
+    adapted = semift.AdaptModel(cfg, model)
+
+    assert isinstance(adapted.model.block.attn.qkv, semift.WarpBlock)
+    assert isinstance(adapted.model.block.attn.qkv.adapter, semift.ConvLora)
+    assert adapted.model.block.attn.qkv.adapter.num_prefix_tokens == 1
+
+
+def test_conv_lora_uses_spatial_branch_when_prefix_tokens_are_valid():
+    semift = load_semift_module()
+    import torch
+
+    adapter = semift.ConvLora(
+        in_features=4,
+        out_features=4,
+        r=2,
+        lora_alpha=2,
+        dropout=0.0,
+        kernel_size=1,
+        num_experts=2,
+        topk=1,
+        num_prefix_tokens=1,
+    )
+    with torch.no_grad():
+        adapter.lora.lora_A.weight.copy_(torch.tensor([[1.0, 0.0, 0.0, 0.0], [0.0, 1.0, 0.0, 0.0]]))
+        adapter.gate.proj.weight.zero_()
+        adapter.gate.proj.weight[0, 0] = 1.0
+        adapter.experts[0][0].weight.fill_(1.0)
+        adapter.experts[1][0].weight.zero_()
+        adapter.spatial_proj.weight.copy_(
+            torch.tensor(
+                [
+                    [1.0, 0.0],
+                    [0.0, 1.0],
+                    [0.0, 0.0],
+                    [0.0, 0.0],
+                ]
+            )
+        )
+
+    x = torch.arange(20, dtype=torch.float32).reshape(1, 5, 4)
+    out = adapter(x)
+
+    assert out.shape == x.shape
+    assert torch.allclose(out[:, :1], torch.zeros_like(out[:, :1]))
+    assert not torch.allclose(out[:, 1:], torch.zeros_like(out[:, 1:]))
+
+
+def test_conv_lora_falls_back_to_plain_lora_when_tokens_are_not_square():
+    semift = load_semift_module()
+    import torch
+
+    adapter = semift.ConvLora(
+        in_features=4,
+        out_features=4,
+        r=2,
+        lora_alpha=2,
+        dropout=0.0,
+        kernel_size=1,
+        num_experts=2,
+        topk=1,
+        num_prefix_tokens=1,
+    )
+    x = torch.randn(2, 6, 4)
+    out = adapter(x)
+    ref = adapter.lora(x)
+
+    assert torch.allclose(out, ref)
 
 
 def test_adaptmodel_wraps_adaptformer_block():

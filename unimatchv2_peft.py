@@ -33,6 +33,8 @@ DEFAULT_PEFT_CFG: Dict[str, Any] = {
     "fact_rank": 8,
     "fact_scale": 1.0,
     "fact_dropout": 0.1,
+    "conv_lora_num_experts": 4,
+    "conv_lora_topk": 1,
     "conv_lora_kernel_size": 3,
     "conv_lora_dropout": 0.1,
     "hydra_num_branches": 4,
@@ -199,6 +201,12 @@ def build_peft_config(peft_cfg: Dict[str, Any], cfg: Dict[str, Any]):
         fact_rank=peft_cfg.get("fact_rank", DEFAULT_PEFT_CFG["fact_rank"]),
         fact_scale=peft_cfg.get("fact_scale", DEFAULT_PEFT_CFG["fact_scale"]),
         fact_dropout=peft_cfg.get("fact_dropout", DEFAULT_PEFT_CFG["fact_dropout"]),
+        conv_lora_num_experts=peft_cfg.get(
+            "conv_lora_num_experts", DEFAULT_PEFT_CFG["conv_lora_num_experts"]
+        ),
+        conv_lora_topk=peft_cfg.get(
+            "conv_lora_topk", DEFAULT_PEFT_CFG["conv_lora_topk"]
+        ),
         conv_lora_kernel_size=peft_cfg.get(
             "conv_lora_kernel_size", DEFAULT_PEFT_CFG["conv_lora_kernel_size"]
         ),

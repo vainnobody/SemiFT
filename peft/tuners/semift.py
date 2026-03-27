@@ -41,6 +41,8 @@ class SemiFTConfig(PeftConfig):
     fact_dropout: float = field(default=0.1)
 
     # Conv-LoRA / HydraLoRA
+    conv_lora_num_experts: int = field(default=4)
+    conv_lora_topk: int = field(default=1)
     conv_lora_kernel_size: int = field(default=3)
     conv_lora_dropout: float = field(default=0.1)
     hydra_num_branches: int = field(default=4)
@@ -335,6 +337,9 @@ class AdaptModel(nn.Module):
             )
             return WarpBlock(target, adapter)
         if method == "conv_lora":
+            num_prefix_tokens = self.peft_config.moe_num_prefix_tokens
+            if num_prefix_tokens is None or int(num_prefix_tokens) < 0:
+                num_prefix_tokens = self._infer_num_prefix_tokens_from_model()
             adapter = ConvLora(
                 input_dim,
                 output_dim,
@@ -342,7 +347,9 @@ class AdaptModel(nn.Module):
                 lora_alpha=self.peft_config.lora_alpha,
                 dropout=self.peft_config.conv_lora_dropout,
                 kernel_size=self.peft_config.conv_lora_kernel_size,
-                num_prefix_tokens=self.peft_config.moe_num_prefix_tokens,
+                num_experts=self.peft_config.conv_lora_num_experts,
+                topk=self.peft_config.conv_lora_topk,
+                num_prefix_tokens=num_prefix_tokens,
             )
             return WarpBlock(target, adapter)
         if method == "hydralora":
@@ -815,37 +822,95 @@ class FactTKAdapter(nn.Module):
         return self.shared.fac_tv(hidden) * self.scale
 
 
-class ConvLora(nn.Module):
-    def __init__(self, in_features, out_features, r=8, lora_alpha=32, dropout=0.1, kernel_size=3, num_prefix_tokens=5):
+class ConvLoRAGate(nn.Module):
+    def __init__(self, hidden_dim: int, num_experts: int, topk: int = 1):
         super().__init__()
+        self.hidden_dim = hidden_dim
+        self.num_experts = max(int(num_experts), 1)
+        self.topk = max(1, min(int(topk), self.num_experts))
+        self.pool = nn.AdaptiveAvgPool2d((1, 1))
+        self.proj = nn.Linear(hidden_dim, self.num_experts, bias=False)
+
+    def forward(self, x):
+        logits = self.proj(self.pool(x).flatten(1))
+        if self.topk >= self.num_experts:
+            return torch.softmax(logits, dim=-1)
+        topk_vals, topk_idx = logits.topk(self.topk, dim=-1)
+        topk_probs = torch.softmax(topk_vals, dim=-1)
+        gates = torch.zeros_like(logits)
+        return gates.scatter(1, topk_idx, topk_probs)
+
+
+class ConvLora(nn.Module):
+    def __init__(
+        self,
+        in_features,
+        out_features,
+        r=8,
+        lora_alpha=32,
+        dropout=0.1,
+        kernel_size=3,
+        num_experts=4,
+        topk=1,
+        num_prefix_tokens=5,
+    ):
+        super().__init__()
+        self.rank = r
         self.lora = Lora(in_features, out_features, r=r, lora_alpha=lora_alpha, p=dropout)
         self.num_prefix_tokens = num_prefix_tokens
-        self.spatial_proj = nn.Linear(in_features, out_features, bias=False)
-        self.depthwise = nn.Conv2d(
-            in_features,
-            in_features,
-            kernel_size=kernel_size,
-            padding=kernel_size // 2,
-            groups=in_features,
-            bias=False,
+        self.spatial_proj = nn.Linear(r, out_features, bias=False)
+        self.gate = ConvLoRAGate(r, num_experts=num_experts, topk=topk)
+        self.experts = nn.ModuleList(
+            [
+                nn.Sequential(
+                    nn.Conv2d(
+                        r,
+                        r,
+                        kernel_size=kernel_size,
+                        padding=kernel_size // 2,
+                        groups=r,
+                        bias=False,
+                    ),
+                    nn.GELU(),
+                )
+                for _ in range(max(int(num_experts), 1))
+            ]
         )
         self.dropout = nn.Dropout(dropout)
         nn.init.zeros_(self.spatial_proj.weight)
 
-    def forward(self, x):
-        delta = self.lora(x)
+    def _split_prefix_and_spatial(self, x):
         if x.dim() != 3:
-            return delta
+            return None
         bsz, tokens, channels = x.shape
-        spatial_tokens = tokens - self.num_prefix_tokens
+        prefix_tokens = max(int(self.num_prefix_tokens), 0)
+        spatial_tokens = tokens - prefix_tokens
         side = int(math.sqrt(max(spatial_tokens, 0)))
         if spatial_tokens <= 0 or side * side != spatial_tokens:
+            return None
+        spatial = x[:, prefix_tokens:].transpose(1, 2).reshape(bsz, channels, side, side)
+        return prefix_tokens, side, spatial
+
+    def forward(self, x):
+        delta = self.lora(x)
+        spatial_info = self._split_prefix_and_spatial(x)
+        if spatial_info is None or self.rank <= 0:
             return delta
-        prefix = delta[:, : self.num_prefix_tokens]
-        spatial_x = x[:, self.num_prefix_tokens :].transpose(1, 2).reshape(bsz, channels, side, side)
-        conv_out = self.depthwise(spatial_x).flatten(2).transpose(1, 2)
-        conv_out = self.spatial_proj(self.dropout(conv_out))
-        return torch.cat([prefix, delta[:, self.num_prefix_tokens :] + conv_out], dim=1)
+        prefix_tokens, side, _ = spatial_info
+        prefix = delta[:, :prefix_tokens]
+        spatial_hidden = self.lora.lora_A(self.lora.lora_dropout(x[:, prefix_tokens:]))
+        spatial_hidden = spatial_hidden.transpose(1, 2).reshape(x.shape[0], self.rank, side, side)
+
+        gates = self.gate(spatial_hidden)
+        expert_out = None
+        for idx, expert in enumerate(self.experts):
+            current = expert(spatial_hidden)
+            weight = gates[:, idx].view(-1, 1, 1, 1)
+            expert_out = current * weight if expert_out is None else expert_out + current * weight
+
+        conv_out = expert_out.flatten(2).transpose(1, 2)
+        conv_out = self.spatial_proj(self.dropout(conv_out)) * self.lora.scaling
+        return torch.cat([prefix, delta[:, prefix_tokens:] + conv_out], dim=1)
 
 
 class HydraLora(nn.Module):
