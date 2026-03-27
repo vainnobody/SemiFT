@@ -174,6 +174,17 @@ def test_method_default_targets_are_selected_when_not_provided():
     assert peft_cfg["target_modules"] == ["qkv", "proj", "fc1", "fc2"]
 
 
+def test_fact_methods_default_to_leaf_targets():
+    cfg_tt = {"nclass": 6, "peft": {"method": "fact_tt"}}
+    cfg_tk = {"nclass": 6, "peft": {"method": "fact_tk"}}
+
+    peft_cfg_tt = resolve_peft_cfg(cfg_tt, make_args())
+    peft_cfg_tk = resolve_peft_cfg(cfg_tk, make_args())
+
+    assert peft_cfg_tt["target_modules"] == ["qkv", "proj", "fc1", "fc2"]
+    assert peft_cfg_tk["target_modules"] == ["qkv", "proj", "fc1", "fc2"]
+
+
 def test_semift_router_bias_settings_are_built_from_config():
     cfg = {
         "nclass": 6,
@@ -274,6 +285,28 @@ def test_adaptmodel_wraps_lora_leaf_modules():
     adapted = semift.AdaptModel(cfg, model)
     assert isinstance(adapted.model.block.mlp.fc1, semift.WarpBlock)
     assert isinstance(adapted.model.block.mlp.fc2, semift.WarpBlock)
+
+
+def test_adaptmodel_wraps_fact_tt_leaf_modules():
+    semift = load_semift_module()
+    model = build_dummy_block(semift.torch)
+    cfg = semift.SemiFTConfig(method="fact_tt", target_modules=["mlp"], fact_rank=4)
+    adapted = semift.AdaptModel(cfg, model)
+    assert isinstance(adapted.model.block.mlp.fc1, semift.WarpBlock)
+    assert isinstance(adapted.model.block.mlp.fc2, semift.WarpBlock)
+    assert isinstance(adapted.model.block.mlp.fc1.adapter, semift.FactTTAdapter)
+    assert isinstance(adapted.model.block.mlp.fc2.adapter, semift.FactTTAdapter)
+
+
+def test_adaptmodel_wraps_fact_tk_leaf_modules():
+    semift = load_semift_module()
+    model = build_dummy_block(semift.torch)
+    cfg = semift.SemiFTConfig(method="fact_tk", target_modules=["mlp"], fact_rank=4)
+    adapted = semift.AdaptModel(cfg, model)
+    assert isinstance(adapted.model.block.mlp.fc1, semift.WarpBlock)
+    assert isinstance(adapted.model.block.mlp.fc2, semift.WarpBlock)
+    assert isinstance(adapted.model.block.mlp.fc1.adapter, semift.FactTKAdapter)
+    assert isinstance(adapted.model.block.mlp.fc2.adapter, semift.FactTKAdapter)
 
 
 def test_adaptmodel_wraps_adaptformer_block():

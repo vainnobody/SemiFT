@@ -85,8 +85,8 @@ METHOD_DEFAULT_TARGETS = {
     "ssf": ["patch_embed", "norm1", "norm2", "qkv", "proj", "fc1", "fc2"],
     "bitfit": ["qkv", "proj", "fc1", "fc2", "norm1", "norm2", "head"],
     "adaptformer": ["mlp"],
-    "fact_tt": ["mlp"],
-    "fact_tk": ["mlp"],
+    "fact_tt": ["qkv", "proj", "fc1", "fc2"],
+    "fact_tk": ["qkv", "proj", "fc1", "fc2"],
     "conv_lora": ["qkv", "proj", "fc1", "fc2"],
     "hydralora": ["qkv", "proj", "fc1", "fc2"],
 }
@@ -95,7 +95,7 @@ HIGH_LEVEL_TO_SUBMODULES = {
     "attn": ["qkv", "proj"],
     "mlp": ["fc1", "fc2"],
 }
-BLOCK_LEVEL_METHODS = {"semift", "semift_samoe", "samoev4", "samoev5", "samoev6", "semift_scalegate", "adaptformer", "fact_tt", "fact_tk"}
+BLOCK_LEVEL_METHODS = {"semift", "semift_samoe", "samoev4", "samoev5", "samoev6", "semift_scalegate", "adaptformer"}
 PARAMETER_ONLY_METHODS = {"bitfit"}
 SSF_METHODS = {"ssf"}
 
@@ -355,6 +355,26 @@ class AdaptModel(nn.Module):
                 router_dropout=self.peft_config.hydra_router_dropout,
                 lora_alpha=self.peft_config.lora_alpha,
                 dropout=self.peft_config.lora_dropout,
+            )
+            return WarpBlock(target, adapter)
+        if method == "fact_tt":
+            shared = self._get_fact_tt_shared(input_dim, output_dim)
+            adapter = FactTTAdapter(
+                shared,
+                dropout=self.peft_config.fact_dropout,
+                scale=self.peft_config.fact_scale,
+            )
+            return WarpBlock(target, adapter)
+        if method == "fact_tk":
+            shared = self._get_fact_tk_shared(input_dim, output_dim)
+            slice_index = self._next_method_counter(
+                (self.peft_config.method, input_dim, output_dim)
+            )
+            adapter = FactTKAdapter(
+                shared,
+                slice_index=slice_index,
+                dropout=self.peft_config.fact_dropout,
+                scale=self.peft_config.fact_scale,
             )
             return WarpBlock(target, adapter)
         if method == "ssf":

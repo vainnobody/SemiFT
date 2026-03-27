@@ -71,8 +71,8 @@ METHOD_DEFAULT_TARGETS: Dict[str, List[str]] = {
     "ssf": ["patch_embed", "norm1", "norm2", "qkv", "proj", "fc1", "fc2"],
     "bitfit": ["qkv", "proj", "fc1", "fc2", "norm1", "norm2", "head"],
     "adaptformer": ["mlp"],
-    "fact_tt": ["mlp"],
-    "fact_tk": ["mlp"],
+    "fact_tt": ["qkv", "proj", "fc1", "fc2"],
+    "fact_tk": ["qkv", "proj", "fc1", "fc2"],
     "conv_lora": ["qkv", "proj", "fc1", "fc2"],
     "hydralora": ["qkv", "proj", "fc1", "fc2"],
 }
