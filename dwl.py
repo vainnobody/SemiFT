@@ -37,6 +37,7 @@ from util.dwl_utils import (
     sample_cls_bins,
     calc_wgt_bins,
     downsample_for_memory,
+    move_cls_memory_to_device,
 )
 
 
@@ -262,7 +263,9 @@ def main(args, cfg):
         previous_best = checkpoint["previous_best"]
         best_epoch = checkpoint["best_epoch"]
         if "cls_memory_u" in checkpoint:
-            cls_memory_u = checkpoint["cls_memory_u"]
+            cls_memory_u = move_cls_memory_to_device(
+                checkpoint["cls_memory_u"], torch.device("cuda", local_rank)
+            )
 
         if rank == 0:
             logger.info("************ Load from checkpoint at epoch %i\n" % epoch)

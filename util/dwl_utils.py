@@ -8,6 +8,13 @@ import torch
 import torch.nn.functional as F
 
 
+def move_cls_memory_to_device(cls_memory: dict, device: torch.device) -> dict:
+    """Move all class-memory tensors to the target device in-place."""
+    for cls_idx, tensors in cls_memory.items():
+        cls_memory[cls_idx] = [tensor.to(device) for tensor in tensors]
+    return cls_memory
+
+
 def update_cls_memory(
     cls_memory: dict,
     pred: torch.Tensor,
@@ -55,12 +62,20 @@ def sample_cls_bins(
         Tensor of shape (num_classes, num_bins) containing quantile values
     """
     num_classes = len(cls_memory)
-    device = next(iter(cls_memory.values()))[0].device
+    first_tensor = None
+    for tensors in cls_memory.values():
+        if len(tensors) > 0:
+            first_tensor = tensors[0]
+            break
+    if first_tensor is None:
+        raise ValueError("cls_memory must contain at least one tensor per class")
+
+    device = first_tensor.device
     cls_bins = torch.ones(num_classes, num_bins, device=device)
 
     for i in range(num_classes):
         if len(cls_memory[i]) > 0:
-            cls_memory_i = torch.cat(cls_memory[i], dim=0)
+            cls_memory_i = torch.cat([tensor.to(device) for tensor in cls_memory[i]], dim=0)
             # Get the confidence for class i (diagonal of the softmax)
             cls_memory_i = cls_memory_i[:, i]
 
