@@ -1324,6 +1324,93 @@ class SemiFtSAMoEV7(SemiFtSAMoEV5):
         return self.drop_path(sparse_out * context_gate)
 
 
+class SemiFtSAMoEV8(SemiFtSAMoEV7):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.context_gate_dwconv = nn.Conv2d(
+            self.r,
+            self.r,
+            kernel_size=3,
+            stride=1,
+            padding=1,
+            groups=self.r,
+            bias=True,
+        )
+        self.context_gate_act = nn.SiLU()
+        self.context_gate = nn.Conv2d(self.r, 2, kernel_size=1, bias=True)
+        nn.init.zeros_(self.context_gate_dwconv.weight)
+        nn.init.zeros_(self.context_gate_dwconv.bias)
+        nn.init.zeros_(self.context_gate.weight)
+        nn.init.zeros_(self.context_gate.bias)
+        self.context_gate.bias.data[1] = self.branch_gate_init_bias
+        self.router_confidence_alpha = 1.0
+
+    def _compute_context_gate(self, x_2d, router_probs=None):
+        gate_hidden = self.context_gate_act(self.context_gate_dwconv(x_2d))
+        branch_logits = self.context_gate(gate_hidden).float()
+        if router_probs is not None:
+            router_probs = router_probs.float()
+            entropy = -(router_probs * router_probs.clamp_min(torch.finfo(router_probs.dtype).eps).log()).sum(dim=-1)
+            max_entropy = math.log(self.num_experts) if self.num_experts > 1 else 1.0
+            router_confidence = 1.0 - (entropy / max_entropy)
+            branch_logits[:, 1] = branch_logits[:, 1] + self.router_confidence_alpha * router_confidence.view(-1, 1, 1)
+        branch_probs = torch.softmax(branch_logits, dim=1).to(x_2d.dtype)
+        return branch_probs[:, :1], branch_probs[:, 1:]
+
+    def forward(self, x, hw=None):
+        x = self.input_act(self.proj_down(self.pre_norm(x)))
+
+        prefix = x[:, : self.num_prefix_tokens, :]
+        patch_tokens = x[:, self.num_prefix_tokens :, :]
+        if patch_tokens.numel() == 0:
+            out = self.proj_up(x)
+            zero = x.new_zeros(())
+            self.aux_loss = zero
+            self.router_aux_loss = zero
+            self.router_z_loss = zero
+            self.router_logits = None
+            self.router_probs = None
+            self.selection_scores = None
+            self.expert_bias = self.gating_network.expert_bias.detach().clone()
+            self.expert_load = self.gating_network.expert_load.detach().clone()
+            self.selected_experts = None
+            self.last_hw = None
+            self.context_gate_values = None
+            return out
+
+        bsz, n_tokens, _ = patch_tokens.shape
+        h, w = self._resolve_hw(n_tokens, hw=hw)
+        self.last_hw = (h, w)
+        x_2d = patch_tokens.transpose(1, 2).reshape(bsz, self.r, h, w).contiguous()
+
+        topk_idx, topk_weight, router_stats = self.gating_network(x_2d)
+        self.selected_experts = topk_idx.detach().clone()
+        sparse_out = self._sparse_moe_forward(x_2d, topk_idx, topk_weight)
+        shared_out = self.shared_expert(x_2d) if self.shared_expert is not None else x_2d.new_zeros(x_2d.shape)
+
+        shared_gate, sparse_gate = self._compute_context_gate(x_2d, router_probs=router_stats["router_probs"])
+        self.context_gate_values = sparse_gate.detach().clone()
+        sparse_term = sparse_gate * self.moe_scale(self.drop_path(sparse_out))
+        shared_term = shared_gate * self.shared_scale(shared_out)
+
+        combined_2d = x_2d + shared_term + sparse_term
+        combined = combined_2d.flatten(2).transpose(1, 2).contiguous()
+
+        zero = patch_tokens.new_zeros(())
+        self.router_aux_loss = zero
+        self.router_z_loss = zero
+        self.router_logits = router_stats["router_logits"]
+        self.router_probs = router_stats["router_probs"]
+        self.selection_scores = router_stats["selection_scores"]
+        self.expert_bias = router_stats["expert_bias"]
+        self.expert_load = router_stats["expert_load"]
+        self.aux_loss = zero
+
+        prefix_out = self.proj_up(prefix)
+        patch_out = self.output_scale(self.proj_up(combined))
+        return torch.cat([prefix_out, patch_out], dim=1)
+
+
 class ScaleGatedConvExpert(ConvExpert):
     def __init__(
         self,
