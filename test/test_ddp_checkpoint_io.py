@@ -75,6 +75,15 @@ def test_direct_entrypoints_use_cpu_resume_and_cpu_safe_save_helpers():
         assert 'model.cuda(local_rank)' in text, f'{name} should bind model initialization to local_rank.'
 
 
+def test_dwl_uses_static_graph_and_non_ddp_eval_for_weak_pseudo_labels():
+    text = (REPO_ROOT / 'dwl.py').read_text()
+    assert 'if hasattr(model, "_set_static_graph"):' in text
+    assert 'Enabled DDP static graph for DWL training.' in text
+    assert 'weak_model = model.module if hasattr(model, "module") else model' in text
+    assert 'weak_model.eval()' in text
+    assert 'pred_u_w = weak_model(img_u_w).detach()' in text
+
+
 def test_rgcr_enables_ddp_static_graph_for_multi_forward_training():
     text = (REPO_ROOT / 'rgcr.py').read_text()
     assert 'if hasattr(model, "_set_static_graph"):' in text

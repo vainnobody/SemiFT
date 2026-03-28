@@ -166,6 +166,10 @@ def main(args, cfg):
         output_device=local_rank,
         find_unused_parameters=True,
     )
+    if hasattr(model, "_set_static_graph"):
+        model._set_static_graph()
+        if rank == 0:
+            logger.info("Enabled DDP static graph for DWL training.")
     log_cuda_memory(
         logger,
         rank,
@@ -298,7 +302,12 @@ def main(args, cfg):
             valid_mask = valid_mask.cuda().bool()
 
             with torch.no_grad():
-                pred_u_w = model(img_u_w).detach()
+                weak_model = model.module if hasattr(model, "module") else model
+                weak_was_training = weak_model.training
+                weak_model.eval()
+                pred_u_w = weak_model(img_u_w).detach()
+                if weak_was_training:
+                    weak_model.train()
                 prob_u_w = pred_u_w.softmax(dim=1)
                 conf_u_w, mask_u_w = prob_u_w.max(dim=1)
 
