@@ -26,6 +26,7 @@ DEFAULT_GPU_IDLE_MAX_UTILIZATION = 10
 
 TRAINING_ENTRYPOINTS = {
     "dwl.py",
+    "segmind.py",
     "fixmatch.py",
     "fixmatch_pascal.py",
     "fixmatch_peft.py",
@@ -46,6 +47,7 @@ TRAINING_ENTRYPOINTS = {
     "unimatch_v2_rgcr.py",
     "unimatchv2_peft.py",
     "wscl.py",
+    "scalematch.py",
 }
 
 

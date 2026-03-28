@@ -202,6 +202,10 @@ def main(args, cfg):
         output_device=local_rank,
         find_unused_parameters=True,
     )
+    if hasattr(model, "_set_static_graph"):
+        model._set_static_graph()
+        if rank == 0:
+            logger.info("Enabled DDP static graph for RGCR training.")
     log_cuda_memory(
         logger,
         rank,

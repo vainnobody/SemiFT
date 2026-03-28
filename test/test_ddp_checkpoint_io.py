@@ -75,6 +75,12 @@ def test_direct_entrypoints_use_cpu_resume_and_cpu_safe_save_helpers():
         assert 'model.cuda(local_rank)' in text, f'{name} should bind model initialization to local_rank.'
 
 
+def test_rgcr_enables_ddp_static_graph_for_multi_forward_training():
+    text = (REPO_ROOT / 'rgcr.py').read_text()
+    assert 'if hasattr(model, "_set_static_graph"):' in text
+    assert 'Enabled DDP static graph for RGCR training.' in text
+
+
 def test_helper_entrypoints_pass_logger_and_rank_into_shared_ddp_helpers():
     for name in HELPER_ENTRYPOINTS:
         text = (REPO_ROOT / name).read_text()

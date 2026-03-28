@@ -269,6 +269,10 @@ def wrap_ddp(model, logger=None, rank=None, save_path=None):
         output_device=local_rank,
         find_unused_parameters=True,
     )
+    if hasattr(model, "_set_static_graph"):
+        model._set_static_graph()
+        if logger is not None and rank == 0:
+            logger.info("Enabled DDP static graph for training.")
     if logger is not None and rank is not None:
         log_cuda_memory(logger, rank, "after_ddp_wrap", local_rank=local_rank, save_path=save_path)
     return model, local_rank
