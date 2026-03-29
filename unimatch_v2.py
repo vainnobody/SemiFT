@@ -251,7 +251,6 @@ def main(args, cfg):
             (img_x, mask_x),
             (img_u_w, img_u_s1, img_u_s2, ignore_mask, cutmix_box1, cutmix_box2),
         ) in enumerate(loader):
-
             img_x, mask_x = img_x.cuda(), mask_x.cuda()
             img_u_w, img_u_s1, img_u_s2 = (
                 img_u_w.cuda(),
@@ -330,34 +329,34 @@ def main(args, cfg):
             loss.backward()
             optimizer.step()
 
-            if i < 10:
-                viz.push(
-                    {
-                        "img_x": (img_x[0], Visualizer.TENSOR),
-                        "mask_x": (mask_x[0], Visualizer.SEGMENTATION),
-                        "pred_x": (pred_x.argmax(dim=1)[0], Visualizer.SEGMENTATION),
-                        "img_u_s1": (img_u_s1[0], Visualizer.TENSOR),
-                        "img_u_s2": (img_u_s2[0], Visualizer.TENSOR),
-                        "mask_u_w_cutmixed1": (
-                            mask_u_w_cutmixed1[0],
-                            Visualizer.SEGMENTATION,
-                        ),
-                        "mask_u_w_cutmixed2": (
-                            mask_u_w_cutmixed2[0],
-                            Visualizer.SEGMENTATION,
-                        ),
-                        "pred_u_s1": (
-                            pred_u_s1.argmax(dim=1)[0],
-                            Visualizer.SEGMENTATION,
-                        ),
-                        "pred_u_s2": (
-                            pred_u_s2.argmax(dim=1)[0],
-                            Visualizer.SEGMENTATION,
-                        ),
-                    }
-                )
-                viz.render(f"epoch_{epoch}_iter_{i}")
-                viz.reset()
+            # if i < 10:
+            #     viz.push(
+            #         {
+            #             "img_x": (img_x[0], Visualizer.TENSOR),
+            #             "mask_x": (mask_x[0], Visualizer.SEGMENTATION),
+            #             "pred_x": (pred_x.argmax(dim=1)[0], Visualizer.SEGMENTATION),
+            #             "img_u_s1": (img_u_s1[0], Visualizer.TENSOR),
+            #             "img_u_s2": (img_u_s2[0], Visualizer.TENSOR),
+            #             "mask_u_w_cutmixed1": (
+            #                 mask_u_w_cutmixed1[0],
+            #                 Visualizer.SEGMENTATION,
+            #             ),
+            #             "mask_u_w_cutmixed2": (
+            #                 mask_u_w_cutmixed2[0],
+            #                 Visualizer.SEGMENTATION,
+            #             ),
+            #             "pred_u_s1": (
+            #                 pred_u_s1.argmax(dim=1)[0],
+            #                 Visualizer.SEGMENTATION,
+            #             ),
+            #             "pred_u_s2": (
+            #                 pred_u_s2.argmax(dim=1)[0],
+            #                 Visualizer.SEGMENTATION,
+            #             ),
+            #         }
+            #     )
+            #     viz.render(f"epoch_{epoch}_iter_{i}")
+            #     viz.reset()
 
             total_loss.update(loss.item())
             total_loss_x.update(loss_x.item())
