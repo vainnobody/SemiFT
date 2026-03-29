@@ -219,7 +219,9 @@ def main(args, cfg):
     if cfg["criterion"]["name"] == "CELoss":
         criterion_l = nn.CrossEntropyLoss(**cfg["criterion"]["kwargs"]).cuda(local_rank)
     elif cfg["criterion"]["name"] == "OHEM":
-        criterion_l = ProbOhemCrossEntropy2d(**cfg["criterion"]["kwargs"]).cuda(local_rank)
+        criterion_l = ProbOhemCrossEntropy2d(**cfg["criterion"]["kwargs"]).cuda(
+            local_rank
+        )
     elif cfg["criterion"]["name"] == "FocalLoss":
         criterion_l = FocalLoss(**cfg["criterion"]["kwargs"]).cuda(local_rank)
     else:
@@ -227,7 +229,9 @@ def main(args, cfg):
             f'{cfg["criterion"]["name"]} criterion is not implemented'
         )
 
-    criterion_u = nn.CrossEntropyLoss(reduction="none", ignore_index=255).cuda(local_rank)
+    criterion_u = nn.CrossEntropyLoss(reduction="none", ignore_index=255).cuda(
+        local_rank
+    )
 
     trainset_u = SemiDataset(
         cfg["dataset"],
@@ -345,14 +349,21 @@ def main(args, cfg):
                 conf_u_w = pred_u_w.softmax(dim=1).max(dim=1)[0]
                 mask_u_w = pred_u_w.argmax(dim=1)
 
-            img_u_s[cutmix_box.unsqueeze(1).expand(img_u_s.shape) == 1] = img_u_s.flip(0)[
-                cutmix_box.unsqueeze(1).expand(img_u_s.shape) == 1
-            ]
+            img_u_s[cutmix_box.unsqueeze(1).expand(img_u_s.shape) == 1] = img_u_s.flip(
+                0
+            )[cutmix_box.unsqueeze(1).expand(img_u_s.shape) == 1]
 
             merged_inputs = torch.cat((img_x, img_u_s, img_x_c, img_u_c), dim=0)
             merged_preds = model(merged_inputs)
-            split_sizes = [img_x.shape[0], img_u_s.shape[0], img_x_c.shape[0], img_u_c.shape[0]]
-            pred_x, pred_u_s, pred_x_rvs, pred_u_rvs = merged_preds.split(split_sizes, dim=0)
+            split_sizes = [
+                img_x.shape[0],
+                img_u_s.shape[0],
+                img_x_c.shape[0],
+                img_u_c.shape[0],
+            ]
+            pred_x, pred_u_s, pred_x_rvs, pred_u_rvs = merged_preds.split(
+                split_sizes, dim=0
+            )
 
             pred_recovered, valid_masks = scale_back(
                 pred_u_rvs, mask_c, cfg["crop_size"], box
@@ -394,7 +405,9 @@ def main(args, cfg):
                 conf_thresh=conf_thresh,
             )
 
-            loss = (loss_x + loss_u_s * 0.5 + loss_u_s_rvs * 0.5) / 2.0
+            loss = (
+                loss_x * 0.5 + loss_x_rvs * 0.5 + loss_u_s * 0.5 + loss_u_s_rvs * 0.5
+            ) / 2.0
 
             torch.distributed.barrier()
 
