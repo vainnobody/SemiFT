@@ -202,10 +202,6 @@ def main(args, cfg):
         output_device=local_rank,
         find_unused_parameters=True,
     )
-    if hasattr(model, "_set_static_graph"):
-        model._set_static_graph()
-        if rank == 0:
-            logger.info("Enabled DDP static graph for RGCR training.")
     log_cuda_memory(
         logger,
         rank,
@@ -353,10 +349,10 @@ def main(args, cfg):
                 cutmix_box.unsqueeze(1).expand(img_u_s.shape) == 1
             ]
 
-            pred_x = model(img_x)
-            pred_u_s = model(img_u_s)
-            pred_x_rvs = model(img_x_c)
-            pred_u_rvs = model(img_u_c)
+            merged_inputs = torch.cat((img_x, img_u_s, img_x_c, img_u_c), dim=0)
+            merged_preds = model(merged_inputs)
+            split_sizes = [img_x.shape[0], img_u_s.shape[0], img_x_c.shape[0], img_u_c.shape[0]]
+            pred_x, pred_u_s, pred_x_rvs, pred_u_rvs = merged_preds.split(split_sizes, dim=0)
 
             pred_recovered, valid_masks = scale_back(
                 pred_u_rvs, mask_c, cfg["crop_size"], box
