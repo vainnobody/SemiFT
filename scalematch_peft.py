@@ -220,10 +220,10 @@ def main(args, cfg):
         output_device=local_rank,
         find_unused_parameters=True,
     )
-    if hasattr(model, "_set_static_graph"):
-        model._set_static_graph()
-        if rank == 0:
-            logger.info("Enabled DDP static graph for ScaleMatch + PEFT training.")
+    if rank == 0:
+        logger.info(
+            "DDP static graph is disabled for ScaleMatch + PEFT to avoid potential hangs."
+        )
     log_cuda_memory(
         logger, rank, "after_ddp_wrap", local_rank=local_rank, save_path=args.save_path
     )
@@ -345,6 +345,8 @@ def main(args, cfg):
             batch_u,
             batch_u_mix,
         ) in enumerate(loader):
+            if rank == 0 and i == 0:
+                logger.info("Epoch %d: first batch loaded from all three ScaleMatch loaders.", epoch)
             (
                 img_u_w,
                 img_u_s1,
@@ -385,6 +387,8 @@ def main(args, cfg):
             cutmix_img_(img_u_s2, img_u_s2_mix, cutmix_box2)
 
             with torch.cuda.amp.autocast(enabled=amp):
+                if rank == 0 and i == 0:
+                    logger.info("Epoch %d iter %d: entering ScaleMatch forward passes.", epoch, i)
                 model.eval()
                 pred_u_w_mix = model(img_u_w_mix, scale_factor=None, scales=None)
                 pred_u_w_mix = pred_u_w_mix.detach()
@@ -447,8 +451,6 @@ def main(args, cfg):
 
                 loss_standard = loss_u_s1 * 0.25 + loss_u_size * 0.25 + loss_u_w_fp * 0.5
                 total_loss = (loss_x + loss_standard) / 2.0
-
-            torch.distributed.barrier()
 
             optimizer.zero_grad()
             if amp:
