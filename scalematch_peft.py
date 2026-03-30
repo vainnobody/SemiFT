@@ -220,10 +220,10 @@ def main(args, cfg):
         output_device=local_rank,
         find_unused_parameters=True,
     )
-    if rank == 0:
-        logger.info(
-            "DDP static graph is disabled for ScaleMatch + PEFT to avoid potential hangs."
-        )
+    if hasattr(model, "_set_static_graph"):
+        model._set_static_graph()
+        if rank == 0:
+            logger.info("Enabled DDP static graph for ScaleMatch + PEFT training.")
     log_cuda_memory(
         logger, rank, "after_ddp_wrap", local_rank=local_rank, save_path=args.save_path
     )
@@ -389,10 +389,13 @@ def main(args, cfg):
             with torch.cuda.amp.autocast(enabled=amp):
                 if rank == 0 and i == 0:
                     logger.info("Epoch %d iter %d: entering ScaleMatch forward passes.", epoch, i)
-                model.eval()
-                pred_u_w_mix = model(img_u_w_mix, scale_factor=None, scales=None)
-                pred_u_w_mix = pred_u_w_mix.detach()
-                conf_u_w_mix, mask_u_w_mix = pred_u_w_mix.softmax(dim=1).max(dim=1)
+                inference_model = model.module if hasattr(model, "module") else model
+                inference_model.eval()
+                with torch.no_grad():
+                    pred_u_w_mix = inference_model(
+                        img_u_w_mix, scale_factor=None, scales=None
+                    )
+                    conf_u_w_mix, mask_u_w_mix = pred_u_w_mix.softmax(dim=1).max(dim=1)
 
                 model.train()
 
