@@ -1411,6 +1411,63 @@ class SemiFtSAMoEV8(SemiFtSAMoEV7):
         return torch.cat([prefix_out, patch_out], dim=1)
 
 
+class SemiFtSAMoEV9(SemiFtSAMoEV7):
+    def forward(self, x, hw=None):
+        x = self.input_act(self.proj_down(self.pre_norm(x)))
+
+        prefix = x[:, : self.num_prefix_tokens, :]
+        patch_tokens = x[:, self.num_prefix_tokens :, :]
+        if patch_tokens.numel() == 0:
+            out = self.proj_up(x)
+            zero = x.new_zeros(())
+            self.aux_loss = zero
+            self.router_aux_loss = zero
+            self.router_z_loss = zero
+            self.router_logits = None
+            self.router_probs = None
+            self.selection_scores = None
+            self.expert_bias = self.gating_network.expert_bias.detach().clone()
+            self.expert_load = self.gating_network.expert_load.detach().clone()
+            self.selected_experts = None
+            self.last_hw = None
+            self.context_gate_values = None
+            return out
+
+        bsz, n_tokens, _ = patch_tokens.shape
+        h, w = self._resolve_hw(n_tokens, hw=hw)
+        self.last_hw = (h, w)
+        x_2d = patch_tokens.transpose(1, 2).reshape(bsz, self.r, h, w).contiguous()
+
+        topk_idx, topk_weight, router_stats = self.gating_network(x_2d)
+        self.selected_experts = topk_idx.detach().clone()
+        sparse_out = self._sparse_moe_forward(x_2d, topk_idx, topk_weight)
+        shared_out = self.shared_expert(x_2d) if self.shared_expert is not None else x_2d.new_zeros(x_2d.shape)
+
+        sparse_gate = self._compute_context_gate(x_2d)
+        shared_gate = 1.0 - sparse_gate
+        self.context_gate_values = sparse_gate.detach().clone()
+
+        sparse_term = sparse_gate * self.moe_scale(self.drop_path(sparse_out))
+        shared_term = shared_gate * self.shared_scale(shared_out)
+
+        combined_2d = x_2d + shared_term + sparse_term
+        combined = combined_2d.flatten(2).transpose(1, 2).contiguous()
+
+        zero = patch_tokens.new_zeros(())
+        self.router_aux_loss = zero
+        self.router_z_loss = zero
+        self.router_logits = router_stats["router_logits"]
+        self.router_probs = router_stats["router_probs"]
+        self.selection_scores = router_stats["selection_scores"]
+        self.expert_bias = router_stats["expert_bias"]
+        self.expert_load = router_stats["expert_load"]
+        self.aux_loss = zero
+
+        prefix_out = self.proj_up(prefix)
+        patch_out = self.output_scale(self.proj_up(combined))
+        return torch.cat([prefix_out, patch_out], dim=1)
+
+
 class ScaleGatedConvExpert(ConvExpert):
     def __init__(
         self,

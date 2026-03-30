@@ -221,6 +221,7 @@ torchrun --nproc_per_node=4 unimatchv2_peft.py \
 - `samoev6`
 - `samoev7`
 - `samoev8`
+- `samoev9`
 - `semift_scalegate`
 - `lora`
 - `ssf`
@@ -242,6 +243,7 @@ torchrun --nproc_per_node=4 unimatchv2_peft.py \
 | samoev6 | `["mlp"]` |
 | samoev7 | `["mlp"]` |
 | samoev8 | `["mlp"]` |
+| samoev9 | `["mlp"]` |
 | semift_scalegate | `["mlp"]` |
 | lora | `["qkv", "proj", "fc1", "fc2"]` |
 | ssf | `["patch_embed", "norm1", "norm2", "qkv", "proj", "fc1", "fc2"]` |
