@@ -35,12 +35,12 @@ from util.ssl_method_utils import (
 from util.validation import validation_cpu as shared_validation_cpu
 
 
+DEFAULT_IMG_SCALES = [0.25, 0.5, 1.5, 2.0]
 DEFAULT_FEAT_S_SCALES = [0.75]
 DEFAULT_FEAT_L_SCALES = [1.25]
 OFFICIAL_WARM_UP = 10
 OFFICIAL_CONF_THRESH = 0.0
 OFFICIAL_USE_AMP = False
-DEFAULT_SAFE_IMG_SCALES = [0.5, 1.0]
 
 
 @torch.no_grad()
@@ -95,49 +95,20 @@ def unpack_unlabeled_batch(batch):
     raise ValueError(f"Unexpected unlabeled batch size: {len(batch)}")
 
 
-def maybe_log_train_peak_memory(logger, rank, local_rank, stage, step=None):
-    if os.environ.get("SEMIFT_LOG_TRAIN_MEM", "0") != "1":
-        return
-    if not torch.cuda.is_available():
-        return
-
-    allocated_gb = torch.cuda.memory_allocated(local_rank) / 1024**3
-    reserved_gb = torch.cuda.memory_reserved(local_rank) / 1024**3
-    peak_gb = torch.cuda.max_memory_allocated(local_rank) / 1024**3
-    step_suffix = "" if step is None else f" step={step}"
-    logger.info(
-        "[train-mem] rank=%s stage=%s%s allocated_gb=%.2f reserved_gb=%.2f peak_gb=%.2f",
-        rank,
-        stage,
-        step_suffix,
-        allocated_gb,
-        reserved_gb,
-        peak_gb,
-    )
-
-
 def main(args, cfg):
     logger = init_log("global", logging.INFO)
     logger.propagate = 0
 
     rank, world_size = setup_distributed(port=args.port)
     ignore_index = cfg.get("ignore_index", 255)
-    cfg.setdefault("img_scales", DEFAULT_SAFE_IMG_SCALES)
-    cfg.setdefault("feat_s_scales", DEFAULT_FEAT_S_SCALES)
-    cfg.setdefault("feat_l_scales", DEFAULT_FEAT_L_SCALES)
-    cfg.setdefault("warm_up", OFFICIAL_WARM_UP)
-    cfg.setdefault("conf_thresh", OFFICIAL_CONF_THRESH)
-    cfg.setdefault("amp", OFFICIAL_USE_AMP)
-
-    amp = cfg["amp"]
-    img_scales = cfg["img_scales"]
-    feat_s_scales = cfg["feat_s_scales"]
-    feat_l_scales = cfg["feat_l_scales"]
-    warm_up = cfg["warm_up"]
-    conf_thresh = cfg["conf_thresh"]
+    amp = OFFICIAL_USE_AMP
+    img_scales = DEFAULT_IMG_SCALES
+    feat_s_scales = DEFAULT_FEAT_S_SCALES
+    feat_l_scales = DEFAULT_FEAT_L_SCALES
+    warm_up = OFFICIAL_WARM_UP
+    conf_thresh = OFFICIAL_CONF_THRESH
 
     if rank == 0:
-        os.makedirs(args.save_path, exist_ok=True)
         all_args = {
             **cfg,
             **vars(args),
@@ -151,6 +122,7 @@ def main(args, cfg):
         }
         logger.info("{}\n".format(pprint.pformat(all_args)))
         writer = SummaryWriter(args.save_path)
+        os.makedirs(args.save_path, exist_ok=True)
 
     cudnn.enabled = True
     cudnn.benchmark = True
@@ -348,53 +320,36 @@ def main(args, cfg):
                 feat_s_scales if random_scale > 1 else feat_l_scales
             )
 
-            img_x = img_x.cuda(local_rank, non_blocking=True)
-            mask_x = mask_x.cuda(local_rank, non_blocking=True)
-            img_u_w = img_u_w.cuda(local_rank, non_blocking=True)
+            img_x, mask_x = img_x.cuda(), mask_x.cuda()
+            img_u_w = img_u_w.cuda()
             img_u_s1, img_u_s2, ignore_mask = (
-                img_u_s1.cuda(local_rank, non_blocking=True),
-                img_u_s2.cuda(local_rank, non_blocking=True),
-                ignore_mask.cuda(local_rank, non_blocking=True),
+                img_u_s1.cuda(),
+                img_u_s2.cuda(),
+                ignore_mask.cuda(),
             )
-            cutmix_box1 = cutmix_box1.cuda(local_rank, non_blocking=True)
-            cutmix_box2 = cutmix_box2.cuda(local_rank, non_blocking=True)
-            img_u_w_mix = img_u_w_mix.cuda(local_rank, non_blocking=True)
-            img_u_s1_mix = img_u_s1_mix.cuda(local_rank, non_blocking=True)
-            img_u_s2_mix = img_u_s2_mix.cuda(local_rank, non_blocking=True)
-            ignore_mask_mix = ignore_mask_mix.cuda(local_rank, non_blocking=True)
+            cutmix_box1, cutmix_box2 = cutmix_box1.cuda(), cutmix_box2.cuda()
+            img_u_w_mix = img_u_w_mix.cuda()
+            img_u_s1_mix, img_u_s2_mix = img_u_s1_mix.cuda(), img_u_s2_mix.cuda()
+            ignore_mask_mix = ignore_mask_mix.cuda()
 
             cutmix_img_(img_u_s1, img_u_s1_mix, cutmix_box1)
             cutmix_img_(img_u_s2, img_u_s2_mix, cutmix_box2)
-            if torch.cuda.is_available():
-                torch.cuda.reset_peak_memory_stats(local_rank)
 
             with torch.cuda.amp.autocast(enabled=amp):
-                inference_model = model.module if hasattr(model, "module") else model
-                inference_model.eval()
-                with torch.no_grad():
-                    pred_u_w_mix = inference_model(
-                        img_u_w_mix, scale_factor=None, scales=None
-                    )
-                    conf_u_w_mix, mask_u_w_mix = pred_u_w_mix.softmax(dim=1).max(dim=1)
-                maybe_log_train_peak_memory(
-                    logger, rank, local_rank, "after_teacher_forward", step=i
-                )
+                model.eval()
+                pred_u_w_mix = model(img_u_w_mix, scale_factor=None, scales=None)
+                pred_u_w_mix = pred_u_w_mix.detach()
+                conf_u_w_mix, mask_u_w_mix = pred_u_w_mix.softmax(dim=1).max(dim=1)
 
                 model.train()
 
-                num_lb = img_x.shape[0]
+                num_lb, num_ulb = img_x.shape[0], img_u_w.shape[0]
                 pred = model(
                     torch.cat((img_x, img_u_w)),
                     scale_factor=random_scale,
                     feature_scale=feature_scale,
                 )
-                maybe_log_train_peak_memory(
-                    logger, rank, local_rank, "after_student_joint_forward", step=i
-                )
                 pred_u_s = model(img_u_s1, scale_factor=None, scales=None)
-                maybe_log_train_peak_memory(
-                    logger, rank, local_rank, "after_student_strong_forward", step=i
-                )
 
                 if epoch < warm_up:
                     pred_u_w = pred["pred_ori"][num_lb:]
@@ -444,6 +399,8 @@ def main(args, cfg):
                 loss_standard = loss_u_s1 * 0.25 + loss_u_size * 0.25 + loss_u_w_fp * 0.5
                 total_loss = (loss_x + loss_standard) / 2.0
 
+            torch.distributed.barrier()
+
             optimizer.zero_grad()
             if amp:
                 scaler.scale(total_loss).backward()
@@ -452,9 +409,6 @@ def main(args, cfg):
             else:
                 total_loss.backward()
                 optimizer.step()
-            maybe_log_train_peak_memory(
-                logger, rank, local_rank, "after_backward", step=i
-            )
 
             valid_mask = (ignore_mask != ignore_index)
             mask_ratio = (
