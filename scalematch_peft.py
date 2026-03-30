@@ -345,8 +345,6 @@ def main(args, cfg):
             batch_u,
             batch_u_mix,
         ) in enumerate(loader):
-            if rank == 0 and i == 0:
-                logger.info("Epoch %d: first batch loaded from all three ScaleMatch loaders.", epoch)
             (
                 img_u_w,
                 img_u_s1,
@@ -387,15 +385,10 @@ def main(args, cfg):
             cutmix_img_(img_u_s2, img_u_s2_mix, cutmix_box2)
 
             with torch.cuda.amp.autocast(enabled=amp):
-                if rank == 0 and i == 0:
-                    logger.info("Epoch %d iter %d: entering ScaleMatch forward passes.", epoch, i)
-                inference_model = model.module if hasattr(model, "module") else model
-                inference_model.eval()
-                with torch.no_grad():
-                    pred_u_w_mix = inference_model(
-                        img_u_w_mix, scale_factor=None, scales=None
-                    )
-                    conf_u_w_mix, mask_u_w_mix = pred_u_w_mix.softmax(dim=1).max(dim=1)
+                model.eval()
+                pred_u_w_mix = model(img_u_w_mix, scale_factor=None, scales=None)
+                pred_u_w_mix = pred_u_w_mix.detach()
+                conf_u_w_mix, mask_u_w_mix = pred_u_w_mix.softmax(dim=1).max(dim=1)
 
                 model.train()
 
@@ -404,9 +397,8 @@ def main(args, cfg):
                     torch.cat((img_x, img_u_w)),
                     scale_factor=random_scale,
                     feature_scale=feature_scale,
-                    plain_inputs=img_u_s1,
                 )
-                pred_u_s = pred["pred_plain"]
+                pred_u_s = model(img_u_s1, scale_factor=None, scales=None)
 
                 if epoch < cfg["warm_up"]:
                     pred_u_w = pred["pred_ori"][num_lb:]
@@ -422,11 +414,11 @@ def main(args, cfg):
                     ignore_mask, ignore_mask_mix, cutmix_box1
                 )
 
-                pred_x = pred["pred_ori"][:num_lb]
+                pred_x_joint = pred["pred_joint"][:num_lb]
                 pred_u_w_scale = pred["pred_size"][num_lb:]
                 pred_u_w_fp = pred["pred_fp"][num_lb:]
 
-                loss_x = criterion_l(pred_x, mask_x)
+                loss_x = criterion_l(pred_x_joint, mask_x)
 
                 loss_u_s1 = criterion_u(pred_u_s, mask_u_w_cutmixed1)
                 loss_u_s1 = confidence_weighted_loss(
@@ -455,6 +447,8 @@ def main(args, cfg):
 
                 loss_standard = loss_u_s1 * 0.25 + loss_u_size * 0.25 + loss_u_w_fp * 0.5
                 total_loss = (loss_x + loss_standard) / 2.0
+
+            torch.distributed.barrier()
 
             optimizer.zero_grad()
             if amp:
