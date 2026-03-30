@@ -407,7 +407,7 @@ def main(args, cfg):
             with torch.cuda.amp.autocast(enabled=amp):
                 inference_model = model.module if hasattr(model, "module") else model
                 inference_model.eval()
-                with torch.inference_mode():
+                with torch.no_grad():
                     pred_u_w_mix = inference_model(
                         img_u_w_mix, scale_factor=None, scales=None
                     )
