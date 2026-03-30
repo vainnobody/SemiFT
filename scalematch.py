@@ -336,10 +336,13 @@ def main(args, cfg):
             cutmix_img_(img_u_s2, img_u_s2_mix, cutmix_box2)
 
             with torch.cuda.amp.autocast(enabled=amp):
-                model.eval()
-                pred_u_w_mix = model(img_u_w_mix, scale_factor=None, scales=None)
-                pred_u_w_mix = pred_u_w_mix.detach()
-                conf_u_w_mix, mask_u_w_mix = pred_u_w_mix.softmax(dim=1).max(dim=1)
+                inference_model = model.module if hasattr(model, "module") else model
+                inference_model.eval()
+                with torch.no_grad():
+                    pred_u_w_mix = inference_model(
+                        img_u_w_mix, scale_factor=None, scales=None
+                    )
+                    conf_u_w_mix, mask_u_w_mix = pred_u_w_mix.softmax(dim=1).max(dim=1)
 
                 model.train()
 
