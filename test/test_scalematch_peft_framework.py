@@ -40,6 +40,7 @@ def test_scalematch_peft_uses_scalematch_recipe_and_peft_logging():
     assert 'pred["pred_joint"]' in source
     assert 'pred["pred_size"]' in source
     assert 'pred["pred_fp"]' in source
+    assert 'pred["pred_plain"]' in source
     assert 'if epoch < cfg["warm_up"]:' in source
     assert 'loss_u_s1 * 0.25 + loss_u_size * 0.25 + loss_u_w_fp * 0.5' in source
     assert "Running ScaleMatch + PEFT with method=%s, target_modules=%s, freeze_backbone=%s" in source

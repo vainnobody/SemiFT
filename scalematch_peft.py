@@ -404,8 +404,9 @@ def main(args, cfg):
                     torch.cat((img_x, img_u_w)),
                     scale_factor=random_scale,
                     feature_scale=feature_scale,
+                    plain_inputs=img_u_s1,
                 )
-                pred_u_s = model(img_u_s1, scale_factor=None, scales=None)
+                pred_u_s = pred["pred_plain"]
 
                 if epoch < cfg["warm_up"]:
                     pred_u_w = pred["pred_ori"][num_lb:]
