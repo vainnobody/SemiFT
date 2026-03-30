@@ -33,6 +33,7 @@ from util.ssl_method_utils import (
     load_backbone_checkpoint,
 )
 from util.validation import validation_cpu as shared_validation_cpu
+from unimatchv2_peft import apply_peft, resolve_peft_cfg, show_trainable_parameters
 
 
 DEFAULT_IMG_SCALES = [0.25, 0.5, 1.5, 2.0]
@@ -50,7 +51,7 @@ def validation_cpu(cfg, model, valid_loader):
 
 def get_parser():
     parser = argparse.ArgumentParser(
-        description="ScaleMatch port based on official GitHub recipe and SemiFT supervised.py runtime"
+        description="ScaleMatch + configurable PEFT for Semi-Supervised Semantic Segmentation"
     )
     parser.add_argument("--config", type=str, required=True)
     parser.add_argument("--labeled-id-path", type=str, required=True)
@@ -58,10 +59,30 @@ def get_parser():
     parser.add_argument("--save-path", type=str, required=True)
     parser.add_argument("--local_rank", "--local-rank", default=0, type=int)
     parser.add_argument("--port", default=None, type=int)
+    parser.add_argument("--peft-method", type=str, default=None)
+    parser.add_argument(
+        "--peft-target-modules",
+        nargs="+",
+        default=None,
+        help="Override PEFT target modules. Pass one or more suffixes, or a single regex string.",
+    )
+    parser.add_argument(
+        "--freeze-backbone",
+        dest="freeze_backbone",
+        action="store_true",
+        help="Freeze backbone parameters before applying PEFT.",
+    )
+    parser.add_argument(
+        "--no-freeze-backbone",
+        dest="freeze_backbone",
+        action="store_false",
+        help="Keep backbone parameters trainable outside PEFT adapters.",
+    )
+    parser.set_defaults(freeze_backbone=None)
     return parser.parse_args()
 
 
-def build_scalematch_model(cfg):
+def build_scalematch_model(cfg, peft_cfg):
     model_kwargs = get_model_kwargs(cfg)
     _, backbone_version = get_backbone_info(cfg)
 
@@ -79,12 +100,45 @@ def build_scalematch_model(cfg):
         raise ValueError(f'Unsupported model type: {cfg["model"]}')
 
     load_backbone_checkpoint(base_model, cfg)
+
+    if peft_cfg.get("freeze_backbone", True):
+        if hasattr(base_model, "lock_backbone"):
+            base_model.lock_backbone()
+        else:
+            for p in base_model.backbone.parameters():
+                p.requires_grad = False
+
+    base_model = apply_peft(base_model, peft_cfg, cfg)
     model = ScaleMatchModel(base_model, cfg["nclass"])
-
-    if cfg.get("lock_backbone", False):
-        model.lock_backbone()
-
     return model
+
+
+def build_optimizer(model, cfg):
+    trainable_backbone_params = []
+    trainable_non_backbone_params = []
+    for name, param in model.named_parameters():
+        if not param.requires_grad:
+            continue
+        if "backbone" in name:
+            trainable_backbone_params.append(param)
+        else:
+            trainable_non_backbone_params.append(param)
+
+    return AdamW(
+        [
+            {
+                "params": trainable_backbone_params,
+                "lr": cfg["lr"],
+            },
+            {
+                "params": trainable_non_backbone_params,
+                "lr": cfg["lr"] * cfg["lr_multi"],
+            },
+        ],
+        lr=cfg["lr"],
+        betas=(0.9, 0.999),
+        weight_decay=0.01,
+    )
 
 
 def unpack_unlabeled_batch(batch):
@@ -100,6 +154,7 @@ def main(args, cfg):
     logger.propagate = 0
 
     rank, world_size = setup_distributed(port=args.port)
+    peft_cfg = resolve_peft_cfg(cfg, args)
     ignore_index = cfg.get("ignore_index", 255)
     cfg.setdefault("img_scales", DEFAULT_IMG_SCALES)
     cfg.setdefault("feat_s_scales", DEFAULT_FEAT_S_SCALES)
@@ -126,37 +181,26 @@ def main(args, cfg):
             "scalematch_amp": amp,
         }
         logger.info("{}\n".format(pprint.pformat(all_args)))
+        logger.info(
+            "Running ScaleMatch + PEFT with method=%s, target_modules=%s, freeze_backbone=%s",
+            peft_cfg["method"],
+            peft_cfg["target_modules"],
+            peft_cfg["freeze_backbone"],
+        )
         writer = SummaryWriter(args.save_path)
         os.makedirs(args.save_path, exist_ok=True)
 
     cudnn.enabled = True
     cudnn.benchmark = True
 
-    model = build_scalematch_model(cfg)
-    optimizer = AdamW(
-        [
-            {
-                "params": [p for p in model.backbone.parameters() if p.requires_grad],
-                "lr": cfg["lr"],
-            },
-            {
-                "params": [
-                    param
-                    for name, param in model.named_parameters()
-                    if "backbone" not in name
-                ],
-                "lr": cfg["lr"] * cfg["lr_multi"],
-            },
-        ],
-        lr=cfg["lr"],
-        betas=(0.9, 0.999),
-        weight_decay=0.01,
-    )
+    model = build_scalematch_model(cfg, peft_cfg)
+    optimizer = build_optimizer(model, cfg)
 
     if rank == 0:
         logger.info("Total params: {:.1f}M".format(count_params(model)))
         logger.info("Encoder params: {:.1f}M".format(count_params(model.backbone)))
         logger.info("Decoder params: {:.1f}M\n".format(count_params(model.head)))
+        show_trainable_parameters(model, logger)
 
     local_rank = get_local_rank()
     model = torch.nn.SyncBatchNorm.convert_sync_batchnorm(model)
@@ -179,7 +223,7 @@ def main(args, cfg):
     if hasattr(model, "_set_static_graph"):
         model._set_static_graph()
         if rank == 0:
-            logger.info("Enabled DDP static graph for ScaleMatch training.")
+            logger.info("Enabled DDP static graph for ScaleMatch + PEFT training.")
     log_cuda_memory(
         logger, rank, "after_ddp_wrap", local_rank=local_rank, save_path=args.save_path
     )
