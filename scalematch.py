@@ -337,8 +337,8 @@ def main(args, cfg):
 
             with torch.cuda.amp.autocast(enabled=amp):
                 model.eval()
-                pred_u_w_mix = model(img_u_w_mix, scale_factor=None, scales=None)
-                pred_u_w_mix = pred_u_w_mix.detach()
+                with torch.no_grad():
+                    pred_u_w_mix = model(img_u_w_mix, scale_factor=None, scales=None)
                 conf_u_w_mix, mask_u_w_mix = pred_u_w_mix.softmax(dim=1).max(dim=1)
 
                 model.train()
