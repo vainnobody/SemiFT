@@ -374,11 +374,11 @@ def main(args, cfg):
                     ignore_mask, ignore_mask_mix, cutmix_box1
                 )
 
-                pred_x_joint = pred["pred_joint"][:num_lb]
+                pred_x = pred["pred_ori"][:num_lb]
                 pred_u_w_scale = pred["pred_size"][num_lb:]
                 pred_u_w_fp = pred["pred_fp"][num_lb:]
 
-                loss_x = criterion_l(pred_x_joint, mask_x)
+                loss_x = criterion_l(pred_x, mask_x)
 
                 loss_u_s1 = criterion_u(pred_u_s, mask_u_w_cutmixed1)
                 loss_u_s1 = confidence_weighted_loss(
