@@ -3,7 +3,7 @@ import torch
 import torch.distributed as dist
 import torch.nn.functional as F
 
-from util.utils import intersectionAndUnion
+from util.utils import intersectionAndUnion, AverageMeter
 
 
 @torch.no_grad()
