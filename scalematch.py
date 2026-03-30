@@ -101,12 +101,17 @@ def main(args, cfg):
 
     rank, world_size = setup_distributed(port=args.port)
     ignore_index = cfg.get("ignore_index", 255)
-    amp = OFFICIAL_USE_AMP
-    img_scales = DEFAULT_IMG_SCALES
-    feat_s_scales = DEFAULT_FEAT_S_SCALES
-    feat_l_scales = DEFAULT_FEAT_L_SCALES
-    warm_up = OFFICIAL_WARM_UP
-    conf_thresh = OFFICIAL_CONF_THRESH
+    cfg.setdefault("img_scales", DEFAULT_IMG_SCALES)
+    cfg.setdefault("feat_s_scales", DEFAULT_FEAT_S_SCALES)
+    cfg.setdefault("feat_l_scales", DEFAULT_FEAT_L_SCALES)
+    cfg.setdefault("warm_up", OFFICIAL_WARM_UP)
+    cfg.setdefault("conf_thresh", OFFICIAL_CONF_THRESH)
+    cfg.setdefault("amp", OFFICIAL_USE_AMP)
+
+    amp = cfg["amp"]
+    img_scales = cfg["img_scales"]
+    feat_s_scales = cfg["feat_s_scales"]
+    feat_l_scales = cfg["feat_l_scales"]
 
     if rank == 0:
         all_args = {
@@ -116,8 +121,8 @@ def main(args, cfg):
             "scalematch_img_scales": img_scales,
             "scalematch_feat_s_scales": feat_s_scales,
             "scalematch_feat_l_scales": feat_l_scales,
-            "scalematch_warm_up": warm_up,
-            "scalematch_conf_thresh": conf_thresh,
+            "scalematch_warm_up": cfg["warm_up"],
+            "scalematch_conf_thresh": cfg["conf_thresh"],
             "scalematch_amp": amp,
         }
         logger.info("{}\n".format(pprint.pformat(all_args)))
@@ -336,10 +341,13 @@ def main(args, cfg):
             cutmix_img_(img_u_s2, img_u_s2_mix, cutmix_box2)
 
             with torch.cuda.amp.autocast(enabled=amp):
-                model.eval()
-                pred_u_w_mix = model(img_u_w_mix, scale_factor=None, scales=None)
-                pred_u_w_mix = pred_u_w_mix.detach()
-                conf_u_w_mix, mask_u_w_mix = pred_u_w_mix.softmax(dim=1).max(dim=1)
+                inference_model = model.module if hasattr(model, "module") else model
+                inference_model.eval()
+                with torch.no_grad():
+                    pred_u_w_mix = inference_model(
+                        img_u_w_mix, scale_factor=None, scales=None
+                    )
+                    conf_u_w_mix, mask_u_w_mix = pred_u_w_mix.softmax(dim=1).max(dim=1)
 
                 model.train()
 
@@ -351,7 +359,7 @@ def main(args, cfg):
                 )
                 pred_u_s = model(img_u_s1, scale_factor=None, scales=None)
 
-                if epoch < warm_up:
+                if epoch < cfg["warm_up"]:
                     pred_u_w = pred["pred_ori"][num_lb:]
                 else:
                     pred_u_w = pred["pred_joint"][num_lb:]
@@ -377,7 +385,7 @@ def main(args, cfg):
                     conf_u_w_cutmixed1,
                     ignore_mask_cutmixed1,
                     ignore_index=ignore_index,
-                    conf_thresh=conf_thresh,
+                    conf_thresh=cfg["conf_thresh"],
                 )
                 loss_u_size = criterion_u(pred_u_w_scale, mask_u_w)
                 loss_u_size = confidence_weighted_loss(
@@ -385,7 +393,7 @@ def main(args, cfg):
                     conf_u_w,
                     ignore_mask,
                     ignore_index=ignore_index,
-                    conf_thresh=conf_thresh,
+                    conf_thresh=cfg["conf_thresh"],
                 )
                 loss_u_w_fp = criterion_u(pred_u_w_fp, mask_u_w)
                 loss_u_w_fp = confidence_weighted_loss(
@@ -393,13 +401,11 @@ def main(args, cfg):
                     conf_u_w,
                     ignore_mask,
                     ignore_index=ignore_index,
-                    conf_thresh=conf_thresh,
+                    conf_thresh=cfg["conf_thresh"],
                 )
 
                 loss_standard = loss_u_s1 * 0.25 + loss_u_size * 0.25 + loss_u_w_fp * 0.5
                 total_loss = (loss_x + loss_standard) / 2.0
-
-            torch.distributed.barrier()
 
             optimizer.zero_grad()
             if amp:
@@ -412,7 +418,7 @@ def main(args, cfg):
 
             valid_mask = (ignore_mask != ignore_index)
             mask_ratio = (
-                ((conf_u_w >= conf_thresh) & valid_mask).sum().item()
+                ((conf_u_w >= cfg["conf_thresh"]) & valid_mask).sum().item()
                 / valid_mask.sum().clamp(min=1).item()
             )
 
