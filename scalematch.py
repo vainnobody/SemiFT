@@ -20,7 +20,12 @@ from model.semseg.scalematch import ScaleMatchModel
 from util.classes import CLASSES
 from util.ohem import ProbOhemCrossEntropy2d
 from util.focal import FocalLoss
-from util.train_utils import DictAverageMeter, confidence_weighted_loss, cutmix_img_, cutmix_mask
+from util.train_utils import (
+    DictAverageMeter,
+    confidence_weighted_loss,
+    cutmix_img_,
+    cutmix_mask,
+)
 from util.utils import count_params, init_log
 from util.dist_helper import setup_distributed
 from util.ssl_method_utils import (
@@ -35,12 +40,12 @@ from util.ssl_method_utils import (
 from util.validation import validation_cpu as shared_validation_cpu
 
 
-DEFAULT_IMG_SCALES = [0.25, 0.5, 1.5, 2.0]
+DEFAULT_IMG_SCALES = [0.25, 0.5, 1.0, 1.25]
 DEFAULT_FEAT_S_SCALES = [0.75]
-DEFAULT_FEAT_L_SCALES = [1.25]
+DEFAULT_FEAT_L_SCALES = [1.0, 1.25, 1.5]
 OFFICIAL_WARM_UP = 10
 OFFICIAL_CONF_THRESH = 0.0
-OFFICIAL_USE_AMP = False
+OFFICIAL_USE_AMP = True
 
 
 @torch.no_grad()
@@ -396,7 +401,9 @@ def main(args, cfg):
                     conf_thresh=conf_thresh,
                 )
 
-                loss_standard = loss_u_s1 * 0.25 + loss_u_size * 0.25 + loss_u_w_fp * 0.5
+                loss_standard = (
+                    loss_u_s1 * 0.25 + loss_u_size * 0.25 + loss_u_w_fp * 0.5
+                )
                 total_loss = (loss_x + loss_standard) / 2.0
 
             torch.distributed.barrier()
@@ -410,11 +417,10 @@ def main(args, cfg):
                 total_loss.backward()
                 optimizer.step()
 
-            valid_mask = (ignore_mask != ignore_index)
+            valid_mask = ignore_mask != ignore_index
             mask_ratio = (
-                ((conf_u_w >= conf_thresh) & valid_mask).sum().item()
-                / valid_mask.sum().clamp(min=1).item()
-            )
+                (conf_u_w >= conf_thresh) & valid_mask
+            ).sum().item() / valid_mask.sum().clamp(min=1).item()
 
             log_avg.update(
                 {
@@ -442,7 +448,8 @@ def main(args, cfg):
 
         val_cfg = dict(cfg)
         val_cfg.setdefault(
-            "eval_mode", "slide_window" if cfg["dataset"] == "cityscapes" else "original"
+            "eval_mode",
+            "slide_window" if cfg["dataset"] == "cityscapes" else "original",
         )
         val_cfg.setdefault("ignore_index", ignore_index)
         eval_mode = val_cfg["eval_mode"]
