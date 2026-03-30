@@ -159,6 +159,17 @@ def unpack_unlabeled_batch(batch):
     raise ValueError(f"Unexpected unlabeled batch size: {len(batch)}")
 
 
+def sample_synced_choice(options, device, rank):
+    if len(options) == 1:
+        return options[0]
+    index = torch.zeros(1, device=device, dtype=torch.long)
+    if rank == 0:
+        index.fill_(random.randrange(len(options)))
+    if torch.distributed.is_available() and torch.distributed.is_initialized():
+        torch.distributed.broadcast(index, src=0)
+    return options[index.item()]
+
+
 def main(args, cfg):
     logger = init_log("global", logging.INFO)
     logger.propagate = 0
@@ -373,11 +384,6 @@ def main(args, cfg):
                 _,
             ) = unpack_unlabeled_batch(batch_u_mix)
 
-            random_scale = random.choice(img_scales)
-            feature_scale = random.choice(
-                feat_s_scales if random_scale > 1 else feat_l_scales
-            )
-
             img_x = img_x.cuda(local_rank, non_blocking=True)
             mask_x = mask_x.cuda(local_rank, non_blocking=True)
             img_u_w = img_u_w.cuda(local_rank, non_blocking=True)
@@ -393,6 +399,13 @@ def main(args, cfg):
 
             cutmix_img_(img_u_s1, img_u_s1_mix, cutmix_box1)
             cutmix_img_(img_u_s2, img_u_s2_mix, cutmix_box2)
+
+            random_scale = sample_synced_choice(img_scales, img_x.device, rank)
+            feature_scale = sample_synced_choice(
+                feat_s_scales if random_scale > 1 else feat_l_scales,
+                img_x.device,
+                rank,
+            )
 
             with torch.cuda.amp.autocast(enabled=amp):
                 inference_model = model.module if hasattr(model, "module") else model
