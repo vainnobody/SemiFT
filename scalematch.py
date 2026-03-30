@@ -35,7 +35,7 @@ from util.ssl_method_utils import (
 from util.validation import validation_cpu as shared_validation_cpu
 
 
-DEFAULT_IMG_SCALES = [0.25, 0.5, 1.5, 2.0]
+DEFAULT_IMG_SCALES = [0.25, 0.5, 1.0, 1.25]
 DEFAULT_FEAT_S_SCALES = [0.75]
 DEFAULT_FEAT_L_SCALES = [1.25]
 OFFICIAL_WARM_UP = 10
@@ -171,10 +171,6 @@ def main(args, cfg):
         output_device=local_rank,
         find_unused_parameters=True,
     )
-    if hasattr(model, "_set_static_graph"):
-        model._set_static_graph()
-        if rank == 0:
-            logger.info("Enabled DDP static graph for ScaleMatch training.")
     log_cuda_memory(
         logger, rank, "after_ddp_wrap", local_rank=local_rank, save_path=args.save_path
     )
