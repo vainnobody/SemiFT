@@ -110,6 +110,16 @@ class BatchTrainRunnerTest(unittest.TestCase):
 
         self.assertEqual(manifest.jobs[0].script.name, "segmind.py")
 
+    def test_load_manifest_accepts_corrmatch_entrypoint(self):
+        manifest_payload = yaml.safe_load(self.manifest_path.read_text(encoding="utf-8"))
+        repo_root = Path(__file__).resolve().parents[1]
+        manifest_payload["jobs"][0]["script"] = str(repo_root / "corrmatch.py")
+        self.manifest_path.write_text(yaml.safe_dump(manifest_payload), encoding="utf-8")
+
+        manifest = load_manifest(self.manifest_path)
+
+        self.assertEqual(manifest.jobs[0].script.name, "corrmatch.py")
+
     def test_parse_target_gpu_tokens_prefers_cuda_visible_devices(self):
         env = {"CUDA_VISIBLE_DEVICES": "3, 5"}
         self.assertEqual(parse_target_gpu_tokens(env, 2), ["3", "5"])
