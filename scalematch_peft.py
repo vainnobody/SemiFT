@@ -9,38 +9,52 @@ from torch import nn
 import torch.backends.cudnn as cudnn
 from torch.optim import AdamW
 from torch.utils.data import DataLoader
-from torch.utils.tensorboard import SummaryWriter
+try:
+    from torch.utils.tensorboard import SummaryWriter
+except ModuleNotFoundError:
+    SummaryWriter = None
 import yaml
 
 from dataset.semi_rs import SemiDataset
 from dataset.val import ValDataset
 from model.semseg.dpt import DPT
-from model.semseg.upernet import UperNet
 from model.semseg.scalematch import ScaleMatchModel
-from util.classes import CLASSES
-from util.ohem import ProbOhemCrossEntropy2d
-from util.focal import FocalLoss
-from util.train_utils import DictAverageMeter, confidence_weighted_loss, cutmix_img_, cutmix_mask
-from util.utils import count_params, init_log
-from util.dist_helper import setup_distributed
-from util.ssl_method_utils import (
-    get_local_rank,
-    load_checkpoint_on_cpu,
-    save_checkpoint_to_disk,
-    log_cuda_memory,
-    get_model_kwargs,
-    get_backbone_info,
-    load_backbone_checkpoint,
+from model.semseg.upernet import UperNet
+from scalematch import (
+    DEFAULT_FEAT_L_SCALES,
+    DEFAULT_FEAT_S_SCALES,
+    DEFAULT_IMG_SCALES,
+    OFFICIAL_CONF_THRESH,
+    OFFICIAL_USE_AMP,
+    OFFICIAL_WARM_UP,
 )
+from unimatchv2_peft import apply_peft, resolve_peft_cfg, show_trainable_parameters
+from util.classes import CLASSES
+from util.dist_helper import setup_distributed
+from util.focal import FocalLoss
+from util.ohem import ProbOhemCrossEntropy2d
+from util.ssl_method_utils import (
+    get_backbone_info,
+    get_local_rank,
+    get_model_kwargs,
+    load_backbone_checkpoint,
+    load_checkpoint_on_cpu,
+    log_cuda_memory,
+    save_checkpoint_to_disk,
+)
+from util.train_utils import (
+    DictAverageMeter,
+    confidence_weighted_loss,
+    cutmix_img_,
+    cutmix_mask,
+)
+from util.utils import count_params, init_log
 from util.validation import validation_cpu as shared_validation_cpu
 
 
-DEFAULT_IMG_SCALES = [0.25, 0.5, 1.0, 1.25]
-DEFAULT_FEAT_S_SCALES = [0.75]
-DEFAULT_FEAT_L_SCALES = [1.25]
-OFFICIAL_WARM_UP = 10
-OFFICIAL_CONF_THRESH = 0.0
-OFFICIAL_USE_AMP = False
+class NullWriter:
+    def add_scalar(self, *args, **kwargs):
+        return None
 
 
 @torch.no_grad()
@@ -50,7 +64,7 @@ def validation_cpu(cfg, model, valid_loader):
 
 def get_parser():
     parser = argparse.ArgumentParser(
-        description="ScaleMatch port based on official GitHub recipe and SemiFT supervised.py runtime"
+        description="ScaleMatch + configurable PEFT for Semi-Supervised Semantic Segmentation"
     )
     parser.add_argument("--config", type=str, required=True)
     parser.add_argument("--labeled-id-path", type=str, required=True)
@@ -58,33 +72,83 @@ def get_parser():
     parser.add_argument("--save-path", type=str, required=True)
     parser.add_argument("--local_rank", "--local-rank", default=0, type=int)
     parser.add_argument("--port", default=None, type=int)
+    parser.add_argument("--peft-method", type=str, default=None)
+    parser.add_argument(
+        "--peft-target-modules",
+        nargs="+",
+        default=None,
+        help="Override PEFT target modules. Pass one or more suffixes, or a single regex string.",
+    )
+    parser.add_argument(
+        "--freeze-backbone",
+        dest="freeze_backbone",
+        action="store_true",
+        help="Freeze backbone parameters before applying PEFT.",
+    )
+    parser.add_argument(
+        "--no-freeze-backbone",
+        dest="freeze_backbone",
+        action="store_false",
+        help="Keep backbone parameters trainable outside PEFT adapters.",
+    )
+    parser.set_defaults(freeze_backbone=None)
     return parser.parse_args()
 
 
-def build_scalematch_model(cfg):
+def build_writer(save_path):
+    if SummaryWriter is None:
+        return NullWriter()
+    return SummaryWriter(save_path)
+
+
+def build_scalematch_model(cfg, peft_cfg):
     model_kwargs = get_model_kwargs(cfg)
     _, backbone_version = get_backbone_info(cfg)
 
     if cfg["model"] == "dpt":
-        base_model = DPT(
-            **model_kwargs,
-            backbone_version=backbone_version,
-        )
+        base_model = DPT(**model_kwargs, backbone_version=backbone_version)
     elif cfg["model"] == "upernet":
-        base_model = UperNet(
-            **model_kwargs,
-            backbone_version=backbone_version,
-        )
+        base_model = UperNet(**model_kwargs, backbone_version=backbone_version)
     else:
-        raise ValueError(f'Unsupported model type: {cfg["model"]}')
+        raise ValueError(f"Unsupported model type: {cfg['model']}")
 
-    load_backbone_checkpoint(base_model, cfg)
+    load_result = load_backbone_checkpoint(base_model, cfg)
+
+    if peft_cfg.get("freeze_backbone", True):
+        if hasattr(base_model, "lock_backbone"):
+            base_model.lock_backbone()
+        else:
+            for param in base_model.backbone.parameters():
+                param.requires_grad = False
+
+    base_model = apply_peft(base_model, peft_cfg, cfg)
     model = ScaleMatchModel(base_model, cfg["nclass"])
+    return model, load_result
 
-    if cfg.get("lock_backbone", False):
-        model.lock_backbone()
 
-    return model
+def build_optimizer(model, cfg):
+    trainable_backbone_params = []
+    trainable_non_backbone_params = []
+    for name, param in model.named_parameters():
+        if not param.requires_grad:
+            continue
+        if "backbone" in name:
+            trainable_backbone_params.append(param)
+        else:
+            trainable_non_backbone_params.append(param)
+
+    return AdamW(
+        [
+            {"params": trainable_backbone_params, "lr": cfg["lr"]},
+            {
+                "params": trainable_non_backbone_params,
+                "lr": cfg["lr"] * cfg["lr_multi"],
+            },
+        ],
+        lr=cfg["lr"],
+        betas=(0.9, 0.999),
+        weight_decay=0.01,
+    )
 
 
 def unpack_unlabeled_batch(batch):
@@ -95,11 +159,23 @@ def unpack_unlabeled_batch(batch):
     raise ValueError(f"Unexpected unlabeled batch size: {len(batch)}")
 
 
+def sample_synced_choice(options, device, rank):
+    if len(options) == 1:
+        return options[0]
+    index = torch.zeros(1, device=device, dtype=torch.long)
+    if rank == 0:
+        index.fill_(random.randrange(len(options)))
+    if torch.distributed.is_available() and torch.distributed.is_initialized():
+        torch.distributed.broadcast(index, src=0)
+    return options[index.item()]
+
+
 def main(args, cfg):
     logger = init_log("global", logging.INFO)
     logger.propagate = 0
 
     rank, world_size = setup_distributed(port=args.port)
+    peft_cfg = resolve_peft_cfg(cfg, args)
     ignore_index = cfg.get("ignore_index", 255)
     amp = OFFICIAL_USE_AMP
     img_scales = DEFAULT_IMG_SCALES
@@ -121,37 +197,33 @@ def main(args, cfg):
             "scalematch_amp": amp,
         }
         logger.info("{}\n".format(pprint.pformat(all_args)))
-        writer = SummaryWriter(args.save_path)
+        logger.info(
+            "Running ScaleMatch + PEFT with method=%s, target_modules=%s, freeze_backbone=%s",
+            peft_cfg["method"],
+            peft_cfg["target_modules"],
+            peft_cfg["freeze_backbone"],
+        )
         os.makedirs(args.save_path, exist_ok=True)
+        writer = build_writer(args.save_path)
+    else:
+        writer = NullWriter()
 
     cudnn.enabled = True
     cudnn.benchmark = True
 
-    model = build_scalematch_model(cfg)
-    optimizer = AdamW(
-        [
-            {
-                "params": [p for p in model.backbone.parameters() if p.requires_grad],
-                "lr": cfg["lr"],
-            },
-            {
-                "params": [
-                    param
-                    for name, param in model.named_parameters()
-                    if "backbone" not in name
-                ],
-                "lr": cfg["lr"] * cfg["lr_multi"],
-            },
-        ],
-        lr=cfg["lr"],
-        betas=(0.9, 0.999),
-        weight_decay=0.01,
-    )
+    model, load_result = build_scalematch_model(cfg, peft_cfg)
+    optimizer = build_optimizer(model, cfg)
 
     if rank == 0:
-        logger.info("Total params: {:.1f}M".format(count_params(model)))
-        logger.info("Encoder params: {:.1f}M".format(count_params(model.backbone)))
-        logger.info("Decoder params: {:.1f}M\n".format(count_params(model.head)))
+        logger.info("Total params: %.1fM", count_params(model))
+        logger.info("Encoder params: %.1fM", count_params(model.backbone))
+        logger.info("Decoder params: %.1fM", count_params(model.head))
+        logger.info(
+            "backbone load_result missing_keys=%s unexpected_keys=%s",
+            list(getattr(load_result, "missing_keys", [])),
+            list(getattr(load_result, "unexpected_keys", [])),
+        )
+        show_trainable_parameters(model, logger)
 
     local_rank = get_local_rank()
     model = torch.nn.SyncBatchNorm.convert_sync_batchnorm(model)
@@ -172,7 +244,11 @@ def main(args, cfg):
         find_unused_parameters=True,
     )
     log_cuda_memory(
-        logger, rank, "after_ddp_wrap", local_rank=local_rank, save_path=args.save_path
+        logger,
+        rank,
+        "after_ddp_wrap",
+        local_rank=local_rank,
+        save_path=args.save_path,
     )
 
     if cfg["criterion"]["name"] == "CELoss":
@@ -257,9 +333,10 @@ def main(args, cfg):
     epoch = -1
     scaler = torch.cuda.amp.GradScaler(enabled=amp)
 
-    if os.path.exists(os.path.join(args.save_path, "latest.pth")):
+    latest_path = os.path.join(args.save_path, "latest.pth")
+    if os.path.exists(latest_path):
         log_cuda_memory(logger, rank, "before_resume_load", save_path=args.save_path)
-        checkpoint = load_checkpoint_on_cpu(os.path.join(args.save_path, "latest.pth"))
+        checkpoint = load_checkpoint_on_cpu(latest_path)
         model.load_state_dict(checkpoint["model"])
         optimizer.load_state_dict(checkpoint["optimizer"])
         log_cuda_memory(logger, rank, "after_resume_load", save_path=args.save_path)
@@ -287,11 +364,7 @@ def main(args, cfg):
         loader = zip(trainloader_l, trainloader_u, trainloader_u_mix)
         model.train()
 
-        for i, (
-            (img_x, mask_x),
-            batch_u,
-            batch_u_mix,
-        ) in enumerate(loader):
+        for i, ((img_x, mask_x), batch_u, batch_u_mix) in enumerate(loader):
             (
                 img_u_w,
                 img_u_s1,
@@ -311,25 +384,28 @@ def main(args, cfg):
                 _,
             ) = unpack_unlabeled_batch(batch_u_mix)
 
-            random_scale = random.choice(img_scales)
-            feature_scale = random.choice(
-                feat_s_scales if random_scale > 1 else feat_l_scales
-            )
-
-            img_x, mask_x = img_x.cuda(), mask_x.cuda()
-            img_u_w = img_u_w.cuda()
-            img_u_s1, img_u_s2, ignore_mask = (
-                img_u_s1.cuda(),
-                img_u_s2.cuda(),
-                ignore_mask.cuda(),
-            )
-            cutmix_box1, cutmix_box2 = cutmix_box1.cuda(), cutmix_box2.cuda()
-            img_u_w_mix = img_u_w_mix.cuda()
-            img_u_s1_mix, img_u_s2_mix = img_u_s1_mix.cuda(), img_u_s2_mix.cuda()
-            ignore_mask_mix = ignore_mask_mix.cuda()
+            img_x = img_x.cuda(local_rank, non_blocking=True)
+            mask_x = mask_x.cuda(local_rank, non_blocking=True)
+            img_u_w = img_u_w.cuda(local_rank, non_blocking=True)
+            img_u_s1 = img_u_s1.cuda(local_rank, non_blocking=True)
+            img_u_s2 = img_u_s2.cuda(local_rank, non_blocking=True)
+            ignore_mask = ignore_mask.cuda(local_rank, non_blocking=True)
+            cutmix_box1 = cutmix_box1.cuda(local_rank, non_blocking=True)
+            cutmix_box2 = cutmix_box2.cuda(local_rank, non_blocking=True)
+            img_u_w_mix = img_u_w_mix.cuda(local_rank, non_blocking=True)
+            img_u_s1_mix = img_u_s1_mix.cuda(local_rank, non_blocking=True)
+            img_u_s2_mix = img_u_s2_mix.cuda(local_rank, non_blocking=True)
+            ignore_mask_mix = ignore_mask_mix.cuda(local_rank, non_blocking=True)
 
             cutmix_img_(img_u_s1, img_u_s1_mix, cutmix_box1)
             cutmix_img_(img_u_s2, img_u_s2_mix, cutmix_box2)
+
+            random_scale = sample_synced_choice(img_scales, img_x.device, rank)
+            feature_scale = sample_synced_choice(
+                feat_s_scales if random_scale > 1 else feat_l_scales,
+                img_x.device,
+                rank,
+            )
 
             with torch.cuda.amp.autocast(enabled=amp):
                 inference_model = model.module if hasattr(model, "module") else model
@@ -342,7 +418,7 @@ def main(args, cfg):
 
                 model.train()
 
-                num_lb, num_ulb = img_x.shape[0], img_u_w.shape[0]
+                num_lb = img_x.shape[0]
                 pred = model(
                     torch.cat((img_x, img_u_w)),
                     scale_factor=random_scale,
@@ -396,10 +472,12 @@ def main(args, cfg):
                     conf_thresh=conf_thresh,
                 )
 
-                loss_standard = loss_u_s1 * 0.25 + loss_u_size * 0.25 + loss_u_w_fp * 0.5
+                loss_standard = (
+                    loss_u_s1 * 0.25 + loss_u_size * 0.25 + loss_u_w_fp * 0.5
+                )
                 total_loss = (loss_x + loss_standard) / 2.0
 
-            optimizer.zero_grad()
+            optimizer.zero_grad(set_to_none=True)
             if amp:
                 scaler.scale(total_loss).backward()
                 scaler.step(optimizer)
@@ -408,12 +486,11 @@ def main(args, cfg):
                 total_loss.backward()
                 optimizer.step()
 
-            valid_mask = (ignore_mask != ignore_index)
+            valid_mask = ignore_mask != ignore_index
             mask_ratio = (
                 ((conf_u_w >= conf_thresh) & valid_mask).sum().item()
                 / valid_mask.sum().clamp(min=1).item()
             )
-
             log_avg.update(
                 {
                     "Total loss": total_loss,
@@ -431,11 +508,15 @@ def main(args, cfg):
             optimizer.param_groups[1]["lr"] = lr * cfg["lr_multi"]
 
             if rank == 0:
-                for k, v in log_avg.avgs.items():
-                    writer.add_scalar("train/" + k, v, iters)
+                for key, value in log_avg.avgs.items():
+                    writer.add_scalar(
+                        "train/" + key,
+                        value.item() if torch.is_tensor(value) else value,
+                        iters,
+                    )
 
             if (i % max(1, len(trainloader_u) // 8) == 0) and (rank == 0):
-                logger.info(f"Iters: {i}, " + str(log_avg))
+                logger.info("Iters: %s, %s", i, log_avg)
                 log_avg.reset()
 
         val_cfg = dict(cfg)
@@ -449,22 +530,22 @@ def main(args, cfg):
         if rank == 0:
             for cls_idx, iou in enumerate(iou_class):
                 logger.info(
-                    "***** Evaluation ***** >>>> Class [{:} {:}] IoU: {:.2f}".format(
-                        cls_idx,
-                        CLASSES[cfg["dataset"]][cls_idx],
-                        iou,
-                    )
+                    "***** Evaluation ***** >>>> Class [%s %s] IoU: %.2f",
+                    cls_idx,
+                    CLASSES[cfg["dataset"]][cls_idx],
+                    iou,
                 )
             logger.info(
-                "***** Evaluation {} ***** >>>> MeanIoU: {:.2f}\n".format(
-                    eval_mode, mIoU
-                )
+                "***** Evaluation %s ***** >>>> MeanIoU: %.2f\n",
+                eval_mode,
+                mIoU,
             )
-
             writer.add_scalar("eval/mIoU", mIoU, epoch)
-            for i, iou in enumerate(iou_class):
+            for cls_idx, iou in enumerate(iou_class):
                 writer.add_scalar(
-                    "eval/%s_IoU" % (CLASSES[cfg["dataset"]][i]), iou, epoch
+                    "eval/%s_IoU" % (CLASSES[cfg["dataset"]][cls_idx]),
+                    iou,
+                    epoch,
                 )
 
         is_best = mIoU >= previous_best

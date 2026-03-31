@@ -48,6 +48,7 @@ TRAINING_ENTRYPOINTS = {
     "unimatchv2_peft.py",
     "wscl.py",
     "scalematch.py",
+    "scalematch_peft.py",
 }
 
 

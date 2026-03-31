@@ -73,6 +73,7 @@ class ScaleMatchModel(nn.Module):
         feature_scale=1.0,
         scales=None,
         eval_mode="atten_fusion",
+        plain_inputs: torch.Tensor = None,
         **kwargs,
     ):
         del feature_scale, eval_mode  # kept for official-API compatibility
@@ -95,6 +96,7 @@ class ScaleMatchModel(nn.Module):
             return self._forward_base(inputs, **kwargs)
 
         scale_factor = float(scale_factor)
+        pred_plain = self._forward_base(plain_inputs, **kwargs) if plain_inputs is not None else None
         if math.isclose(scale_factor, 1.0):
             pred_ori, pred_fp = self._forward_base(inputs, need_fp=True, **kwargs)
             return {
@@ -102,6 +104,7 @@ class ScaleMatchModel(nn.Module):
                 "pred_ori": pred_ori,
                 "pred_fp": pred_fp,
                 "pred_size": pred_ori,
+                "pred_plain": pred_plain,
                 "out": pred_ori,
             }
 
@@ -122,6 +125,7 @@ class ScaleMatchModel(nn.Module):
                 "pred_ori": pred_ori,
                 "pred_fp": pred_fp,
                 "pred_size": pred_scale,
+                "pred_plain": pred_plain,
                 "out": pred_joint,
             }
 
@@ -139,5 +143,6 @@ class ScaleMatchModel(nn.Module):
             "pred_ori": pred_ori,
             "pred_fp": pred_fp,
             "pred_size": pred_scale,
+            "pred_plain": pred_plain,
             "out": pred_joint,
         }
